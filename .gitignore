@@ -1,0 +1,78 @@
+# macOS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local environments and caches
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Logs and local env files
+*.log
+.env
+.env.*
+!.env.example
+
+# Node, Vite, and Tauri build outputs
+node_modules/
+dist/
+target/
+apps/*/node_modules/
+apps/*/dist/
+apps/*/src-tauri/target/
+apps/*/.vite/
+apps/*/.turbo/
+
+# Project raw data, generated models, renders, and experiments
+rose/
+data/
+raw/
+inputs/
+outputs/
+experiments/
+renders/
+screenshots/
+
+# 3D model and mesh assets
+*.fbx
+*.stl
+*.obj
+*.ply
+*.mtl
+*.glb
+*.gltf
+*.3mf
+*.blend
+*.dae
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.step
+*.stp
+*.iges
+*.igs
+*.off
+
+# Raster/video/reference media
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.heic
+*.mov
+*.mp4
+*.webm
+
+# Generated reports and large analysis outputs
+*.report.json
+*_worst_error_points.csv
