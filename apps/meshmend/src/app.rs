@@ -12,8 +12,8 @@ use meshmend_analysis::AnalysisReport;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_project::{
-    project_directory_from_selection, MeshMendProject, OperationKind, OperationStatus,
-    ScaleCalibration, SelectionReference,
+    project_directory_from_selection, ExportKind, MeshMendProject, OperationKind, OperationStatus,
+    ScaleCalibration, SelectionReference, ValidationSummary,
 };
 use meshmend_render::{
     DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
@@ -49,6 +49,7 @@ enum UiAction {
     OpenProject,
     SaveProject,
     ExportReport,
+    ExportStl,
     Undo,
     Redo,
     RunAnalysis,
@@ -1302,6 +1303,56 @@ fn handle_ui_action(
                 *needs_redraw = true;
             }
         }
+        UiAction::ExportStl => {
+            let Some(model) = model_info.as_ref() else {
+                *status = "Load an STL before exporting".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            if project.is_none() {
+                *project = Some(project_from_model(model));
+            }
+            let Some(project) = project.as_mut() else {
+                *status = "No project state to export".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            let source_path = project
+                .current_revision()
+                .map(|revision| revision.mesh_path.clone())
+                .filter(|path| path.exists())
+                .unwrap_or_else(|| model.path.clone());
+            let default_name = format!("{}-repaired.stl", project.metadata.name);
+            if let Some(path) = meshmend_io::pick_stl_to_save(&default_name) {
+                if same_file_path(&source_path, &path) {
+                    *status =
+                        "Export cancelled: choose a path different from the source STL".to_string();
+                    *needs_redraw = true;
+                    return;
+                }
+                match export_stl_with_validation(&source_path, &path) {
+                    Ok(validation) => {
+                        project.add_export(ExportKind::Stl, &path, validation.clone());
+                        project.record_operation(
+                            OperationKind::Export,
+                            OperationStatus::Applied,
+                            serde_json::json!({
+                                "source": source_path,
+                                "output": path,
+                                "validation": validation,
+                            }),
+                            Vec::new(),
+                        );
+                        *status = format!("Exported STL {}", path.display());
+                    }
+                    Err(err) => {
+                        *status = format!("Export failed: {err}");
+                        tracing::error!(error = %err, "failed to export STL");
+                    }
+                }
+                *needs_redraw = true;
+            }
+        }
         UiAction::Undo => {
             if let Some(project) = project.as_mut() {
                 match project.undo() {
@@ -1726,6 +1777,42 @@ pub fn analyze_parsed_stl(parsed: &ParsedStl) -> AnalysisReport {
         parsed.stats.clone(),
         parsed.stats.bounds.radius().max(1.0) * 1.0e-6,
     )
+}
+
+fn export_stl_with_validation(source: &Path, output: &Path) -> Result<ValidationSummary> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, output)?;
+    let parsed = load_binary_stl(output)?;
+    let report = analyze_parsed_stl(&parsed);
+    Ok(validation_from_analysis(&report))
+}
+
+fn validation_from_analysis(report: &AnalysisReport) -> ValidationSummary {
+    ValidationSummary {
+        boundary_loop_count: Some(report.topology.boundary_loop_count as u64),
+        non_manifold_edge_count: Some(report.topology.non_manifold_edge_count as u64),
+        component_count: Some(u64::from(report.topology.component_count)),
+        self_intersection_count: None,
+        internal_cavity_count: Some(report.topology.contained_component_count as u64),
+        triangle_count: Some(report.summary.triangle_count),
+        warnings: report
+            .defects
+            .iter()
+            .map(|defect| format!("{:?}: {}", defect.kind, defect.recommendation))
+            .collect(),
+    }
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn selection_reference_from_pick(pick: PickResult) -> SelectionReference {
@@ -2230,11 +2317,7 @@ fn draw_repair_panel(
             "Remesh",
             "Choose a physical target resolution and preview mesh density changes.",
         ),
-        ToolMode::Export => draw_operation_stub(
-            ui,
-            "Export",
-            "Validate the current mesh and export repaired STL plus a repair report.",
-        ),
+        ToolMode::Export => draw_export_tools(ui, project, action),
         ToolMode::Select | ToolMode::Navigate | ToolMode::XrayInspect => {
             draw_cross_section_tools(ui, model, cross_section, action);
             ui.separator();
@@ -2321,6 +2404,9 @@ fn draw_project_controls(
         }
         if ui.button("Open Project").clicked() {
             *action = UiAction::OpenProject;
+        }
+        if ui.button("Export STL").clicked() {
+            *action = UiAction::ExportStl;
         }
         if ui.button("Export Report").clicked() {
             *action = UiAction::ExportReport;
@@ -2640,6 +2726,34 @@ fn draw_measure_tools(
             "Reference: {:.6} model units = {:.3} mm",
             scale.reference_model_distance, scale.reference_real_distance_mm
         ));
+    }
+}
+
+fn draw_export_tools(ui: &mut egui::Ui, project: Option<&MeshMendProject>, action: &mut UiAction) {
+    ui.heading("Export");
+    ui.label("Validate the current mesh state and write printable output.");
+    ui.horizontal(|ui| {
+        if ui.button("Export STL").clicked() {
+            *action = UiAction::ExportStl;
+        }
+        if ui.button("Export Report").clicked() {
+            *action = UiAction::ExportReport;
+        }
+    });
+    if let Some(project) = project {
+        if let Some(revision) = project.current_revision() {
+            ui.small(format!(
+                "Current revision {}: {} triangles",
+                revision.id, revision.triangle_count
+            ));
+        }
+        if !project.exports.is_empty() {
+            ui.separator();
+            ui.label("Recent exports");
+            for export in project.exports.iter().rev().take(4) {
+                ui.small(format!("{:?}: {}", export.kind, export.path.display()));
+            }
+        }
     }
 }
 

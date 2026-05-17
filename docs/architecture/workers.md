@@ -31,6 +31,7 @@ cargo run -p meshmend -- hole-fill fixtures/stl/cube_missing_top.stl --output ou
 cargo run -p meshmend -- local-wrap fixtures/stl/cube_binary.stl --output outputs/cube-wrapped.stl --voxel-size 0.08
 cargo run -p meshmend -- cut fixtures/stl/cube_binary.stl --output outputs/cube-cut.stl --normal 1 0 0 --offset 0 --keep positive
 cargo run -p meshmend -- remesh fixtures/stl/cube_binary.stl --output outputs/cube-remesh.stl --target-edge-length 0.75
+cargo run -p meshmend -- export outputs/cube-remesh.stl --output outputs/cube-export.stl --report-json outputs/cube-export-report.json --report-md outputs/cube-export-report.md
 ```
 
 `MESHMEND_WORKER_DIR` can point the Rust runner at a custom worker directory.

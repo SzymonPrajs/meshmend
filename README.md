@@ -49,6 +49,8 @@ The active implementation is now the native viewer:
   the kept side, validates topology, and exports STL
 - measure/scale controls in the native app that store model-units-per-mm in the
   project, plus CGAL-backed `meshmend remesh` for target edge-length remeshing
+- explicit STL export validation in the app and `meshmend export` CLI reports
+  with JSON/Markdown validation output
 
 ## App Location
 

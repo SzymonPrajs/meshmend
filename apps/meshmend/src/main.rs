@@ -97,6 +97,16 @@ enum Command {
         #[arg(long, value_name = "MODEL_UNITS_PER_MM")]
         model_units_per_mm: Option<f64>,
     },
+    Export {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "STL")]
+        output: PathBuf,
+        #[arg(long, value_name = "JSON")]
+        report_json: Option<PathBuf>,
+        #[arg(long, value_name = "MD")]
+        report_md: Option<PathBuf>,
+    },
     Perf {
         #[arg(value_name = "STL")]
         path: PathBuf,
@@ -467,6 +477,14 @@ fn main() -> Result<()> {
                 report.topology.non_manifold_edge_count
             );
         }
+        Some(Command::Export {
+            path,
+            output,
+            report_json,
+            report_md,
+        }) => {
+            export_mesh_with_reports(&path, &output, report_json.as_deref(), report_md.as_deref())?;
+        }
         Some(Command::Perf { path, output }) => {
             app::run_perf(path, output)?;
         }
@@ -528,4 +546,123 @@ fn init_logging() {
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+fn export_mesh_with_reports(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    report_json: Option<&std::path::Path>,
+    report_md: Option<&std::path::Path>,
+) -> Result<()> {
+    if same_file_path(source, output) {
+        anyhow::bail!("export output must not overwrite the source STL");
+    }
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, output)?;
+
+    let parsed = load_binary_stl_with_options(
+        output,
+        &LoadOptions {
+            parallel: true,
+            ..LoadOptions::default()
+        },
+    )?;
+    let report = app::analyze_parsed_stl(&parsed);
+    let export_report = serde_json::json!({
+        "version": 1,
+        "source": source,
+        "output": output,
+        "validation": {
+            "triangle_count": report.summary.triangle_count,
+            "component_count": report.topology.component_count,
+            "boundary_loop_count": report.topology.boundary_loop_count,
+            "non_manifold_edge_count": report.topology.non_manifold_edge_count,
+            "contained_internal_shell_count": report.topology.contained_component_count,
+            "defect_count": report.defects.len(),
+        },
+        "analysis": &report,
+    });
+
+    if let Some(path) = report_json {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&export_report)?)?;
+        println!("wrote json report: {}", path.display());
+    }
+    if let Some(path) = report_md {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, export_markdown_report(source, output, &report))?;
+        println!("wrote markdown report: {}", path.display());
+    }
+
+    println!("exported: {}", output.display());
+    println!("triangles: {}", report.summary.triangle_count);
+    println!("defects: {}", report.defects.len());
+    println!("components: {}", report.topology.component_count);
+    println!("boundary loops: {}", report.topology.boundary_loop_count);
+    println!(
+        "non-manifold edges: {}",
+        report.topology.non_manifold_edge_count
+    );
+    Ok(())
+}
+
+fn export_markdown_report(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    report: &meshmend_analysis::AnalysisReport,
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# MeshMend Export Report\n\n");
+    markdown.push_str(&format!("- Source: `{}`\n", source.display()));
+    markdown.push_str(&format!("- Output: `{}`\n", output.display()));
+    markdown.push_str(&format!("- Triangles: {}\n", report.summary.triangle_count));
+    markdown.push_str(&format!("- Defects: {}\n", report.defects.len()));
+    markdown.push_str(&format!(
+        "- Components: {}\n",
+        report.topology.component_count
+    ));
+    markdown.push_str(&format!(
+        "- Boundary loops: {}\n",
+        report.topology.boundary_loop_count
+    ));
+    markdown.push_str(&format!(
+        "- Non-manifold edges: {}\n",
+        report.topology.non_manifold_edge_count
+    ));
+    markdown.push_str(&format!(
+        "- Contained internal shells: {}\n",
+        report.topology.contained_component_count
+    ));
+    if !report.defects.is_empty() {
+        markdown.push_str("\n## Findings\n\n");
+        for defect in &report.defects {
+            markdown.push_str(&format!(
+                "- {:?} {:?}: {}\n",
+                defect.kind, defect.severity, defect.recommendation
+            ));
+        }
+    }
+    markdown
+}
+
+fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
