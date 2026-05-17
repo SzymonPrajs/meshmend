@@ -12,14 +12,15 @@ use meshmend_analysis::AnalysisReport;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_project::{
-    project_directory_from_selection, ExportKind, MeshMendProject, OperationKind, OperationStatus,
-    ScaleCalibration, SelectionReference, ValidationSummary,
+    now_unix_ms, project_directory_from_selection, ExportKind, MeshMendProject, OperationKind,
+    OperationStatus, ScaleCalibration, SelectionReference, ValidationSummary,
 };
 use meshmend_render::{
     DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
     SelectionSummary, WgpuRenderer,
 };
 use meshmend_stl::{load_binary_stl, ParsedStl};
+use meshmend_worker_api::{discover_worker_binary, WorkerOperation, WorkerRequest, WorkerRunner};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
@@ -57,8 +58,8 @@ enum UiAction {
     Fit,
     Reset,
     AddIssue,
-    SaveIssues,
-    LoadIssues,
+    SaveRepairData,
+    LoadRepairData,
     FrameIssue(usize),
     DeleteIssue(usize),
     ResetCrossSection,
@@ -67,6 +68,10 @@ enum UiAction {
     SetMeasurePointA,
     SetMeasurePointB,
     ApplyScaleCalibration,
+    ApplyHoleFill,
+    ApplyLocalWrap,
+    ApplyCut,
+    ApplyRemesh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +209,19 @@ struct MeasureToolState {
     real_distance_mm: f64,
 }
 
+#[derive(Debug, Clone)]
+struct RemeshToolState {
+    target_edge_length: f64,
+}
+
+impl Default for RemeshToolState {
+    fn default() -> Self {
+        Self {
+            target_edge_length: 0.75,
+        }
+    }
+}
+
 impl Default for MeasureToolState {
     fn default() -> Self {
         Self {
@@ -306,6 +324,7 @@ pub fn run_native(
     let mut selected_issue_kind = IssueKind::default();
     let mut brush_tool = BrushToolState::default();
     let mut measure_tool = MeasureToolState::default();
+    let mut remesh_tool = RemeshToolState::default();
     let mut tool_mode = ToolMode::Select;
     let mut view_mode = ViewMode::Headlight;
 
@@ -363,6 +382,7 @@ pub fn run_native(
                                 &mut selected_issue_kind,
                                 &mut brush_tool,
                                 &mut measure_tool,
+                                &mut remesh_tool,
                                 &mut tool_mode,
                                 &mut view_mode,
                                 renderer.gpu_buffer_bytes(),
@@ -390,6 +410,7 @@ pub fn run_native(
                             selected_issue_kind,
                             &mut brush_tool,
                             &mut measure_tool,
+                            &mut remesh_tool,
                             &mut selected_pick,
                             &mut hit_stack_state,
                             &mut status,
@@ -1178,6 +1199,7 @@ fn handle_ui_action(
     selected_issue_kind: IssueKind,
     brush_tool: &mut BrushToolState,
     measure_tool: &mut MeasureToolState,
+    remesh_tool: &mut RemeshToolState,
     selected_pick: &mut Option<PickResult>,
     hit_stack_state: &mut HitStackState,
     status: &mut String,
@@ -1463,7 +1485,7 @@ fn handle_ui_action(
                 *needs_redraw = true;
             }
         }
-        UiAction::SaveIssues => {
+        UiAction::SaveRepairData => {
             if let Some(session) = issue_session.as_ref() {
                 let default_name = format!("{}.issues.json", session.model_file_name);
                 if let Some(path) = meshmend_io::pick_issue_session_to_save(&default_name) {
@@ -1480,7 +1502,7 @@ fn handle_ui_action(
                 }
             }
         }
-        UiAction::LoadIssues => {
+        UiAction::LoadRepairData => {
             if let Some(path) = meshmend_io::pick_issue_session_to_load() {
                 match IssueSession::load_from_path(&path) {
                     Ok(session) => {
@@ -1542,7 +1564,7 @@ fn handle_ui_action(
                 session.clear_label_strokes();
                 renderer.set_label_strokes(&[]);
                 brush_tool.finish_stroke();
-                *status = "Cleared brush labels".to_string();
+                *status = "Cleared repair regions".to_string();
                 *needs_redraw = true;
             }
         }
@@ -1614,6 +1636,111 @@ fn handle_ui_action(
             *status = format!("Applied scale: {:.6} model units/mm", model_units_per_mm);
             *needs_redraw = true;
         }
+        UiAction::ApplyHoleFill => {
+            apply_worker_mesh_revision(
+                "meshmend-cgal-worker",
+                WorkerOperation::HoleFill,
+                OperationKind::HoleFill,
+                "hole-fill",
+                None,
+                serde_json::json!({}),
+                renderer,
+                window,
+                model_info,
+                issue_session,
+                project,
+                analysis_report,
+                cross_section,
+                brush_tool,
+                selected_pick,
+                hit_stack_state,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::ApplyLocalWrap => {
+            let target_edge_length = model_info
+                .as_ref()
+                .map(|model| f64::from(model.brush_unit.max(f32::EPSILON)) * 4.0);
+            apply_worker_mesh_revision(
+                "meshmend-openvdb-worker",
+                WorkerOperation::LocalSdfWrap,
+                OperationKind::SurfaceWrap,
+                "local-wrap",
+                target_edge_length,
+                serde_json::json!({
+                    "brush_strokes": issue_session
+                        .as_ref()
+                        .map(|session| session.label_strokes.len())
+                        .unwrap_or(0),
+                }),
+                renderer,
+                window,
+                model_info,
+                issue_session,
+                project,
+                analysis_report,
+                cross_section,
+                brush_tool,
+                selected_pick,
+                hit_stack_state,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::ApplyCut => {
+            let (normal, keep) = cut_plane_from_section(*cross_section);
+            apply_worker_mesh_revision(
+                "meshmend-cgal-worker",
+                WorkerOperation::Cut,
+                OperationKind::Cut,
+                "cut",
+                None,
+                serde_json::json!({
+                    "plane_nx": normal[0],
+                    "plane_ny": normal[1],
+                    "plane_nz": normal[2],
+                    "plane_offset": cross_section.offset,
+                    "keep": keep,
+                }),
+                renderer,
+                window,
+                model_info,
+                issue_session,
+                project,
+                analysis_report,
+                cross_section,
+                brush_tool,
+                selected_pick,
+                hit_stack_state,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::ApplyRemesh => {
+            apply_worker_mesh_revision(
+                "meshmend-cgal-worker",
+                WorkerOperation::Remesh,
+                OperationKind::Remesh,
+                "remesh",
+                Some(remesh_tool.target_edge_length),
+                serde_json::json!({
+                    "target_edge_length": remesh_tool.target_edge_length,
+                }),
+                renderer,
+                window,
+                model_info,
+                issue_session,
+                project,
+                analysis_report,
+                cross_section,
+                brush_tool,
+                selected_pick,
+                hit_stack_state,
+                status,
+                needs_redraw,
+            );
+        }
     }
 }
 
@@ -1626,6 +1753,166 @@ fn reset_camera(renderer: &mut WgpuRenderer<'_>) {
         );
         renderer.set_camera(camera);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_worker_mesh_revision(
+    worker_binary_name: &str,
+    worker_operation: WorkerOperation,
+    project_operation: OperationKind,
+    label: &str,
+    target_edge_length: Option<f64>,
+    options: serde_json::Value,
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    issue_session: &mut Option<IssueSession>,
+    project: &mut Option<MeshMendProject>,
+    analysis_report: &mut Option<AnalysisReport>,
+    cross_section: &mut CrossSectionState,
+    brush_tool: &mut BrushToolState,
+    selected_pick: &mut Option<PickResult>,
+    hit_stack_state: &mut HitStackState,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(model) = model_info.as_ref() else {
+        *status = "Load an STL before applying a repair".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    if project.is_none() {
+        *project = Some(project_from_model(model));
+    }
+    let Some(project) = project.as_mut() else {
+        *status = "No project state available for repair".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    let input_mesh = project
+        .current_revision()
+        .map(|revision| revision.mesh_path.clone())
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| model.path.clone());
+    let output_mesh = PathBuf::from("outputs").join("operations").join(format!(
+        "{}-{}.stl",
+        label,
+        now_unix_ms()
+    ));
+    let operation_id = project.record_operation(
+        project_operation,
+        OperationStatus::Planned,
+        serde_json::json!({
+            "input_mesh": input_mesh,
+            "output_mesh": output_mesh,
+            "target_edge_length": target_edge_length,
+            "options": options.clone(),
+        }),
+        Vec::new(),
+    );
+
+    let result = run_worker_mesh_operation(
+        worker_binary_name,
+        worker_operation,
+        &input_mesh,
+        &output_mesh,
+        target_edge_length,
+        options,
+        label,
+    )
+    .and_then(|()| load_model(&output_mesh, renderer, window));
+
+    match result {
+        Ok(info) => {
+            let report = run_analysis_for_model(&info).ok();
+            let validation = report
+                .as_ref()
+                .map(validation_from_analysis)
+                .unwrap_or_default();
+            project.apply_mesh_revision(
+                operation_id,
+                label,
+                output_mesh.clone(),
+                info.stats.triangle_count,
+                validation,
+            );
+            *cross_section = CrossSectionState::centered(info.stats.bounds);
+            *issue_session = Some(IssueSession::new(
+                info.file_name.clone(),
+                info.stats.source_bytes,
+            ));
+            *analysis_report = report;
+            *model_info = Some(info);
+            *selected_pick = None;
+            hit_stack_state.clear();
+            brush_tool.finish_stroke();
+            renderer.set_selection_marker(None);
+            renderer.set_issue_markers(&[]);
+            renderer.set_label_strokes(&[]);
+            *status = format!("Applied {label} repair");
+        }
+        Err(err) => {
+            if let Some(operation) = project
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == operation_id)
+            {
+                operation.status = OperationStatus::Failed;
+                operation.warnings.push(err.to_string());
+            }
+            *status = format!("{label} failed: {err}");
+            tracing::error!(error = %err, "worker repair failed");
+        }
+    }
+    *needs_redraw = true;
+}
+
+fn run_worker_mesh_operation(
+    worker_binary_name: &str,
+    worker_operation: WorkerOperation,
+    input_mesh: &Path,
+    output_mesh: &Path,
+    target_edge_length: Option<f64>,
+    options: serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let binary = discover_worker_binary(worker_binary_name).ok_or_else(|| {
+        anyhow!("worker {worker_binary_name} was not found; run `just worker-build`")
+    })?;
+    let worker_dir = PathBuf::from("outputs").join("workers");
+    fs::create_dir_all(&worker_dir)?;
+    let response_path = worker_dir.join(format!("{label}-ui-response.json"));
+    let request_path = worker_dir.join(format!("{label}-ui-request.json"));
+    let mut request = WorkerRequest::new(worker_operation, input_mesh, response_path);
+    request.output_mesh = Some(output_mesh.to_path_buf());
+    request.preview = false;
+    request.target_edge_length = target_edge_length;
+    request.options = options;
+    let result = WorkerRunner::new(binary).run(&request, &request_path)?;
+    if !result.response.success {
+        anyhow::bail!(
+            "{}",
+            result
+                .response
+                .error
+                .unwrap_or_else(|| "worker returned failure".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn cut_plane_from_section(cross_section: CrossSectionState) -> ([f64; 3], &'static str) {
+    let normal = match cross_section.axis {
+        CrossSectionAxis::X => [1.0, 0.0, 0.0],
+        CrossSectionAxis::Y => [0.0, 1.0, 0.0],
+        CrossSectionAxis::Z => [0.0, 0.0, 1.0],
+    };
+    let keep = if cross_section.flip_side {
+        "negative"
+    } else {
+        "positive"
+    };
+    (normal, keep)
 }
 
 fn select_at_cursor(
@@ -1837,7 +2124,7 @@ fn hash_file_fnv1a64(path: &Path) -> Result<String> {
 fn estimate_mesh_detail_unit(parsed: &ParsedStl) -> f32 {
     const MAX_SAMPLED_TRIANGLES: usize = 50_000;
     const MIN_BOUND_FRACTION: f32 = 0.0001;
-    const FALLBACK_BOUND_FRACTION: f32 = 0.01;
+    const DEFAULT_BOUND_FRACTION: f32 = 0.01;
 
     let triangle_count = parsed.stats.triangle_count as usize;
     let step = (triangle_count / MAX_SAMPLED_TRIANGLES).max(1);
@@ -1872,10 +2159,10 @@ fn estimate_mesh_detail_unit(parsed: &ParsedStl) -> f32 {
     } else {
         1.0
     };
-    let fallback = bounds_radius * FALLBACK_BOUND_FRACTION;
+    let default_edge = bounds_radius * DEFAULT_BOUND_FRACTION;
     let minimum = bounds_radius * MIN_BOUND_FRACTION;
     let average_edge = if edge_count == 0 {
-        fallback
+        default_edge
     } else {
         (edge_total / edge_count as f64) as f32
     };
@@ -2031,6 +2318,7 @@ fn draw_ui(
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
     measure_tool: &mut MeasureToolState,
+    remesh_tool: &mut RemeshToolState,
     tool_mode: &mut ToolMode,
     view_mode: &mut ViewMode,
     gpu_buffer_bytes: u64,
@@ -2128,6 +2416,7 @@ fn draw_ui(
                 selected_issue_kind,
                 brush_tool,
                 measure_tool,
+                remesh_tool,
                 *tool_mode,
                 *view_mode,
                 gpu_buffer_bytes,
@@ -2265,6 +2554,7 @@ fn draw_repair_panel(
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
     measure_tool: &mut MeasureToolState,
+    remesh_tool: &mut RemeshToolState,
     tool_mode: ToolMode,
     view_mode: ViewMode,
     gpu_buffer_bytes: u64,
@@ -2301,22 +2591,10 @@ fn draw_repair_panel(
         ToolMode::RepairBrush => {
             draw_repair_brush_tools(ui, model, issue_session, brush_tool, action)
         }
-        ToolMode::HoleFill => draw_operation_stub(
-            ui,
-            "Hole Fill",
-            "Select an open boundary loop, preview a refined cap, then apply the repair.",
-        ),
-        ToolMode::Cut => draw_operation_stub(
-            ui,
-            "Cut",
-            "Draw a cut line, preview both sides, then apply a capped printable split.",
-        ),
+        ToolMode::HoleFill => draw_hole_fill_tools(ui, analysis_report, action),
+        ToolMode::Cut => draw_cut_tools(ui, cross_section, action),
         ToolMode::Measure => draw_measure_tools(ui, selected_pick, project, measure_tool, action),
-        ToolMode::Remesh => draw_operation_stub(
-            ui,
-            "Remesh",
-            "Choose a physical target resolution and preview mesh density changes.",
-        ),
+        ToolMode::Remesh => draw_remesh_tools(ui, project, remesh_tool, action),
         ToolMode::Export => draw_export_tools(ui, project, action),
         ToolMode::Select | ToolMode::Navigate | ToolMode::XrayInspect => {
             draw_cross_section_tools(ui, model, cross_section, action);
@@ -2501,8 +2779,9 @@ fn draw_repair_brush_tools(
     ui.add(egui::Slider::new(&mut brush_tool.min_screen_spacing, 2.0..=32.0).text("Spacing"));
 
     ui.horizontal(|ui| {
-        ui.add_enabled(false, egui::Button::new("Preview"));
-        ui.add_enabled(false, egui::Button::new("Apply"));
+        if ui.button("Apply Local Wrap").clicked() {
+            *action = UiAction::ApplyLocalWrap;
+        }
         if ui.button("Clear Regions").clicked() {
             *action = UiAction::ClearLabelStrokes;
         }
@@ -2525,6 +2804,60 @@ fn draw_repair_brush_tools(
                 }
             });
         }
+    }
+}
+
+fn draw_hole_fill_tools(
+    ui: &mut egui::Ui,
+    analysis_report: Option<&AnalysisReport>,
+    action: &mut UiAction,
+) {
+    ui.heading("Hole Fill");
+    let boundary_loops = analysis_report
+        .map(|report| report.topology.boundary_loop_count)
+        .unwrap_or(0);
+    ui.label(format!("Detected boundary loops: {boundary_loops}"));
+    ui.label("Apply fills open boundary cycles and validates the resulting mesh.");
+    if ui.button("Apply Hole Fill").clicked() {
+        *action = UiAction::ApplyHoleFill;
+    }
+}
+
+fn draw_cut_tools(ui: &mut egui::Ui, cross_section: &mut CrossSectionState, action: &mut UiAction) {
+    ui.heading("Cut");
+    ui.label("The cut uses the current cross-section plane as the bisect plane.");
+    ui.horizontal(|ui| {
+        ui.label("Axis");
+        for axis in CrossSectionAxis::ALL {
+            ui.selectable_value(&mut cross_section.axis, axis, axis.label());
+        }
+    });
+    ui.add(egui::DragValue::new(&mut cross_section.offset).speed(0.01));
+    ui.checkbox(&mut cross_section.flip_side, "Keep negative side");
+    if ui.button("Apply Capped Cut").clicked() {
+        *action = UiAction::ApplyCut;
+    }
+}
+
+fn draw_remesh_tools(
+    ui: &mut egui::Ui,
+    project: Option<&MeshMendProject>,
+    remesh_tool: &mut RemeshToolState,
+    action: &mut UiAction,
+) {
+    ui.heading("Remesh");
+    if let Some(scale) = project.and_then(|project| project.scale.as_ref()) {
+        let microns = remesh_tool.target_edge_length / scale.model_units_per_mm * 1000.0;
+        ui.label(format!("Target: {:.1} microns", microns));
+    }
+    ui.add(
+        egui::DragValue::new(&mut remesh_tool.target_edge_length)
+            .speed(0.01)
+            .clamp_range(0.000001..=1_000_000.0)
+            .prefix("Target edge "),
+    );
+    if ui.button("Apply Remesh").clicked() {
+        *action = UiAction::ApplyRemesh;
     }
 }
 
@@ -2581,10 +2914,10 @@ fn draw_defect_tools(
 
     ui.horizontal(|ui| {
         if ui.button("Save Repair Data").clicked() {
-            *action = UiAction::SaveIssues;
+            *action = UiAction::SaveRepairData;
         }
         if ui.button("Load Repair Data").clicked() {
-            *action = UiAction::LoadIssues;
+            *action = UiAction::LoadRepairData;
         }
     });
 
@@ -2761,14 +3094,4 @@ fn point_label(point: Option<[f32; 3]>) -> String {
     point
         .map(|point| format!("{:.4}, {:.4}, {:.4}", point[0], point[1], point[2]))
         .unwrap_or_else(|| "unset".to_string())
-}
-
-fn draw_operation_stub(ui: &mut egui::Ui, title: &str, description: &str) {
-    ui.heading(title);
-    ui.label(description);
-    ui.horizontal(|ui| {
-        ui.add_enabled(false, egui::Button::new("Preview"));
-        ui.add_enabled(false, egui::Button::new("Apply"));
-        ui.add_enabled(false, egui::Button::new("Cancel"));
-    });
 }

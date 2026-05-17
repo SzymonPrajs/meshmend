@@ -1,6 +1,7 @@
 # Local Heal Direction
 
-Local repair should start from painted labels, not from global mesh heuristics.
+Local repair should start from painted repair regions, not from global mesh
+heuristics.
 
 The intended workflow is:
 

@@ -65,9 +65,9 @@ The current inspection milestone is complete when:
 - orbit, pan, and zoom work smoothly enough to inspect the loaded mesh
 - the camera fits the model to view after loading
 - the app reports basic mesh stats such as triangle count and bounds
-- basic selection, issue marking, screenshots, and performance metrics work
+- basic selection, defect recording, screenshots, and performance metrics work
 - a cross-section plane can inspect hidden internal geometry along X, Y, or Z
-- brush labels can mark healthy boundary and repair target regions
+- repair-region brushing can mark healthy boundary and repair target regions
 - the app follows the current master plan phase being implemented
 
 The master plan supersedes this historical inspection milestone when the two
