@@ -1,0 +1,12 @@
+{
+  "name": "meshmend",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "scripts/run-meshmend.sh",
+    "start": "scripts/run-meshmend.sh",
+    "smoke": "cargo run -p meshmend -- --smoke-window",
+    "verify": "cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl",
+    "test": "cargo test --workspace"
+  }
+}

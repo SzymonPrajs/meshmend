@@ -60,6 +60,7 @@ The intended stack is:
 Current implementation commands:
 
 ```bash
+npm run dev
 cargo run -p meshmend
 cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- fixtures/stl/cube_binary.stl
@@ -67,6 +68,10 @@ cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- --screenshot fixtures/stl/cube_binary.stl outputs/cube.png
 cargo run -p meshmend -- perf fixtures/stl/cube_binary.stl --output outputs/perf-cube.json
 ```
+
+The Codex app run action can use the root `npm run dev` script. It starts the
+native viewer with `rose/raw.stl` when that ignored local asset is present, and
+otherwise opens the viewer without an initial STL.
 
 Verification:
 
