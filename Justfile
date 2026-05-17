@@ -15,6 +15,17 @@ build:
 release:
     cargo build --workspace --release
 
+package:
+    just release
+    just worker-build
+    bash scripts/package-macos.sh
+
+package-smoke:
+    just package
+    target/package/MeshMend.app/Contents/MacOS/meshmend --smoke-window
+    target/package/MeshMend.app/Contents/MacOS/meshmend worker-smoke cgal fixtures/stl/cube_binary.stl
+    target/package/MeshMend.app/Contents/MacOS/meshmend worker-smoke openvdb fixtures/stl/cube_binary.stl
+
 test:
     cargo test --workspace
 

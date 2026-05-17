@@ -9,6 +9,25 @@ Early release status:
 Unsigned developer preview
 ```
 
+Local macOS packaging is available through:
+
+```bash
+just package
+just package-smoke
+```
+
+The package recipe builds:
+
+```text
+target/package/MeshMend.app/
+  Contents/MacOS/meshmend
+  Contents/Resources/workers/meshmend-cgal-worker
+  Contents/Resources/workers/meshmend-openvdb-worker
+```
+
+The app binary discovers workers from `Contents/Resources/workers`, matching the
+runtime worker discovery path used by release builds.
+
 Signing is intentionally late-stage:
 
 - Windows requires a code-signing certificate and GitHub secret handling.

@@ -8,6 +8,7 @@ Commands:
 ```bash
 cargo run -p meshmend -- perf fixtures/stl/cube_binary.stl --output outputs/perf-cube.json
 cargo run -p meshmend -- perf rose/raw.stl --output outputs/perf-rose.json
+just package-smoke
 ```
 
 The JSON report records:
@@ -23,3 +24,6 @@ The JSON report records:
 - CPU RSS on Unix platforms where `ps` is available
 - GPU buffer allocation totals from MeshMend-owned buffers
 - render nonblank coverage
+
+Release performance checks should keep both fixture and rose reports under
+`outputs/` because those reports are generated artifacts, not committed source.

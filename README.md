@@ -69,6 +69,8 @@ just run
 just run-file fixtures/stl/cube_binary.stl
 just build
 just release
+just package
+just package-smoke
 just test
 just lint
 just verify
@@ -89,6 +91,8 @@ just lint
 just test
 just release
 just verify
+just repair-smoke
+just package-smoke
 ```
 
 Local large-model checks use the ignored file:
