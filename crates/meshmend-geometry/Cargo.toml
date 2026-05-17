@@ -1,0 +1,10 @@
+[package]
+name = "meshmend-geometry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+meshmend-core = { path = "../meshmend-core" }

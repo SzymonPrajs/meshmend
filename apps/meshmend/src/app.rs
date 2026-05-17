@@ -12,7 +12,7 @@ use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_render::{
     DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
-    WgpuRenderer,
+    SelectionSummary, WgpuRenderer,
 };
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
@@ -33,6 +33,7 @@ struct ModelInfo {
     chunk_count: usize,
     parse_ms: f64,
     brush_unit: f32,
+    selection_summary: Option<SelectionSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +173,21 @@ struct BrushToolState {
     last_sample_screen: Option<glam::Vec2>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct HitStackState {
+    screen_position: Option<glam::Vec2>,
+    hits: Vec<PickResult>,
+    index: usize,
+}
+
+impl HitStackState {
+    fn clear(&mut self) {
+        self.screen_position = None;
+        self.hits.clear();
+        self.index = 0;
+    }
+}
+
 impl Default for BrushToolState {
     fn default() -> Self {
         Self {
@@ -256,6 +272,7 @@ pub fn run_native(
     let mut active_modifiers = ModifiersState::default();
     let mut needs_redraw = true;
     let mut selected_pick: Option<PickResult> = None;
+    let mut hit_stack_state = HitStackState::default();
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
@@ -318,6 +335,7 @@ pub fn run_native(
                             selected_issue_kind,
                             &mut brush_tool,
                             &mut selected_pick,
+                            &mut hit_stack_state,
                             &mut status,
                             &mut needs_redraw,
                         );
@@ -373,19 +391,20 @@ pub fn run_native(
                     }
                     WindowEvent::DroppedFile(path) => {
                         match load_model(&path, &mut renderer, redraw_window) {
-                                Ok(info) => {
-                                    status = format!("Loaded {}", info.file_name);
-                                    issue_session = Some(IssueSession::new(
-                                        info.file_name.clone(),
-                                        info.stats.source_bytes,
-                                    ));
-                                    cross_section = CrossSectionState::centered(info.stats.bounds);
-                                    model_info = Some(info);
-                                    selected_pick = None;
-                                    brush_tool.finish_stroke();
-                                    renderer.set_issue_markers(&[]);
-                                    renderer.set_label_strokes(&[]);
-                                }
+                            Ok(info) => {
+                                status = format!("Loaded {}", info.file_name);
+                                issue_session = Some(IssueSession::new(
+                                    info.file_name.clone(),
+                                    info.stats.source_bytes,
+                                ));
+                                cross_section = CrossSectionState::centered(info.stats.bounds);
+                                model_info = Some(info);
+                                selected_pick = None;
+                                hit_stack_state.clear();
+                                brush_tool.finish_stroke();
+                                renderer.set_issue_markers(&[]);
+                                renderer.set_label_strokes(&[]);
+                            }
                             Err(err) => {
                                 status = format!("Load failed: {err}");
                                 tracing::error!(error = %err, "failed to load dropped STL");
@@ -418,7 +437,8 @@ pub fn run_native(
                         }
                         ElementState::Released => {
                             if let Some(position) = camera_input.release(button) {
-                                if button == MouseButton::Left && brush_tool.active_stroke_index.is_some()
+                                if button == MouseButton::Left
+                                    && brush_tool.active_stroke_index.is_some()
                                 {
                                     if let Some(session) = issue_session.as_mut() {
                                         session.discard_empty_label_strokes();
@@ -431,24 +451,15 @@ pub fn run_native(
                                     && !active_modifiers.shift_key()
                                     && !egui_response.consumed
                                 {
-                                    match renderer.pick(position) {
-                                        Ok(pick) => {
-                                            selected_pick = pick;
-                                            if let Some(pick) = selected_pick {
-                                                status = format!(
-                                                    "Selected triangle {}:{}",
-                                                    pick.triangle_id.chunk,
-                                                    pick.triangle_id.local_index
-                                                );
-                                            }
-                                            needs_redraw = true;
-                                        }
-                                        Err(err) => {
-                                            status = format!("Pick failed: {err}");
-                                            tracing::error!(error = %err, "failed to pick triangle");
-                                            needs_redraw = true;
-                                        }
-                                    }
+                                    select_at_cursor(
+                                        &mut renderer,
+                                        view_mode,
+                                        position,
+                                        &mut selected_pick,
+                                        &mut hit_stack_state,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    );
                                 }
                             }
                         }
@@ -692,6 +703,77 @@ pub fn run_view_mode_verification(input: PathBuf) -> Result<()> {
     guard
         .take()
         .unwrap_or_else(|| Err(anyhow!("view mode verification did not run")))
+}
+
+pub fn run_hit_stack_verification(input: PathBuf) -> Result<()> {
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new()
+        .with_title("MeshMend hit stack verification")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_visible(false)
+        .build(&event_loop)?;
+    let window: &'static Window = Box::leak(Box::new(window));
+    let window_id = window.id();
+    let redraw_window = window;
+    let mut renderer = pollster::block_on(WgpuRenderer::new(window))?;
+    let _model = load_model(&input, &mut renderer, window)?;
+    let result: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+    let result_writer = Arc::clone(&result);
+    let mut needs_redraw = true;
+    let mut captured = false;
+
+    event_loop.run(move |event, target| {
+        target.set_control_flow(ControlFlow::Wait);
+
+        match event {
+            Event::WindowEvent {
+                window_id: event_window_id,
+                event: WindowEvent::RedrawRequested,
+            } if event_window_id == window_id && !captured => {
+                captured = true;
+                let center = glam::Vec2::new(
+                    renderer.size().width as f32 * 0.5,
+                    renderer.size().height as f32 * 0.5,
+                );
+                let capture = renderer
+                    .pick_hit_stack(center)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|hits| {
+                        println!("hit-stack center count={}", hits.len());
+                        for (index, hit) in hits.iter().take(6).enumerate() {
+                            println!(
+                                "hit {} triangle {}:{} at {:.6},{:.6},{:.6}",
+                                index + 1,
+                                hit.triangle_id.chunk,
+                                hit.triangle_id.local_index,
+                                hit.position.x,
+                                hit.position.y,
+                                hit.position.z
+                            );
+                        }
+                        if hits.len() < 2 {
+                            Err(anyhow!("hit stack verification expected at least two hits"))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                *result_writer
+                    .lock()
+                    .expect("hit stack result lock poisoned") = Some(capture);
+                target.exit();
+            }
+            Event::AboutToWait if needs_redraw => {
+                redraw_window.request_redraw();
+                needs_redraw = false;
+            }
+            _ => {}
+        }
+    })?;
+
+    let mut guard = result.lock().expect("hit stack result lock poisoned");
+    guard
+        .take()
+        .unwrap_or_else(|| Err(anyhow!("hit stack verification did not run")))
 }
 
 fn run_capture_with_options(
@@ -1036,6 +1118,7 @@ fn handle_ui_action(
     selected_issue_kind: IssueKind,
     brush_tool: &mut BrushToolState,
     selected_pick: &mut Option<PickResult>,
+    hit_stack_state: &mut HitStackState,
     status: &mut String,
     needs_redraw: &mut bool,
 ) {
@@ -1053,6 +1136,7 @@ fn handle_ui_action(
                         *cross_section = CrossSectionState::centered(info.stats.bounds);
                         *model_info = Some(info);
                         *selected_pick = None;
+                        hit_stack_state.clear();
                         brush_tool.finish_stroke();
                         renderer.set_selection_marker(None);
                         renderer.set_issue_markers(&[]);
@@ -1193,6 +1277,78 @@ fn reset_camera(renderer: &mut WgpuRenderer<'_>) {
     }
 }
 
+fn select_at_cursor(
+    renderer: &mut WgpuRenderer<'_>,
+    view_mode: ViewMode,
+    position: glam::Vec2,
+    selected_pick: &mut Option<PickResult>,
+    hit_stack_state: &mut HitStackState,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    if view_mode == ViewMode::XrayWire {
+        match renderer.pick_hit_stack(position) {
+            Ok(hits) if hits.is_empty() => {
+                *selected_pick = None;
+                hit_stack_state.clear();
+                renderer.set_selection_marker(None);
+                *status = "X-ray pick found no mesh hits".to_string();
+                *needs_redraw = true;
+            }
+            Ok(hits) => {
+                let same_cursor = hit_stack_state
+                    .screen_position
+                    .is_some_and(|previous| previous.distance(position) < 4.0);
+                let index = if same_cursor && hit_stack_state.hits.len() == hits.len() {
+                    (hit_stack_state.index + 1) % hits.len()
+                } else {
+                    0
+                };
+                hit_stack_state.screen_position = Some(position);
+                hit_stack_state.hits = hits;
+                hit_stack_state.index = index;
+
+                let pick = hit_stack_state.hits[index];
+                *selected_pick = Some(pick);
+                renderer.set_selection_marker(Some(pick.position));
+                *status = format!(
+                    "X-ray hit {}/{} triangle {}:{}",
+                    index + 1,
+                    hit_stack_state.hits.len(),
+                    pick.triangle_id.chunk,
+                    pick.triangle_id.local_index
+                );
+                *needs_redraw = true;
+            }
+            Err(err) => {
+                *status = format!("X-ray pick failed: {err}");
+                tracing::error!(error = %err, "failed to build x-ray hit stack");
+                *needs_redraw = true;
+            }
+        }
+        return;
+    }
+
+    hit_stack_state.clear();
+    match renderer.pick(position) {
+        Ok(pick) => {
+            *selected_pick = pick;
+            if let Some(pick) = *selected_pick {
+                *status = format!(
+                    "Selected triangle {}:{}",
+                    pick.triangle_id.chunk, pick.triangle_id.local_index
+                );
+            }
+            *needs_redraw = true;
+        }
+        Err(err) => {
+            *status = format!("Pick failed: {err}");
+            tracing::error!(error = %err, "failed to pick triangle");
+            *needs_redraw = true;
+        }
+    }
+}
+
 fn is_camera_button(button: MouseButton) -> bool {
     matches!(
         button,
@@ -1215,6 +1371,7 @@ fn load_model(
         chunk_count: parsed.chunks.len(),
         parse_ms: parsed.timings.parse.as_secs_f64() * 1000.0,
         brush_unit,
+        selection_summary: renderer.selection_summary(),
     };
     window.set_title(&format!("MeshMend - {}", info.file_name));
     tracing::info!(
@@ -1733,6 +1890,16 @@ fn draw_model_summary(
             ui.label(format!("Path: {}", model.path.display()));
             ui.label(format!("Triangles: {}", model.stats.triangle_count));
             ui.label(format!("Chunks: {}", model.chunk_count));
+            if let Some(summary) = model.selection_summary {
+                ui.label(format!("Indexed vertices: {}", summary.vertex_count));
+                ui.label(format!("Indexed faces: {}", summary.face_count));
+                ui.label(format!("Components: {}", summary.component_count));
+                ui.label(format!("Boundary loops: {}", summary.boundary_loop_count));
+                ui.label(format!(
+                    "Non-manifold edges: {}",
+                    summary.non_manifold_edge_count
+                ));
+            }
             ui.label(format!("Bytes: {}", model.stats.source_bytes));
             ui.label(format!("Parse: {:.2} ms", model.parse_ms));
             ui.label(format!("Brush unit: {:.5}", model.brush_unit));

@@ -30,3 +30,7 @@ image is effectively blank. `--verify-view-modes` repeats the same blank-frame
 check across every first-class viewport mode, including normals, surface wire,
 x-ray wire, transparent, and cross-section. Outputs under `outputs/` are
 ignored.
+
+`--verify-hit-stack` exercises the CPU selection BVH through the renderer and
+fails unless a center ray returns a multi-hit stack, proving x-ray selection can
+see beyond the front-most GPU pick.

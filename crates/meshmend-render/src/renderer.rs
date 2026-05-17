@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 use glam::{Vec2, Vec3, Vec4};
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshBounds, Triangle, TriangleId};
+use meshmend_geometry::{Ray, SelectionMesh};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -76,6 +77,15 @@ pub struct ScreenshotStats {
     pub coverage: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SelectionSummary {
+    pub vertex_count: usize,
+    pub face_count: usize,
+    pub component_count: u32,
+    pub boundary_loop_count: usize,
+    pub non_manifold_edge_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct LabelStrokeOverlay {
     pub points: Vec<Vec3>,
@@ -109,6 +119,7 @@ pub struct WgpuRenderer<'window> {
     label_strokes: Option<SceneLines>,
     selection_marker: Option<SceneLines>,
     issue_markers: Option<SceneLines>,
+    selection_mesh: Option<SelectionMesh>,
     display_settings: DisplaySettings,
     info: RendererInfo,
 }
@@ -319,6 +330,7 @@ impl<'window> WgpuRenderer<'window> {
             label_strokes: None,
             selection_marker: None,
             issue_markers: None,
+            selection_mesh: None,
             display_settings: DisplaySettings::default(),
             info,
         })
@@ -401,11 +413,24 @@ impl<'window> WgpuRenderer<'window> {
         self.label_strokes = None;
         self.selection_marker = None;
         self.issue_markers = None;
+        self.selection_mesh = None;
+        let mut selection_triangles = Vec::new();
 
         for chunk in chunks {
             if chunk.triangles.is_empty() {
                 continue;
             }
+            selection_triangles.extend(chunk.triangles.iter().copied().enumerate().map(
+                |(local_index, triangle)| {
+                    (
+                        TriangleId {
+                            chunk: chunk.chunk_index,
+                            local_index: local_index as u32,
+                        },
+                        triangle,
+                    )
+                },
+            ));
             let triangles = chunk
                 .triangles
                 .iter()
@@ -457,7 +482,36 @@ impl<'window> WgpuRenderer<'window> {
             });
         }
 
+        if !selection_triangles.is_empty() {
+            let started = std::time::Instant::now();
+            let selection_mesh = SelectionMesh::from_triangles(
+                selection_triangles,
+                selection_weld_tolerance(bounds),
+            );
+            tracing::info!(
+                vertices = selection_mesh.mesh.vertices.len(),
+                faces = selection_mesh.mesh.faces.len(),
+                components = selection_mesh.mesh.connectivity.component_count,
+                boundary_loops = selection_mesh.mesh.connectivity.boundary_loops.len(),
+                non_manifold_edges = selection_mesh.mesh.connectivity.non_manifold_edges.len(),
+                build_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "built CPU selection geometry"
+            );
+            self.selection_mesh = Some(selection_mesh);
+        }
+
         self.fit_camera_to_mesh();
+    }
+
+    pub fn selection_summary(&self) -> Option<SelectionSummary> {
+        let mesh = self.selection_mesh.as_ref()?;
+        Some(SelectionSummary {
+            vertex_count: mesh.mesh.vertices.len(),
+            face_count: mesh.mesh.faces.len(),
+            component_count: mesh.mesh.connectivity.component_count,
+            boundary_loop_count: mesh.mesh.connectivity.boundary_loops.len(),
+            non_manifold_edge_count: mesh.mesh.connectivity.non_manifold_edges.len(),
+        })
     }
 
     pub fn render(&mut self) -> Result<(), RenderError> {
@@ -841,6 +895,25 @@ impl<'window> WgpuRenderer<'window> {
             triangle_id,
             position,
         }))
+    }
+
+    pub fn pick_hit_stack(&self, screen_position: Vec2) -> Result<Vec<PickResult>, RenderError> {
+        let Some(selection_mesh) = &self.selection_mesh else {
+            return Ok(Vec::new());
+        };
+        let ray = self.pick_ray(screen_position);
+        let clip_plane = self
+            .cross_section
+            .enabled
+            .then(|| self.cross_section.plane());
+        Ok(selection_mesh
+            .hit_stack(ray, clip_plane)
+            .into_iter()
+            .map(|hit| PickResult {
+                triangle_id: hit.source_id,
+                position: hit.position,
+            })
+            .collect())
     }
 
     pub fn set_selection_marker(&mut self, position: Option<Vec3>) {
@@ -1586,12 +1659,6 @@ impl PickingTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Ray {
-    origin: Vec3,
-    direction: Vec3,
-}
-
 fn intersect_triangle(ray: Ray, triangle: Triangle) -> Option<Vec3> {
     let epsilon = 1.0e-7;
     let edge1 = triangle.vertices[1] - triangle.vertices[0];
@@ -1640,6 +1707,10 @@ fn count_non_background_pixels(rgba: &[u8]) -> u64 {
 
 fn aspect_from_size(size: PhysicalSize<u32>) -> f32 {
     size.width.max(1) as f32 / size.height.max(1) as f32
+}
+
+fn selection_weld_tolerance(bounds: MeshBounds) -> f32 {
+    bounds.radius().max(1.0) * 1.0e-6
 }
 
 struct DepthTexture {

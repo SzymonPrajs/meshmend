@@ -12,6 +12,7 @@ egui-wgpu.workspace = true
 glam.workspace = true
 image.workspace = true
 meshmend-core = { path = "../meshmend-core" }
+meshmend-geometry = { path = "../meshmend-geometry" }
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true

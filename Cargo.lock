@@ -1783,6 +1783,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshmend-geometry"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "meshmend-core",
+]
+
+[[package]]
 name = "meshmend-inspection"
 version = "0.1.0"
 dependencies = [
@@ -1811,6 +1819,7 @@ dependencies = [
  "glam",
  "image",
  "meshmend-core",
+ "meshmend-geometry",
  "thiserror 1.0.69",
  "tracing",
  "wgpu",
