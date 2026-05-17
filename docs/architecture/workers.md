@@ -4,6 +4,9 @@ MeshMend runs heavy geometry through external worker processes. Rust writes a
 versioned JSON request, launches the worker with `--request`, streams JSONL
 progress from stdout, then reads the final response JSON.
 
+During the viewer reset, these workers are CLI-only experiments. They are not
+reachable from the native viewer UI.
+
 Current binaries:
 
 - `meshmend-cgal-worker`: links CGAL, validates binary STL input, performs the

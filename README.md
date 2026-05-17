@@ -1,11 +1,11 @@
 # MeshMend
 
-This workspace is focused on MeshMend, a native Rust STL inspection app for
+This workspace is focused on MeshMend, a native Rust STL viewer for inspecting
 AI-generated 3D model meshes.
 
 The previous Python mesh-repair toolchain has been removed from the source
-tree. Its useful diagnostics, ROI, voxel, and CLI ideas now live in the native
-Rust/C++ implementation.
+tree. Repair experiments may remain as isolated Rust/C++ CLI code, but the
+active app surface is the viewer described in `plan.md`.
 
 ## Current Assets
 
@@ -20,31 +20,21 @@ track code and planning files, not raw model data.
 
 ## Current Implementation
 
-The active implementation is now the native viewer:
+The active implementation is the native viewer:
 
 - native `winit` desktop window
 - native `wgpu` renderer
 - Rust binary STL parsing and validation
+- menu-based STL open, save, and save-as/export
 - orbit, pan, zoom, fit, and reset camera controls
-- mesh stats, cross-section inspection, repair-region brushing, defect
-  selection, screenshots, and performance metrics
-- directory-backed `.meshmend` project state for source hashes, operation
-  history, undo/redo revision pointers, exports, and repair reports
-- Rust topology analysis for components, open boundaries, non-manifold edges,
-  duplicate/degenerate faces, simple contained-shell candidates, and CLI
-  reports via `meshmend analyze`
-- process-based C++ worker protocol with CGAL and OpenVDB smoke workers built
-  by `just worker-build`
-- CGAL-backed `meshmend hole-fill` repair smoke path for closing simple
-  boundary loops and exporting a repaired STL
-- OpenVDB-backed `meshmend local-wrap` path for rebuilding a mesh through an
-  explicit voxel/SDF surface extraction and exporting the wrapped STL
-- CGAL-backed `meshmend cut` straight bisect path that clips by a plane, caps
-  the kept side, validates topology, and exports STL
-- measure/scale controls in the native app that store model-units-per-mm in the
-  project, plus CGAL-backed `meshmend remesh` for target edge-length remeshing
-- explicit STL export validation in the app and `meshmend export` CLI reports
-  with JSON/Markdown validation output
+- top toolbar view modes: rendered, wireframe, surface wire, x-ray wire,
+  transparent, normals, studio lighting, and headlight lighting
+- compact bottom status bar with file name, triangle count, backend, GPU
+  memory, FPS/frame time, current view, and transient status
+- screenshot, view-mode, and performance verification commands
+
+No repair, annotation, cross-section, remesh, worker, issue, or project panel is
+exposed in the active viewer UI during this reset.
 
 ## App Location
 
@@ -62,7 +52,7 @@ The intended stack is:
 - `egui` for overlay UI
 - `rayon` and `memmap2` for large STL loading
 
-Current implementation commands:
+Current viewer commands:
 
 ```bash
 just run
@@ -75,7 +65,6 @@ just test
 just lint
 just verify
 just smoke
-just repair-smoke
 just verify-rose
 just perf fixtures/stl/cube_binary.stl
 ```
@@ -91,7 +80,6 @@ just lint
 just test
 just release
 just verify
-just repair-smoke
 just package-smoke
 ```
 
@@ -101,3 +89,7 @@ Local large-model checks use the ignored file:
 just verify-rose
 just perf rose/raw.stl
 ```
+
+CLI-only geometry and worker experiments still exist for later reference, but
+they are not reachable from the active app UI. Build them explicitly with
+`just worker-build` before running worker commands.

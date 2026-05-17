@@ -1,6 +1,6 @@
 # Verification
 
-Core checks:
+Core viewer checks:
 
 ```bash
 just lint
@@ -16,21 +16,21 @@ cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- inspect rose/raw.stl --parallel
 ```
 
-Analysis checks:
+CLI analysis checks:
 
 ```bash
 cargo test -p meshmend-analysis
 cargo run -p meshmend -- analyze fixtures/stl/cube_binary.stl --output outputs/analysis-cube.json
 ```
 
-Project checks:
+CLI project checks:
 
 ```bash
 cargo test -p meshmend-project
 cargo run -p meshmend -- project validate path/to/project.meshmend
 ```
 
-Worker checks:
+CLI worker checks:
 
 ```bash
 just worker-build
@@ -52,9 +52,10 @@ just verify-rose
 `--verify-render` captures pixels from the native WGPU surface and fails if the
 image is effectively blank. `--verify-view-modes` repeats the same blank-frame
 check across every first-class viewport mode, including normals, surface wire,
-x-ray wire, transparent, and cross-section. Outputs under `outputs/` are
+x-ray wire, and transparent. Outputs under `outputs/` are
 ignored.
 
 `--verify-hit-stack` exercises the CPU selection BVH through the renderer and
-fails unless a center ray returns a multi-hit stack, proving x-ray selection can
-see beyond the front-most GPU pick.
+fails unless a center ray returns a multi-hit stack. That path is a CLI
+diagnostic only; the active viewer UI no longer exposes hit-stack selection or
+starts selection-geometry preparation on load.

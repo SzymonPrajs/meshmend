@@ -8,6 +8,7 @@ use meshmend_worker_api::{discover_worker_binary, WorkerOperation, WorkerRequest
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
+mod icons;
 mod input;
 
 #[derive(Debug, Parser)]

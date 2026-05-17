@@ -1762,7 +1762,6 @@ dependencies = [
  "glam",
  "meshmend-analysis",
  "meshmend-core",
- "meshmend-inspection",
  "meshmend-io",
  "meshmend-project",
  "meshmend-render",
