@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 glam.workspace = true
 meshmend-core = { path = "../meshmend-core" }
+thiserror.workspace = true

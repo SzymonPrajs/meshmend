@@ -10,7 +10,9 @@ use glam::{Vec2, Vec3, Vec4};
 use meshmend_core::{
     CrossSectionAxis, CrossSectionPlane, CrossSectionState, MeshBounds, Triangle, TriangleId,
 };
-use meshmend_geometry::{Ray, SelectionMesh};
+use meshmend_geometry::{
+    cut_plane_from_view_rays, preview_cut, CutPlane, CutPreview, Ray, SelectionMesh,
+};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -140,6 +142,7 @@ pub struct WgpuRenderer<'window> {
     cross_section_guide: Option<SceneLines>,
     label_strokes: Option<SceneLines>,
     selection_overlay: Option<SelectionSceneOverlay>,
+    cut_preview: Option<SceneLines>,
     selection_marker: Option<SceneLines>,
     issue_markers: Option<SceneLines>,
     pick_mesh: Option<PickMesh>,
@@ -357,6 +360,7 @@ impl<'window> WgpuRenderer<'window> {
             cross_section_guide: None,
             label_strokes: None,
             selection_overlay: None,
+            cut_preview: None,
             selection_marker: None,
             issue_markers: None,
             pick_mesh: None,
@@ -443,6 +447,7 @@ impl<'window> WgpuRenderer<'window> {
         self.update_cross_section_guide();
         self.label_strokes = None;
         self.selection_overlay = None;
+        self.cut_preview = None;
         self.selection_marker = None;
         self.issue_markers = None;
         self.pick_mesh = None;
@@ -797,6 +802,12 @@ impl<'window> WgpuRenderer<'window> {
                     );
                 }
             }
+            if let Some(preview) = &self.cut_preview {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, preview.buffer.slice(..));
+                pass.draw(0..preview.grid_vertex_count, 0..1);
+            }
             if let Some(marker) = &self.selection_marker {
                 pass.set_pipeline(&self.grid_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -1138,6 +1149,64 @@ impl<'window> WgpuRenderer<'window> {
         });
     }
 
+    pub fn clear_cut_preview(&mut self) {
+        self.cut_preview = None;
+    }
+
+    pub fn set_cut_preview_segments(&mut self, segments: &[[Vec3; 2]]) {
+        self.cut_preview = (!segments.is_empty()).then(|| {
+            SceneLines::emphasized_segments(
+                &self.device,
+                segments,
+                self.marker_radius() * 0.045,
+                [1.0, 0.56, 0.08, 1.0],
+            )
+        });
+    }
+
+    pub fn view_line_cut_plane(&self, start: Vec2, end: Vec2) -> Option<CutPlane> {
+        if start.distance_squared(end) < 16.0 {
+            return None;
+        }
+        let start_ray = self.pick_ray(start);
+        let end_ray = self.pick_ray(end);
+        cut_plane_from_view_rays(self.camera.eye(), start_ray.direction, end_ray.direction)
+    }
+
+    pub fn cut_preview(&self, plane: CutPlane) -> CutPreview {
+        let epsilon = self
+            .mesh_bounds
+            .map(|bounds| bounds.radius().max(1.0) * 1.0e-6)
+            .unwrap_or(1.0e-6);
+        let mut segments = Vec::new();
+        let mut affected_triangle_count = 0;
+        for chunk in &self.mesh_chunks {
+            let preview = preview_cut(&chunk.cpu_triangles, plane, epsilon);
+            affected_triangle_count += preview.affected_triangle_count;
+            segments.extend(preview.segments);
+        }
+        CutPreview {
+            segments,
+            affected_triangle_count,
+        }
+    }
+
+    pub fn all_triangles(&self) -> Vec<Triangle> {
+        self.mesh_chunks
+            .iter()
+            .flat_map(|chunk| chunk.cpu_triangles.iter().copied())
+            .collect()
+    }
+
+    pub fn triangle_global_index(&self, triangle_id: TriangleId) -> Option<usize> {
+        let chunk = self
+            .mesh_chunks
+            .iter()
+            .find(|chunk| chunk.chunk_index == triangle_id.chunk)?;
+        let local = triangle_id.local_index as usize;
+        (local < chunk.cpu_triangles.len()).then_some(chunk.start_triangle as usize + local)
+    }
+
     pub fn triangle_vertices(&self, triangle_id: TriangleId) -> Option<[Vec3; 3]> {
         self.triangle(triangle_id).map(|triangle| triangle.vertices)
     }
@@ -1278,6 +1347,12 @@ impl<'window> WgpuRenderer<'window> {
                     0..1,
                 );
             }
+        }
+        if let Some(preview) = &self.cut_preview {
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, preview.buffer.slice(..));
+            pass.draw(0..preview.grid_vertex_count, 0..1);
         }
     }
 
@@ -1637,6 +1712,29 @@ impl SceneLines {
         }
     }
 
+    fn emphasized_segments(
+        device: &wgpu::Device,
+        segments: &[[Vec3; 2]],
+        radius: f32,
+        color: [f32; 4],
+    ) -> Self {
+        let mut vertices = Vec::with_capacity(segments.len() * 10);
+        for [start, end] in segments {
+            Self::push_emphasized_segment(&mut vertices, *start, *end, radius, color);
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend emphasized segment overlay buffer"),
+            contents: bytemuck::cast_slice(vertices.as_slice()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            buffer,
+            grid_vertex_count: vertices.len() as u32,
+            axes_vertex_count: 0,
+        }
+    }
+
     fn push_segment(vertices: &mut Vec<LineVertex>, start: Vec3, end: Vec3, color: [f32; 4]) {
         vertices.push(LineVertex {
             position: start.to_array(),
@@ -1646,6 +1744,30 @@ impl SceneLines {
             position: end.to_array(),
             color,
         });
+    }
+
+    fn push_emphasized_segment(
+        vertices: &mut Vec<LineVertex>,
+        start: Vec3,
+        end: Vec3,
+        radius: f32,
+        color: [f32; 4],
+    ) {
+        Self::push_segment(vertices, start, end, color);
+        let direction = (end - start).normalize_or_zero();
+        if direction.length_squared() <= f32::EPSILON || radius <= 0.0 {
+            return;
+        }
+        let reference = if direction.y.abs() < 0.9 {
+            Vec3::Y
+        } else {
+            Vec3::X
+        };
+        let side = direction.cross(reference).normalize_or_zero() * radius;
+        let up = direction.cross(side).normalize_or_zero() * radius;
+        for offset in [side, -side, up, -up] {
+            Self::push_segment(vertices, start + offset, end + offset, color);
+        }
     }
 
     fn push_triangle(vertices: &mut Vec<LineVertex>, face: [Vec3; 3], color: [f32; 4]) {
@@ -1772,10 +1894,10 @@ struct SelectionSceneOverlay {
 impl SelectionSceneOverlay {
     fn new(device: &wgpu::Device, overlay: &SelectionOverlay, marker_radius: f32) -> Self {
         let face_fill = [1.0, 0.48, 0.02, 0.46];
-        let edge_color = [1.0, 0.56, 0.08, 1.0];
+        let edge_color = [1.0, 0.68, 0.18, 1.0];
         let vertex_color = [1.0, 0.72, 0.20, 1.0];
         let mut vertices = Vec::with_capacity(
-            overlay.faces.len() * 3 + overlay.edges.len() * 2 + overlay.vertices.len() * 96,
+            overlay.faces.len() * 3 + overlay.edges.len() * 10 + overlay.vertices.len() * 96,
         );
 
         for face in &overlay.faces {
@@ -1784,7 +1906,13 @@ impl SelectionSceneOverlay {
         let face_vertex_count = vertices.len() as u32;
 
         for [start, end] in &overlay.edges {
-            SceneLines::push_segment(&mut vertices, *start, *end, edge_color);
+            SceneLines::push_emphasized_segment(
+                &mut vertices,
+                *start,
+                *end,
+                marker_radius * 0.055,
+                edge_color,
+            );
         }
         for position in &overlay.vertices {
             let radius = marker_radius * 1.35;

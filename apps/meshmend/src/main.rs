@@ -2,8 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use glam::Vec3;
+use meshmend_geometry::{
+    split_and_cap_mesh, CapDensity, CutMeshOptions, CutMeshResult, CutPlane, CutSide,
+};
 use meshmend_project::MeshMendProject;
-use meshmend_stl::{load_binary_stl_with_options, LoadOptions};
+use meshmend_stl::{load_binary_stl_with_options, write_binary_stl, LoadOptions};
 use meshmend_worker_api::{discover_worker_binary, WorkerOperation, WorkerRequest, WorkerRunner};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -79,12 +83,22 @@ enum Command {
         path: PathBuf,
         #[arg(long, value_name = "STL")]
         output: PathBuf,
+        #[arg(long, value_name = "STL")]
+        output_positive: Option<PathBuf>,
+        #[arg(long, value_name = "STL")]
+        output_negative: Option<PathBuf>,
         #[arg(long, num_args = 3, value_names = ["X", "Y", "Z"])]
         normal: Vec<f64>,
         #[arg(long, default_value_t = 0.0)]
         offset: f64,
         #[arg(long, value_enum, default_value_t = CutKeepSide::Positive)]
         keep: CutKeepSide,
+        #[arg(long)]
+        smooth_cap: bool,
+        #[arg(long, value_name = "JSON")]
+        report_json: Option<PathBuf>,
+        #[arg(long, value_name = "MD")]
+        report_md: Option<PathBuf>,
     },
     Remesh {
         #[arg(value_name = "STL")]
@@ -144,15 +158,6 @@ enum WorkerBackend {
 enum CutKeepSide {
     Positive,
     Negative,
-}
-
-impl CutKeepSide {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Positive => "positive",
-            Self::Negative => "negative",
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -347,47 +352,73 @@ fn main() -> Result<()> {
         Some(Command::Cut {
             path,
             output,
+            output_positive,
+            output_negative,
             normal,
             offset,
             keep,
+            smooth_cap,
+            report_json,
+            report_md,
         }) => {
             if normal.len() != 3 {
                 anyhow::bail!("cut --normal requires exactly three values");
             }
-            let binary = discover_worker_binary("meshmend-cgal-worker").ok_or_else(|| {
-                anyhow::anyhow!("CGAL worker was not found; run `just worker-build`")
-            })?;
-            if let Some(parent) = output
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                std::fs::create_dir_all(parent)?;
+            let parsed = load_binary_stl_with_options(
+                &path,
+                &LoadOptions {
+                    parallel: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            let triangles = parsed
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.triangles.iter().copied())
+                .collect::<Vec<_>>();
+            let normal = Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
+            let plane = CutPlane {
+                normal: normal.normalize_or_zero(),
+                offset: offset as f32,
+            };
+            if plane.normal.length_squared() <= f32::EPSILON {
+                anyhow::bail!("cut --normal requires a non-zero vector");
             }
-            let response_path = PathBuf::from("outputs")
-                .join("workers")
-                .join("cut-response.json");
-            let request_path = PathBuf::from("outputs")
-                .join("workers")
-                .join("cut-request.json");
-            let mut request = WorkerRequest::new(WorkerOperation::Cut, path.clone(), response_path);
-            request.output_mesh = Some(output.clone());
-            request.preview = false;
-            request.options = serde_json::json!({
-                "plane_nx": normal[0],
-                "plane_ny": normal[1],
-                "plane_nz": normal[2],
-                "plane_offset": offset,
-                "keep": keep.as_str(),
-            });
-            let result = WorkerRunner::new(binary).run(&request, &request_path)?;
-            if !result.response.success {
-                anyhow::bail!(
-                    "cut worker failed: {}",
-                    result
-                        .response
-                        .error
-                        .unwrap_or_else(|| "unknown".to_string())
-                );
+            let result = split_and_cap_mesh(
+                &triangles,
+                plane,
+                CutMeshOptions {
+                    weld_tolerance: parsed.stats.bounds.radius().max(1.0) * 1.0e-6,
+                    target_edge_length: None,
+                    cap_density: CapDensity::Automatic,
+                    smooth_cap,
+                },
+            )?;
+            let side = match keep {
+                CutKeepSide::Positive => CutSide::Positive,
+                CutKeepSide::Negative => CutSide::Negative,
+            };
+            let piece = result
+                .pieces
+                .iter()
+                .find(|piece| piece.side == side)
+                .expect("cut result should contain requested side");
+            write_binary_stl(&output, &piece.triangles)?;
+            if let Some(path) = output_positive.as_ref() {
+                let positive = result
+                    .pieces
+                    .iter()
+                    .find(|piece| piece.side == CutSide::Positive)
+                    .expect("cut result should contain positive side");
+                write_binary_stl(path, &positive.triangles)?;
+            }
+            if let Some(path) = output_negative.as_ref() {
+                let negative = result
+                    .pieces
+                    .iter()
+                    .find(|piece| piece.side == CutSide::Negative)
+                    .expect("cut result should contain negative side");
+                write_binary_stl(path, &negative.triangles)?;
             }
             let parsed = load_binary_stl_with_options(
                 &output,
@@ -399,11 +430,26 @@ fn main() -> Result<()> {
             let report = app::analyze_parsed_stl(&parsed);
             println!("wrote: {}", output.display());
             println!("triangles: {}", parsed.stats.triangle_count);
+            println!("cut loops: {}", result.loops.len());
+            println!("cap triangles: {}", piece.cap_triangle_count);
+            println!("target cap edge length: {:.6}", result.target_edge_length);
             println!("boundary loops: {}", report.topology.boundary_loop_count);
             println!(
                 "non-manifold edges: {}",
                 report.topology.non_manifold_edge_count
             );
+            write_cut_reports(
+                &path,
+                &output,
+                output_positive.as_deref(),
+                output_negative.as_deref(),
+                plane,
+                side,
+                &result,
+                &report,
+                report_json.as_deref(),
+                report_md.as_deref(),
+            )?;
         }
         Some(Command::Remesh {
             path,
@@ -622,6 +668,148 @@ fn export_mesh_with_reports(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_cut_reports(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    output_positive: Option<&std::path::Path>,
+    output_negative: Option<&std::path::Path>,
+    plane: CutPlane,
+    kept_side: CutSide,
+    cut: &CutMeshResult,
+    report: &meshmend_analysis::AnalysisReport,
+    report_json: Option<&std::path::Path>,
+    report_md: Option<&std::path::Path>,
+) -> Result<()> {
+    if report_json.is_none() && report_md.is_none() {
+        return Ok(());
+    }
+    let pieces = cut
+        .pieces
+        .iter()
+        .map(|piece| {
+            serde_json::json!({
+                "side": cut_side_label(piece.side),
+                "triangles": piece.triangles.len(),
+                "cap_triangles": piece.cap_triangle_count,
+                "bounds": {
+                    "min": [piece.bounds.min.x, piece.bounds.min.y, piece.bounds.min.z],
+                    "max": [piece.bounds.max.x, piece.bounds.max.y, piece.bounds.max.z],
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let cut_report = serde_json::json!({
+        "version": 1,
+        "source": source,
+        "output": output,
+        "output_positive": output_positive,
+        "output_negative": output_negative,
+        "kept_side": cut_side_label(kept_side),
+        "cut": {
+            "plane": {
+                "normal": [plane.normal.x, plane.normal.y, plane.normal.z],
+                "offset": plane.offset,
+            },
+            "loop_count": cut.loops.len(),
+            "loops": cut.loops.iter().map(|cut_loop| serde_json::json!({
+                "vertices": cut_loop.vertices.len(),
+                "closed": cut_loop.closed,
+                "length": cut_loop.length,
+            })).collect::<Vec<_>>(),
+            "target_cap_edge_length": cut.target_edge_length,
+            "warnings": cut.warnings,
+        },
+        "pieces": pieces,
+        "validation": {
+            "triangle_count": report.summary.triangle_count,
+            "component_count": report.topology.component_count,
+            "boundary_loop_count": report.topology.boundary_loop_count,
+            "non_manifold_edge_count": report.topology.non_manifold_edge_count,
+            "defect_count": report.defects.len(),
+        },
+    });
+
+    if let Some(path) = report_json {
+        write_text_report(path, &serde_json::to_string_pretty(&cut_report)?)?;
+        println!("wrote json report: {}", path.display());
+    }
+    if let Some(path) = report_md {
+        write_text_report(
+            path,
+            &cut_markdown_report(
+                source,
+                output,
+                output_positive,
+                output_negative,
+                plane,
+                kept_side,
+                cut,
+                report,
+            ),
+        )?;
+        println!("wrote markdown report: {}", path.display());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cut_markdown_report(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    output_positive: Option<&std::path::Path>,
+    output_negative: Option<&std::path::Path>,
+    plane: CutPlane,
+    kept_side: CutSide,
+    cut: &CutMeshResult,
+    report: &meshmend_analysis::AnalysisReport,
+) -> String {
+    let mut markdown = String::new();
+    markdown.push_str("# MeshMend Cut Report\n\n");
+    markdown.push_str(&format!("- Source: `{}`\n", source.display()));
+    markdown.push_str(&format!("- Output: `{}`\n", output.display()));
+    markdown.push_str(&format!("- Kept side: `{}`\n", cut_side_label(kept_side)));
+    if let Some(path) = output_positive {
+        markdown.push_str(&format!("- Positive side: `{}`\n", path.display()));
+    }
+    if let Some(path) = output_negative {
+        markdown.push_str(&format!("- Negative side: `{}`\n", path.display()));
+    }
+    markdown.push_str(&format!(
+        "- Plane normal: `[{:.6}, {:.6}, {:.6}]`\n",
+        plane.normal.x, plane.normal.y, plane.normal.z
+    ));
+    markdown.push_str(&format!("- Plane offset: `{:.6}`\n", plane.offset));
+    markdown.push_str(&format!("- Cut loops: {}\n", cut.loops.len()));
+    markdown.push_str(&format!(
+        "- Target cap edge length: `{:.6}`\n",
+        cut.target_edge_length
+    ));
+    for piece in &cut.pieces {
+        markdown.push_str(&format!(
+            "- {} side: {} triangles, {} cap triangles\n",
+            cut_side_label(piece.side),
+            piece.triangles.len(),
+            piece.cap_triangle_count
+        ));
+    }
+    markdown.push_str(&format!(
+        "- Boundary loops after export: {}\n",
+        report.topology.boundary_loop_count
+    ));
+    markdown.push_str(&format!(
+        "- Non-manifold edges after export: {}\n",
+        report.topology.non_manifold_edge_count
+    ));
+    if !cut.warnings.is_empty() {
+        markdown.push_str("\n## Warnings\n\n");
+        for warning in &cut.warnings {
+            markdown.push_str(&format!("- {warning}\n"));
+        }
+    }
+    markdown
+}
+
 fn export_markdown_report(
     source: &std::path::Path,
     output: &std::path::Path,
@@ -659,6 +847,24 @@ fn export_markdown_report(
         }
     }
     markdown
+}
+
+fn write_text_report(path: &std::path::Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)?;
+    Ok(())
+}
+
+fn cut_side_label(side: CutSide) -> &'static str {
+    match side {
+        CutSide::Positive => "positive",
+        CutSide::Negative => "negative",
+    }
 }
 
 fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {

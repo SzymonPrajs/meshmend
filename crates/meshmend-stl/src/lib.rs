@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -57,6 +58,34 @@ pub struct StlTimings {
 
 pub fn load_binary_stl(path: &Path) -> Result<ParsedStl, StlError> {
     load_binary_stl_with_options(path, &LoadOptions::default())
+}
+
+pub fn write_binary_stl(path: &Path, triangles: &[Triangle]) -> Result<(), StlError> {
+    if triangles.len() > u32::MAX as usize {
+        return Err(StlError::TooManyTriangles {
+            triangle_count: triangles.len(),
+        });
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut output = File::create(path)?;
+    let mut header = [0_u8; HEADER_BYTES];
+    let label = b"MeshMend binary STL";
+    header[..label.len()].copy_from_slice(label);
+    output.write_all(&header)?;
+    output.write_all(&(triangles.len() as u32).to_le_bytes())?;
+    for triangle in triangles {
+        write_vec3(&mut output, computed_normal(*triangle))?;
+        for vertex in triangle.vertices {
+            write_vec3(&mut output, vertex)?;
+        }
+        output.write_all(&0_u16.to_le_bytes())?;
+    }
+    Ok(())
 }
 
 pub fn load_binary_stl_with_options(
@@ -242,6 +271,24 @@ fn read_f32(record: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
 }
 
+fn write_vec3(output: &mut File, value: Vec3) -> Result<(), StlError> {
+    output.write_all(&value.x.to_le_bytes())?;
+    output.write_all(&value.y.to_le_bytes())?;
+    output.write_all(&value.z.to_le_bytes())?;
+    Ok(())
+}
+
+fn computed_normal(triangle: Triangle) -> Vec3 {
+    let normal = (triangle.vertices[1] - triangle.vertices[0])
+        .cross(triangle.vertices[2] - triangle.vertices[0])
+        .normalize_or_zero();
+    if normal.length_squared() > f32::EPSILON {
+        normal
+    } else {
+        triangle.normal.normalize_or_zero()
+    }
+}
+
 fn looks_like_ascii_stl(bytes: &[u8]) -> bool {
     let prefix = &bytes[..bytes.len().min(256)];
     let trimmed = prefix
@@ -284,6 +331,8 @@ pub enum StlError {
         chunk_count: usize,
         chunk_triangles: usize,
     },
+    #[error("too many triangles to write binary STL: {triangle_count}")]
+    TooManyTriangles { triangle_count: usize },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -333,5 +382,24 @@ mod tests {
         assert_eq!(parsed.chunks[0].start_triangle, 0);
         assert_eq!(parsed.chunks[1].start_triangle, 5);
         assert_eq!(parsed.chunks[2].triangles.len(), 2);
+    }
+
+    #[test]
+    fn writes_binary_stl_that_reloads() {
+        let parsed = load_binary_stl(Path::new("../../fixtures/stl/cube_binary.stl"))
+            .expect("cube fixture should parse");
+        let triangles = parsed
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.triangles.iter().copied())
+            .collect::<Vec<_>>();
+        let output =
+            std::env::temp_dir().join(format!("meshmend-stl-write-{}.stl", std::process::id()));
+
+        write_binary_stl(&output, &triangles).expect("write should succeed");
+        let reloaded = load_binary_stl(&output).expect("written STL should reload");
+
+        assert_eq!(reloaded.stats.triangle_count, parsed.stats.triangle_count);
+        let _ = std::fs::remove_file(output);
     }
 }

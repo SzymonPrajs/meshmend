@@ -13,6 +13,10 @@ pub fn pick_stl_to_save(default_name: &str) -> Option<PathBuf> {
         .save_file()
 }
 
+pub fn pick_export_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+
 pub fn pick_issue_session_to_load() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter("MeshMend inspection issues", &["json"])

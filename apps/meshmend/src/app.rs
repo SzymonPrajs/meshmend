@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -11,12 +12,15 @@ use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use glam::{Vec2, Vec3};
 use meshmend_analysis::AnalysisReport;
-use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats, TriangleId};
+use meshmend_core::{
+    CrossSectionAxis, CrossSectionState, MeshBounds, MeshStats, Triangle, TriangleId,
+};
+use meshmend_geometry::{split_and_cap_mesh, CapDensity, CutMeshOptions, CutPlane, CutSide};
 use meshmend_render::{
     DisplaySettings, LightingMode, MeshChunkUpload, PickResult, RendererInfo, SelectionOverlay,
     WgpuRenderer,
 };
-use meshmend_stl::{load_binary_stl, ParsedStl};
+use meshmend_stl::{load_binary_stl, write_binary_stl, ParsedStl, DEFAULT_CHUNK_TRIANGLES};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
@@ -32,6 +36,7 @@ use crate::{
 
 const FPS_DISPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const SELECTION_UNDO_LIMIT: usize = 64;
+const CUT_MIN_SCREEN_DISTANCE_SQUARED: f32 = 16.0;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
@@ -59,6 +64,13 @@ enum UiAction {
     Save,
     SaveAs,
     ClearSelection,
+    ApplyCut,
+    HidePiece,
+    ShowAllPieces,
+    DeletePiece,
+    KeepOnlyPiece,
+    ExportPiece,
+    ExportAllPieces,
     Fit,
     Reset,
     Quit,
@@ -462,17 +474,17 @@ impl SelectionElement {
 enum SelectionTool {
     Point,
     Brush,
-    Line,
+    Cut,
 }
 
 impl SelectionTool {
-    const ALL: [Self; 3] = [Self::Point, Self::Brush, Self::Line];
+    const ALL: [Self; 3] = [Self::Point, Self::Brush, Self::Cut];
 
     fn label(self) -> &'static str {
         match self {
             Self::Point => "Point",
             Self::Brush => "Brush",
-            Self::Line => "Line",
+            Self::Cut => "Cut",
         }
     }
 
@@ -480,7 +492,7 @@ impl SelectionTool {
         match self {
             Self::Point => "Q",
             Self::Brush => "W",
-            Self::Line => "E",
+            Self::Cut => "C",
         }
     }
 
@@ -488,7 +500,7 @@ impl SelectionTool {
         match self {
             Self::Point => Icon::PointSelect,
             Self::Brush => Icon::BrushSelect,
-            Self::Line => Icon::LineSelect,
+            Self::Cut => Icon::CutTool,
         }
     }
 }
@@ -633,7 +645,6 @@ struct SelectionState {
     brush_active: bool,
     last_brush_position: Option<Vec2>,
     cursor_position: Option<Vec2>,
-    line_start: Option<Vec2>,
     selected: SelectedElements,
     undo_stack: VecDeque<SelectedElements>,
     brush_undo_snapshot: Option<SelectedElements>,
@@ -649,7 +660,6 @@ impl Default for SelectionState {
             brush_active: false,
             last_brush_position: None,
             cursor_position: None,
-            line_start: None,
             selected: SelectedElements::default(),
             undo_stack: VecDeque::new(),
             brush_undo_snapshot: None,
@@ -678,8 +688,11 @@ impl SelectionState {
         true
     }
 
+    fn has_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
     fn cancel_active_gesture(&mut self) {
-        self.line_start = None;
         self.last_brush_position = None;
         self.brush_active = false;
         self.brush_undo_snapshot = None;
@@ -690,6 +703,182 @@ impl SelectionState {
         self.undo_stack.clear();
         self.cancel_active_gesture();
     }
+}
+
+#[derive(Debug)]
+struct CutState {
+    start: Option<Vec2>,
+    current: Option<Vec2>,
+    plane: Option<CutPlane>,
+    dragging: bool,
+    preview_segments: usize,
+    affected_triangles: usize,
+    cap_density: CapDensity,
+    smooth_cap: bool,
+}
+
+impl Default for CutState {
+    fn default() -> Self {
+        Self {
+            start: None,
+            current: None,
+            plane: None,
+            dragging: false,
+            preview_segments: 0,
+            affected_triangles: 0,
+            cap_density: CapDensity::Automatic,
+            smooth_cap: false,
+        }
+    }
+}
+
+impl CutState {
+    fn cancel(&mut self, renderer: &mut WgpuRenderer<'_>) {
+        self.start = None;
+        self.current = None;
+        self.plane = None;
+        self.dragging = false;
+        self.preview_segments = 0;
+        self.affected_triangles = 0;
+        renderer.clear_cut_preview();
+    }
+
+    fn clear_preview(&mut self, renderer: &mut WgpuRenderer<'_>) {
+        self.plane = None;
+        self.preview_segments = 0;
+        self.affected_triangles = 0;
+        renderer.clear_cut_preview();
+    }
+
+    fn has_anchor(&self) -> bool {
+        self.start.is_some()
+    }
+
+    fn has_active_gesture(&self) -> bool {
+        self.start.is_some() || self.current.is_some() || self.dragging
+    }
+
+    fn has_preview(&self) -> bool {
+        self.start.is_some() && self.current.is_some() && self.plane.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MeshDocument {
+    triangles: Vec<Triangle>,
+    revisions: Vec<MeshRevision>,
+    pieces: Vec<MeshPiece>,
+    selected_piece: Option<usize>,
+    render_index: Vec<usize>,
+    dirty: bool,
+}
+
+impl MeshDocument {
+    fn new(triangles: Vec<Triangle>) -> Self {
+        let render_index = (0..triangles.len()).collect();
+        Self {
+            triangles,
+            revisions: Vec::new(),
+            pieces: Vec::new(),
+            selected_piece: None,
+            render_index,
+            dirty: false,
+        }
+    }
+
+    fn push_revision(&mut self) {
+        self.revisions.push(MeshRevision {
+            triangles: self.triangles.clone(),
+            pieces: self.pieces.clone(),
+            selected_piece: self.selected_piece,
+            render_index: self.render_index.clone(),
+            dirty: self.dirty,
+        });
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(revision) = self.revisions.pop() else {
+            return false;
+        };
+        self.triangles = revision.triangles;
+        self.pieces = revision.pieces;
+        self.selected_piece = revision.selected_piece;
+        self.render_index = revision.render_index;
+        self.dirty = revision.dirty;
+        true
+    }
+
+    fn selected_piece(&self) -> Option<&MeshPiece> {
+        self.selected_piece.and_then(|index| self.pieces.get(index))
+    }
+
+    fn select_piece_for_render_triangle(&mut self, render_triangle_index: usize) -> Option<usize> {
+        let document_triangle_index = self.document_triangle_index(render_triangle_index)?;
+        let piece_index = self
+            .pieces
+            .iter()
+            .position(|piece| piece.range.contains(&document_triangle_index) && !piece.hidden)?;
+        self.selected_piece = Some(piece_index);
+        Some(piece_index)
+    }
+
+    fn document_triangle_index(&self, render_triangle_index: usize) -> Option<usize> {
+        self.render_index.get(render_triangle_index).copied()
+    }
+
+    fn visible_piece_count(&self) -> usize {
+        self.pieces.iter().filter(|piece| !piece.hidden).count()
+    }
+
+    fn hidden_piece_count(&self) -> usize {
+        self.pieces.iter().filter(|piece| piece.hidden).count()
+    }
+
+    fn any_hidden_pieces(&self) -> bool {
+        self.hidden_piece_count() > 0
+    }
+
+    fn has_pieces(&self) -> bool {
+        !self.pieces.is_empty()
+    }
+
+    fn visible_triangles(&mut self) -> Vec<Triangle> {
+        self.render_index.clear();
+        if self.pieces.is_empty() {
+            self.render_index.extend(0..self.triangles.len());
+            return self.triangles.clone();
+        }
+
+        let mut visible = Vec::new();
+        for piece in self.pieces.iter().filter(|piece| !piece.hidden) {
+            for index in piece.range.clone() {
+                if let Some(triangle) = self.triangles.get(index).copied() {
+                    self.render_index.push(index);
+                    visible.push(triangle);
+                }
+            }
+        }
+        visible
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MeshRevision {
+    triangles: Vec<Triangle>,
+    pieces: Vec<MeshPiece>,
+    selected_piece: Option<usize>,
+    render_index: Vec<usize>,
+    dirty: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MeshPiece {
+    label: String,
+    side: CutSide,
+    range: Range<usize>,
+    cap_triangle_count: usize,
+    bounds: MeshBounds,
+    hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -843,7 +1032,6 @@ fn apply_camera_zoom(renderer: &mut WgpuRenderer<'_>, wheel_delta: f32, needs_re
 enum SelectionStrokeKind {
     Point,
     Brush,
-    Line,
 }
 
 fn apply_selection_at_screen(
@@ -880,29 +1068,6 @@ fn apply_brush_selection(
             selection,
             point,
             SelectionStrokeKind::Brush,
-            Some(&mut seen_faces),
-        )?;
-    }
-    if changed {
-        sync_selection_overlay(renderer, selection);
-    }
-    Ok(changed)
-}
-
-fn apply_line_selection(
-    renderer: &mut WgpuRenderer<'_>,
-    selection: &mut SelectionState,
-    start: Vec2,
-    end: Vec2,
-) -> Result<bool> {
-    let mut changed = false;
-    let mut seen_faces = HashSet::new();
-    for point in line_sample_points(start, end) {
-        changed |= apply_selection_at_screen(
-            renderer,
-            selection,
-            point,
-            SelectionStrokeKind::Line,
             Some(&mut seen_faces),
         )?;
     }
@@ -952,10 +1117,6 @@ fn add_hit_to_selection(
                 | selection.selected.add_vertex(vertices[1])
                 | selection.selected.add_vertex(vertices[2])
         }
-        SelectionElement::Vertex if stroke_kind == SelectionStrokeKind::Line => {
-            let [start, end] = nearest_screen_edge(renderer, vertices, screen_position);
-            selection.selected.add_vertex(start) | selection.selected.add_vertex(end)
-        }
         SelectionElement::Vertex => {
             let vertex = nearest_screen_vertex(renderer, vertices, screen_position);
             selection.selected.add_vertex(vertex)
@@ -973,7 +1134,7 @@ fn clear_selection(
     record_history: bool,
 ) -> bool {
     let had_selection = !selection.selected.is_empty();
-    let had_gesture = selection.line_start.is_some() || selection.brush_active;
+    let had_gesture = selection.brush_active;
 
     if record_history && had_selection {
         selection.push_undo_snapshot(selection.selected.clone());
@@ -990,6 +1151,414 @@ fn undo_selection(renderer: &mut WgpuRenderer<'_>, selection: &mut SelectionStat
     }
     sync_selection_overlay(renderer, selection);
     true
+}
+
+fn refresh_cut_preview(
+    renderer: &mut WgpuRenderer<'_>,
+    cut: &mut CutState,
+    start: Vec2,
+    current: Vec2,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    cut.start = Some(start);
+    cut.current = Some(current);
+    if start.distance_squared(current) < CUT_MIN_SCREEN_DISTANCE_SQUARED {
+        cut.clear_preview(renderer);
+        *status = "Draw a longer cut line".to_string();
+        *needs_redraw = true;
+        return;
+    }
+    let Some(plane) = renderer.view_line_cut_plane(start, current) else {
+        cut.clear_preview(renderer);
+        *status = "Draw a longer cut line".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    let preview = renderer.cut_preview(plane);
+    cut.plane = Some(plane);
+    cut.preview_segments = preview.segments.len();
+    cut.affected_triangles = preview.affected_triangle_count;
+    renderer.set_cut_preview_segments(&preview.segments);
+    *status = format!(
+        "Cut preview: {} segments across {} triangles",
+        cut.preview_segments, cut.affected_triangles
+    );
+    *needs_redraw = true;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn release_cut_gesture(
+    renderer: &mut WgpuRenderer<'_>,
+    cut: &mut CutState,
+    release_position: Vec2,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    cut.dragging = false;
+    let Some(start) = cut.start else {
+        cut.cancel(renderer);
+        *status = "Click to place the first cut point".to_string();
+        *needs_redraw = true;
+        return;
+    };
+
+    cut.current = Some(release_position);
+    if start.distance_squared(release_position) < CUT_MIN_SCREEN_DISTANCE_SQUARED {
+        cut.current = None;
+        cut.clear_preview(renderer);
+        *status = "First cut point placed; click a second point or drag a line".to_string();
+        *needs_redraw = true;
+        return;
+    }
+
+    refresh_cut_preview(renderer, cut, start, release_position, status, needs_redraw);
+    if cut.has_preview() {
+        let preview_status = status.clone();
+        *status = format!("{preview_status}; press Enter to commit");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_cut_preview(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut Option<MeshDocument>,
+    cut: &mut CutState,
+    selection: &mut SelectionState,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(document) = document.as_mut() else {
+        *status = "Load an STL before cutting".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    let Some(plane) = cut.plane else {
+        *status = "Draw a cut line first".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    if cut.preview_segments == 0 {
+        *status = "Cut line does not intersect the mesh".to_string();
+        *needs_redraw = true;
+        return;
+    }
+
+    document.push_revision();
+    let bounds = bounds_for_triangles(&document.triangles);
+    let result = match split_and_cap_mesh(
+        &document.triangles,
+        plane,
+        CutMeshOptions {
+            weld_tolerance: bounds.radius().max(1.0) * 1.0e-6,
+            target_edge_length: None,
+            cap_density: cut.cap_density,
+            smooth_cap: cut.smooth_cap,
+        },
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = document.undo();
+            *status = format!("Cut failed: {err}");
+            *needs_redraw = true;
+            return;
+        }
+    };
+
+    let positive_len = result.pieces[0].triangles.len();
+    let negative_len = result.pieces[1].triangles.len();
+    document.triangles = result.combined_triangles;
+    document.pieces = vec![
+        MeshPiece {
+            label: "Piece A".to_string(),
+            side: result.pieces[0].side,
+            range: 0..positive_len,
+            cap_triangle_count: result.pieces[0].cap_triangle_count,
+            bounds: result.pieces[0].bounds,
+            hidden: false,
+        },
+        MeshPiece {
+            label: "Piece B".to_string(),
+            side: result.pieces[1].side,
+            range: positive_len..positive_len + negative_len,
+            cap_triangle_count: result.pieces[1].cap_triangle_count,
+            bounds: result.pieces[1].bounds,
+            hidden: false,
+        },
+    ];
+    document.selected_piece = None;
+    document.dirty = true;
+    upload_document_mesh(renderer, window, model_info, document);
+    selection.reset_for_model_change();
+    cut.cancel(renderer);
+    renderer.set_selection_overlay(&cap_overlay_for_document(document));
+    *status = format!(
+        "Cut applied: {} loops, {:.5} target cap edge, {} cap triangles",
+        result.loops.len(),
+        result.target_edge_length,
+        result.pieces[0].cap_triangle_count + result.pieces[1].cap_triangle_count
+    );
+    if !result.warnings.is_empty() {
+        *status = format!("{} ({})", *status, result.warnings.join("; "));
+    }
+    *needs_redraw = true;
+}
+
+fn cap_overlay_for_document(document: &MeshDocument) -> SelectionOverlay {
+    let mut faces = Vec::new();
+    for piece in document.pieces.iter().filter(|piece| !piece.hidden) {
+        let cap_start = piece.range.end.saturating_sub(piece.cap_triangle_count);
+        for index in cap_start..piece.range.end {
+            if let Some(triangle) = document.triangles.get(index) {
+                faces.push(triangle.vertices);
+            }
+        }
+    }
+    SelectionOverlay {
+        vertices: Vec::new(),
+        edges: Vec::new(),
+        faces,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn undo_mesh_revision(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut Option<MeshDocument>,
+    cut: &mut CutState,
+    selection: &mut SelectionState,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) -> bool {
+    let Some(document) = document.as_mut() else {
+        return false;
+    };
+    if !document.undo() {
+        return false;
+    }
+    upload_document_mesh(renderer, window, model_info, document);
+    cut.cancel(renderer);
+    selection.reset_for_model_change();
+    *status = "Undid mesh operation".to_string();
+    *needs_redraw = true;
+    true
+}
+
+fn select_piece_at_screen(
+    renderer: &mut WgpuRenderer<'_>,
+    document: &mut Option<MeshDocument>,
+    screen_position: Vec2,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) -> bool {
+    let Some(document) = document
+        .as_mut()
+        .filter(|document| !document.pieces.is_empty())
+    else {
+        return false;
+    };
+    let Ok(Some(pick)) = renderer.pick(screen_position) else {
+        return false;
+    };
+    let Some(global_index) = renderer.triangle_global_index(pick.triangle_id) else {
+        return false;
+    };
+    let Some(piece_index) = document.select_piece_for_render_triangle(global_index) else {
+        return false;
+    };
+    let piece = &document.pieces[piece_index];
+    renderer.set_selection_overlay(&SelectionOverlay {
+        vertices: Vec::new(),
+        edges: Vec::new(),
+        faces: document.triangles[piece.range.clone()]
+            .iter()
+            .map(|triangle| triangle.vertices)
+            .collect(),
+    });
+    *status = format!(
+        "Selected {} ({:?}, {} triangles, {} cap triangles)",
+        piece.label,
+        piece.side,
+        piece.range.len(),
+        piece.cap_triangle_count
+    );
+    *status = format!("{}, radius {:.4}", *status, piece.bounds.radius());
+    *needs_redraw = true;
+    true
+}
+
+fn delete_selected_piece(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut Option<MeshDocument>,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(document) = document.as_mut() else {
+        *status = "No mesh loaded".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    let Some(selected) = document.selected_piece else {
+        *status = "Select a cut piece first".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    document.push_revision();
+    let selected_range = document.pieces[selected].range.clone();
+    document.triangles = document
+        .triangles
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, triangle)| (!selected_range.contains(&index)).then_some(triangle))
+        .collect();
+    document.pieces.clear();
+    document.selected_piece = None;
+    document.dirty = true;
+    upload_document_mesh(renderer, window, model_info, document);
+    renderer.set_selection_overlay(&SelectionOverlay::default());
+    *status = "Deleted selected cut piece".to_string();
+    *needs_redraw = true;
+}
+
+fn hide_selected_piece(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut Option<MeshDocument>,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(document) = document.as_mut() else {
+        *status = "No mesh loaded".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    let Some(selected) = document.selected_piece else {
+        *status = "Select a cut piece first".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    if document.visible_piece_count() <= 1 {
+        *status = "Cannot hide the last visible piece".to_string();
+        *needs_redraw = true;
+        return;
+    }
+
+    document.push_revision();
+    let label = document.pieces[selected].label.clone();
+    document.pieces[selected].hidden = true;
+    document.selected_piece = None;
+    document.dirty = true;
+    upload_document_mesh(renderer, window, model_info, document);
+    renderer.set_selection_overlay(&SelectionOverlay::default());
+    *status = format!("Hidden {label}; Show All restores hidden pieces");
+    *needs_redraw = true;
+}
+
+fn show_all_pieces(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut Option<MeshDocument>,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(document) = document.as_mut() else {
+        *status = "No mesh loaded".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    if !document.any_hidden_pieces() {
+        *status = "No hidden pieces".to_string();
+        *needs_redraw = true;
+        return;
+    }
+
+    document.push_revision();
+    for piece in &mut document.pieces {
+        piece.hidden = false;
+    }
+    document.selected_piece = None;
+    document.dirty = true;
+    upload_document_mesh(renderer, window, model_info, document);
+    renderer.set_selection_overlay(&SelectionOverlay::default());
+    *status = "Showing all cut pieces".to_string();
+    *needs_redraw = true;
+}
+
+fn keep_only_selected_piece(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut Option<MeshDocument>,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(document) = document.as_mut() else {
+        *status = "No mesh loaded".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    let Some(selected) = document.selected_piece else {
+        *status = "Select a cut piece first".to_string();
+        *needs_redraw = true;
+        return;
+    };
+    document.push_revision();
+    let selected_range = document.pieces[selected].range.clone();
+    document.triangles = document.triangles[selected_range].to_vec();
+    document.pieces.clear();
+    document.selected_piece = None;
+    document.dirty = true;
+    upload_document_mesh(renderer, window, model_info, document);
+    renderer.set_selection_overlay(&SelectionOverlay::default());
+    *status = "Kept selected cut piece".to_string();
+    *needs_redraw = true;
+}
+
+fn export_all_pieces(
+    document: &MeshDocument,
+    model_info: Option<&ModelInfo>,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    if !document.has_pieces() {
+        *status = "Cut pieces are only available after applying a cut".to_string();
+        *needs_redraw = true;
+        return;
+    }
+    let default_name = model_info
+        .map(|model| model.file_name.trim_end_matches(".stl").to_string())
+        .unwrap_or_else(|| "meshmend-pieces".to_string());
+    let Some(folder) = meshmend_io::pick_export_folder() else {
+        return;
+    };
+    let mut exported = 0;
+    for piece in &document.pieces {
+        let filename = format!(
+            "{}-{}.stl",
+            default_name,
+            piece.label.replace(' ', "-").to_lowercase()
+        );
+        let path = folder.join(filename);
+        match write_binary_stl(&path, &document.triangles[piece.range.clone()]) {
+            Ok(()) => exported += 1,
+            Err(err) => {
+                *status = format!("Export all failed on {}: {err}", piece.label);
+                *needs_redraw = true;
+                return;
+            }
+        }
+    }
+    *status = format!("Exported {exported} cut pieces to {}", folder.display());
+    *needs_redraw = true;
 }
 
 fn brush_sample_points(center: Vec2, radius: f32) -> Vec<Vec2> {
@@ -1010,20 +1579,6 @@ fn brush_sample_points(center: Vec2, radius: f32) -> Vec<Vec2> {
         }
     }
     points
-}
-
-fn line_sample_points(start: Vec2, end: Vec2) -> Vec<Vec2> {
-    let length = (end - start).length();
-    if length <= 0.5 {
-        return vec![start];
-    }
-    let steps = (length / 6.0).ceil().clamp(1.0, 1024.0) as usize;
-    (0..=steps)
-        .map(|index| {
-            let t = index as f32 / steps as f32;
-            start.lerp(end, t)
-        })
-        .collect()
 }
 
 fn nearest_screen_vertex(
@@ -1108,16 +1663,7 @@ fn handle_selection_click(
             None,
         ),
         SelectionTool::Brush => apply_brush_selection(renderer, selection, screen_position),
-        SelectionTool::Line => {
-            if let Some(start) = selection.line_start.take() {
-                apply_line_selection(renderer, selection, start, screen_position)
-            } else {
-                selection.line_start = Some(screen_position);
-                *status = "Line selector start point set".to_string();
-                *needs_redraw = true;
-                return;
-            }
-        }
+        SelectionTool::Cut => Ok(false),
     };
 
     match result {
@@ -1209,8 +1755,8 @@ fn handle_selection_shortcut(
             selection.tool = SelectionTool::Brush;
             selection.cancel_active_gesture();
         }
-        PhysicalKey::Code(KeyCode::KeyE) => {
-            selection.tool = SelectionTool::Line;
+        PhysicalKey::Code(KeyCode::KeyC) | PhysicalKey::Code(KeyCode::KeyK) => {
+            selection.tool = SelectionTool::Cut;
             selection.cancel_active_gesture();
         }
         PhysicalKey::Code(KeyCode::KeyX) => selection.depth = selection.depth.next(),
@@ -1235,12 +1781,16 @@ fn handle_selection_shortcut(
         _ => return false,
     }
 
-    *status = format!(
-        "{} {} selection ({})",
-        selection.depth.label(),
-        selection.element.label(),
-        selection.tool.label()
-    );
+    *status = if selection.tool == SelectionTool::Cut {
+        "Cut tool: drag a line across the mesh".to_string()
+    } else {
+        format!(
+            "{} {} selection ({})",
+            selection.depth.label(),
+            selection.element.label(),
+            selection.tool.label()
+        )
+    };
     selection.last_brush_position = None;
     sync_selection_overlay(renderer, selection);
     *needs_redraw = true;
@@ -1279,6 +1829,9 @@ pub fn run_native(
     } else {
         None
     };
+    let mut mesh_document = model_info
+        .as_ref()
+        .map(|_| MeshDocument::new(renderer.all_triangles()));
     native_menu.set_model_loaded(model_info.is_some());
     let mut status = model_info
         .as_ref()
@@ -1301,6 +1854,7 @@ pub fn run_native(
     let mut camera_input = CameraInput::default();
     let mut ui_input = UiInputState::default();
     let mut selection_state = SelectionState::default();
+    let mut cut_state = CutState::default();
     let mut active_modifiers = ModifiersState::default();
     let mut needs_redraw = true;
 
@@ -1328,6 +1882,8 @@ pub fn run_native(
                                 &mut show_shortcuts,
                                 &mut status,
                                 &mut selection_state,
+                                &mut cut_state,
+                                &mut mesh_document,
                                 &mut needs_redraw,
                             );
                             native_menu.set_model_loaded(model_info.is_some());
@@ -1371,6 +1927,8 @@ pub fn run_native(
                                 &status,
                                 &mut next_display_settings,
                                 &mut selection_state,
+                                &mut cut_state,
+                                mesh_document.as_ref(),
                                 window.scale_factor() as f32,
                                 &mut show_shortcuts,
                                 &mut show_view_switcher,
@@ -1407,6 +1965,8 @@ pub fn run_native(
                                     &mut show_shortcuts,
                                     &mut status,
                                     &mut selection_state,
+                                    &mut cut_state,
+                                    &mut mesh_document,
                                     &mut needs_redraw,
                                 );
                                 native_menu.set_model_loaded(model_info.is_some());
@@ -1466,11 +2026,33 @@ pub fn run_native(
                             &mut model_info,
                             &mut status,
                         );
+                        mesh_document = model_info
+                            .as_ref()
+                            .map(|_| MeshDocument::new(renderer.all_triangles()));
                         selection_state.reset_for_model_change();
+                        cut_state.cancel(&mut renderer);
                         needs_redraw = true;
                         native_menu.set_model_loaded(model_info.is_some());
                     }
                     WindowEvent::MouseInput { state, button, .. } => match state {
+                        ElementState::Pressed
+                            if button == MouseButton::Left
+                                && selection_state.tool == SelectionTool::Cut
+                                && !active_modifiers.shift_key()
+                                && ui_input.allows_pointer_action(window.scale_factor() as f32) =>
+                        {
+                            if let Some(position) = selection_state.cursor_position {
+                                if !cut_state.has_anchor() {
+                                    cut_state.start = Some(position);
+                                }
+                                cut_state.current = Some(position);
+                                cut_state.dragging = true;
+                                cut_state.clear_preview(&mut renderer);
+                                status = "Drag to place the cut line, or release to anchor the first point"
+                                    .to_string();
+                                needs_redraw = true;
+                            }
+                        }
                         ElementState::Pressed
                             if button == MouseButton::Left
                                 && selection_state.tool == SelectionTool::Brush
@@ -1498,6 +2080,19 @@ pub fn run_native(
                             camera_input.press(button);
                         }
                         ElementState::Released
+                            if button == MouseButton::Left && cut_state.dragging =>
+                        {
+                            if let Some(position) = selection_state.cursor_position {
+                                release_cut_gesture(
+                                    &mut renderer,
+                                    &mut cut_state,
+                                    position,
+                                    &mut status,
+                                    &mut needs_redraw,
+                                );
+                            }
+                        }
+                        ElementState::Released
                             if button == MouseButton::Left && selection_state.brush_active =>
                         {
                             selection_state.brush_active = false;
@@ -1512,6 +2107,14 @@ pub fn run_native(
                                         Some(click_position),
                                         window.scale_factor() as f32,
                                     )
+                                    && !select_piece_at_screen(
+                                        &mut renderer,
+                                        &mut mesh_document,
+                                        click_position,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    )
+                                    && selection_state.tool != SelectionTool::Cut
                                 {
                                     handle_selection_click(
                                         &mut renderer,
@@ -1529,7 +2132,32 @@ pub fn run_native(
                         ui_input.set_cursor_position(position.x, position.y);
                         let cursor = Vec2::new(position.x as f32, position.y as f32);
                         selection_state.cursor_position = Some(cursor);
-                        if selection_state.brush_active {
+                        if cut_state.dragging {
+                            if let Some(start) = cut_state.start {
+                                if start.distance_squared(cursor) >= CUT_MIN_SCREEN_DISTANCE_SQUARED
+                                {
+                                    refresh_cut_preview(
+                                        &mut renderer,
+                                        &mut cut_state,
+                                        start,
+                                        cursor,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    );
+                                } else {
+                                    cut_state.current = Some(cursor);
+                                    cut_state.clear_preview(&mut renderer);
+                                    status = "Draw a longer cut line".to_string();
+                                    needs_redraw = true;
+                                }
+                            }
+                        } else if selection_state.tool == SelectionTool::Cut
+                            && cut_state.has_anchor()
+                            && !cut_state.has_preview()
+                        {
+                            cut_state.current = Some(cursor);
+                            needs_redraw = true;
+                        } else if selection_state.brush_active {
                             let _ = camera_input.cursor_delta(position.x, position.y);
                             if ui_input.allows_pointer_action(window.scale_factor() as f32) {
                                 handle_brush_selection(
@@ -1562,7 +2190,85 @@ pub fn run_native(
                     WindowEvent::KeyboardInput { event, .. }
                         if event.state == ElementState::Pressed && !egui_response.consumed =>
                     {
-                        if let Some(action) = shortcut_action(event.physical_key, active_modifiers)
+                        if matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ))
+                            && (active_modifiers.control_key() || active_modifiers.super_key())
+                            && !active_modifiers.shift_key()
+                            && !active_modifiers.alt_key()
+                        {
+                            if selection_state.has_undo()
+                                && undo_selection(&mut renderer, &mut selection_state)
+                            {
+                                status = format!("Undid selection: {}", selection_state.summary());
+                                needs_redraw = true;
+                            } else if undo_mesh_revision(
+                                &mut renderer,
+                                redraw_window,
+                                &mut model_info,
+                                &mut mesh_document,
+                                &mut cut_state,
+                                &mut selection_state,
+                                &mut status,
+                                &mut needs_redraw,
+                            ) {
+                            } else {
+                                status = "No undo available".to_string();
+                                needs_redraw = true;
+                            }
+                        } else if matches!(
+                            event.physical_key,
+                            PhysicalKey::Code(KeyCode::Backspace)
+                                | PhysicalKey::Code(KeyCode::Delete)
+                        ) && mesh_document
+                            .as_ref()
+                            .and_then(MeshDocument::selected_piece)
+                            .is_some()
+                        {
+                            delete_selected_piece(
+                                &mut renderer,
+                                redraw_window,
+                                &mut model_info,
+                                &mut mesh_document,
+                                &mut status,
+                                &mut needs_redraw,
+                            );
+                        } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                            && cut_state.has_active_gesture()
+                        {
+                            cut_state.cancel(&mut renderer);
+                            status = "Cut canceled".to_string();
+                            needs_redraw = true;
+                        } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Enter))
+                            && cut_state.has_active_gesture()
+                        {
+                            if let (Some(start), Some(current)) =
+                                (cut_state.start, cut_state.current)
+                            {
+                                refresh_cut_preview(
+                                    &mut renderer,
+                                    &mut cut_state,
+                                    start,
+                                    current,
+                                    &mut status,
+                                    &mut needs_redraw,
+                                );
+                                if cut_state.has_preview() {
+                                    apply_cut_preview(
+                                        &mut renderer,
+                                        redraw_window,
+                                        &mut model_info,
+                                        &mut mesh_document,
+                                        &mut cut_state,
+                                        &mut selection_state,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    );
+                                }
+                            } else {
+                                status = "Place the second cut point first".to_string();
+                                needs_redraw = true;
+                            }
+                        } else if let Some(action) =
+                            shortcut_action(event.physical_key, active_modifiers)
                         {
                             match action {
                                 UiAction::Quit => target.exit(),
@@ -1576,6 +2282,8 @@ pub fn run_native(
                                         &mut show_shortcuts,
                                         &mut status,
                                         &mut selection_state,
+                                        &mut cut_state,
+                                        &mut mesh_document,
                                         &mut needs_redraw,
                                     );
                                     native_menu.set_model_loaded(model_info.is_some());
@@ -1590,6 +2298,8 @@ pub fn run_native(
                                         &mut show_shortcuts,
                                         &mut status,
                                         &mut selection_state,
+                                        &mut cut_state,
+                                        &mut mesh_document,
                                         &mut needs_redraw,
                                     );
                                     native_menu.set_model_loaded(model_info.is_some());
@@ -1603,6 +2313,9 @@ pub fn run_native(
                             &mut status,
                             &mut needs_redraw,
                         ) {
+                            if selection_state.tool != SelectionTool::Cut {
+                                cut_state.cancel(&mut renderer);
+                            }
                         } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ))
                             && !active_modifiers.control_key()
                             && !active_modifiers.super_key()
@@ -1630,6 +2343,8 @@ pub fn run_native(
                                 &mut show_shortcuts,
                                 &mut status,
                                 &mut selection_state,
+                                &mut cut_state,
+                                &mut mesh_document,
                                 &mut needs_redraw,
                             );
                             native_menu.set_model_loaded(model_info.is_some());
@@ -2029,6 +2744,8 @@ fn draw_ui(
     status: &str,
     display_settings: &mut DisplaySettings,
     selection_state: &mut SelectionState,
+    cut_state: &mut CutState,
+    mesh_document: Option<&MeshDocument>,
     scale_factor: f32,
     show_shortcuts: &mut bool,
     show_view_switcher: &mut bool,
@@ -2045,6 +2762,40 @@ fn draw_ui(
             if toolbar_command_button(ui, Icon::Reset, "Reset", "Home").clicked() {
                 *action = UiAction::Reset;
             }
+            if mesh_document
+                .and_then(MeshDocument::selected_piece)
+                .is_some()
+            {
+                ui.separator();
+                if toolbar_command_button(ui, Icon::Hide, "Hide", "H").clicked() {
+                    *action = UiAction::HidePiece;
+                }
+                if toolbar_command_button(ui, Icon::Trash, "Delete", "Del").clicked() {
+                    *action = UiAction::DeletePiece;
+                }
+                if toolbar_command_button(ui, Icon::KeepOnly, "Keep", "K").clicked() {
+                    *action = UiAction::KeepOnlyPiece;
+                }
+                if toolbar_command_button(ui, Icon::Export, "Export", "").clicked() {
+                    *action = UiAction::ExportPiece;
+                }
+            }
+            if mesh_document
+                .map(|document| document.has_pieces())
+                .unwrap_or(false)
+            {
+                ui.separator();
+                if mesh_document
+                    .map(MeshDocument::any_hidden_pieces)
+                    .unwrap_or(false)
+                    && toolbar_command_button(ui, Icon::ShowAll, "Show All", "").clicked()
+                {
+                    *action = UiAction::ShowAllPieces;
+                }
+                if toolbar_command_button(ui, Icon::Export, "Export All", "").clicked() {
+                    *action = UiAction::ExportAllPieces;
+                }
+            }
         });
     });
     ui_regions.add(top_response.response.rect);
@@ -2053,10 +2804,14 @@ fn draw_ui(
         .frame(egui::Frame::none())
         .show(ctx, |_ui| {});
 
-    if let Some(rect) = draw_selection_palette(ctx, selection_state, action) {
+    if let Some(rect) = draw_selection_palette(ctx, selection_state, cut_state, action) {
         ui_regions.add(rect);
     }
     draw_selection_cursor(ctx, selection_state, scale_factor);
+    draw_cut_cursor(ctx, cut_state, scale_factor);
+    if let Some(rect) = draw_cut_confirm_popover(ctx, cut_state, scale_factor, action) {
+        ui_regions.add(rect);
+    }
 
     let bottom_response = egui::TopBottomPanel::bottom("status_bar")
         .resizable(false)
@@ -2090,6 +2845,7 @@ fn draw_ui(
 fn draw_selection_palette(
     ctx: &egui::Context,
     selection_state: &mut SelectionState,
+    cut_state: &mut CutState,
     action: &mut UiAction,
 ) -> Option<egui::Rect> {
     let response = egui::Area::new(egui::Id::new("selection_palette"))
@@ -2163,6 +2919,36 @@ fn draw_selection_palette(
                                     (selection_state.brush_radius_px + 4.0).min(180.0);
                             }
                         });
+                    }
+                    if selection_state.tool == SelectionTool::Cut {
+                        ui.add_space(5.0);
+                        palette_caption(ui, "Cap");
+                        for (density, label) in [
+                            (CapDensity::Automatic, "Auto"),
+                            (CapDensity::Fine, "Fine"),
+                            (CapDensity::Coarse, "Crse"),
+                        ] {
+                            if palette_button(
+                                ui,
+                                label,
+                                "Cut cap triangle density",
+                                cut_state.cap_density == density,
+                            )
+                            .clicked()
+                            {
+                                cut_state.cap_density = density;
+                            }
+                        }
+                        if palette_button(
+                            ui,
+                            "Smth",
+                            "Smooth generated cap interior",
+                            cut_state.smooth_cap,
+                        )
+                        .clicked()
+                        {
+                            cut_state.smooth_cap = !cut_state.smooth_cap;
+                        }
                     }
 
                     ui.add_space(5.0);
@@ -2277,19 +3063,6 @@ fn draw_selection_cursor(ctx: &egui::Context, selection_state: &SelectionState, 
             painter.circle_filled(cursor, 2.0, egui::Color32::from_rgb(210, 245, 255));
         }
     }
-
-    if selection_state.tool == SelectionTool::Line {
-        if let Some(start) = selection_state.line_start {
-            let start = egui::pos2(start.x / scale_factor, start.y / scale_factor);
-            painter.circle_filled(start, 3.5, egui::Color32::from_rgb(210, 245, 255));
-            if let Some(cursor) = cursor {
-                painter.line_segment(
-                    [start, cursor],
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(155, 220, 255)),
-                );
-            }
-        }
-    }
 }
 
 fn draw_view_toolbar(
@@ -2304,6 +3077,81 @@ fn draw_view_toolbar(
             apply_view_mode(mode, display_settings);
         }
     }
+}
+
+fn draw_cut_cursor(ctx: &egui::Context, cut_state: &CutState, scale_factor: f32) {
+    if cut_state.has_preview() && !cut_state.dragging {
+        return;
+    }
+    let Some(start) = cut_state.start else {
+        return;
+    };
+    let scale_factor = scale_factor.max(0.1);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("cut_cursor"),
+    ));
+    let start = egui::pos2(start.x / scale_factor, start.y / scale_factor);
+    let Some(current) = cut_state
+        .current
+        .map(|current| egui::pos2(current.x / scale_factor, current.y / scale_factor))
+    else {
+        painter.circle_filled(start, 3.5, egui::Color32::from_rgb(255, 160, 50));
+        return;
+    };
+    let direction = current - start;
+    if direction.length_sq() <= 1.0 {
+        painter.circle_filled(start, 3.5, egui::Color32::from_rgb(255, 160, 50));
+        return;
+    }
+    let direction = direction.normalized();
+    let long = direction * 4000.0;
+    painter.line_segment(
+        [start - long, start + long],
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 145, 30)),
+    );
+    painter.circle_filled(start, 3.5, egui::Color32::from_rgb(255, 190, 90));
+    painter.circle_filled(current, 3.5, egui::Color32::from_rgb(255, 190, 90));
+}
+
+fn draw_cut_confirm_popover(
+    ctx: &egui::Context,
+    cut_state: &CutState,
+    scale_factor: f32,
+    action: &mut UiAction,
+) -> Option<egui::Rect> {
+    if cut_state.dragging || !cut_state.has_preview() {
+        return None;
+    }
+    let (Some(start), Some(current)) = (cut_state.start, cut_state.current) else {
+        return None;
+    };
+    let scale_factor = scale_factor.max(0.1);
+    let midpoint = (start + current) * 0.5 / scale_factor;
+    let screen_rect = ctx.screen_rect();
+    let position = egui::pos2(
+        midpoint
+            .x
+            .clamp(screen_rect.left() + 80.0, screen_rect.right() - 140.0),
+        midpoint
+            .y
+            .clamp(screen_rect.top() + 64.0, screen_rect.bottom() - 80.0),
+    );
+
+    let response = egui::Area::new(egui::Id::new("cut_confirm_popover"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(position)
+        .show(ctx, |ui| {
+            egui::Frame::dark_canvas(ui.style())
+                .rounding(egui::Rounding::same(7.0))
+                .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+                .show(ui, |ui| {
+                    if toolbar_command_button(ui, Icon::CutTool, "Apply Cut", "Enter").clicked() {
+                        *action = UiAction::ApplyCut;
+                    }
+                });
+        });
+    Some(response.response.rect)
 }
 
 fn view_button(ui: &mut egui::Ui, mode: ViewMode, selected: bool) -> egui::Response {
@@ -2430,10 +3278,15 @@ fn draw_shortcuts_window(ctx: &egui::Context, show_shortcuts: &mut bool) -> Opti
             ui.separator();
             ui.label("Selection");
             ui.monospace("A/S/D        Vertex / Edge / Face");
-            ui.monospace("Q/W/E        Point / Brush / Line");
+            ui.monospace("Q/W/C        Point / Brush / Cut");
             ui.monospace("X            Front / Through");
+            ui.monospace("Enter        Apply cut preview");
             ui.monospace("Esc/Delete   Clear selection");
-            ui.monospace("Cmd/Ctrl+Z   Undo selection");
+            ui.monospace("Cmd/Ctrl+Z   Undo latest selection or mesh operation");
+            ui.separator();
+            ui.label("Cut Pieces");
+            ui.monospace("H            Hide selected piece");
+            ui.monospace("Delete       Delete selected piece");
         })
         .map(|response| response.response.rect)
 }
@@ -2472,6 +3325,8 @@ fn handle_ui_action(
     show_shortcuts: &mut bool,
     status: &mut String,
     selection_state: &mut SelectionState,
+    cut_state: &mut CutState,
+    mesh_document: &mut Option<MeshDocument>,
     needs_redraw: &mut bool,
 ) {
     match action {
@@ -2484,7 +3339,11 @@ fn handle_ui_action(
         UiAction::OpenStl => {
             if let Some(path) = meshmend_io::pick_stl_file() {
                 load_model_into_app(&path, renderer, window, model_info, status);
+                *mesh_document = model_info
+                    .as_ref()
+                    .map(|_| MeshDocument::new(renderer.all_triangles()));
                 selection_state.reset_for_model_change();
+                cut_state.cancel(renderer);
                 *needs_redraw = true;
             }
         }
@@ -2494,8 +3353,16 @@ fn handle_ui_action(
                 *needs_redraw = true;
                 return;
             };
-            match load_binary_stl(&model.path) {
-                Ok(_) => *status = format!("Current STL already saved: {}", model.path.display()),
+            let Some(document) = mesh_document.as_mut() else {
+                *status = "Load an STL before saving".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            match save_document_to_path(document, &model.path) {
+                Ok(()) => {
+                    document.dirty = false;
+                    *status = format!("Saved {}", model.path.display());
+                }
                 Err(err) => *status = format!("Save validation failed: {err}"),
             }
             *needs_redraw = true;
@@ -2508,10 +3375,19 @@ fn handle_ui_action(
             };
             let default_name = model.file_name.clone();
             if let Some(path) = meshmend_io::pick_stl_to_save(&default_name) {
-                match export_current_stl(&model.path, &path) {
+                let Some(document) = mesh_document.as_mut() else {
+                    *status = "Load an STL before exporting".to_string();
+                    *needs_redraw = true;
+                    return;
+                };
+                match save_document_to_path(document, &path) {
                     Ok(()) => {
                         load_model_into_app(&path, renderer, window, model_info, status);
+                        *mesh_document = model_info
+                            .as_ref()
+                            .map(|_| MeshDocument::new(renderer.all_triangles()));
                         selection_state.reset_for_model_change();
+                        cut_state.cancel(renderer);
                         *status = format!("Exported {}", path.display());
                     }
                     Err(err) => *status = format!("Export failed: {err}"),
@@ -2520,12 +3396,93 @@ fn handle_ui_action(
             }
         }
         UiAction::ClearSelection => {
+            cut_state.cancel(renderer);
             if clear_selection(renderer, selection_state, true) {
                 *status = "Selection cleared".to_string();
             } else {
                 *status = "Selection already clear".to_string();
             }
             *needs_redraw = true;
+        }
+        UiAction::ApplyCut => {
+            apply_cut_preview(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                cut_state,
+                selection_state,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::HidePiece => {
+            hide_selected_piece(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::ShowAllPieces => {
+            show_all_pieces(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::DeletePiece => {
+            delete_selected_piece(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::KeepOnlyPiece => {
+            keep_only_selected_piece(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+        }
+        UiAction::ExportPiece => {
+            let Some(document) = mesh_document.as_ref() else {
+                *status = "No mesh loaded".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            let Some(piece) = document.selected_piece() else {
+                *status = "Select a cut piece first".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            let default_name = format!("{}.stl", piece.label.replace(' ', "-").to_lowercase());
+            if let Some(path) = meshmend_io::pick_stl_to_save(&default_name) {
+                match write_binary_stl(&path, &document.triangles[piece.range.clone()]) {
+                    Ok(()) => *status = format!("Exported {}", path.display()),
+                    Err(err) => *status = format!("Export piece failed: {err}"),
+                }
+                *needs_redraw = true;
+            }
+        }
+        UiAction::ExportAllPieces => {
+            let Some(document) = mesh_document.as_ref() else {
+                *status = "No mesh loaded".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            export_all_pieces(document, model_info.as_ref(), status, needs_redraw);
         }
         UiAction::Fit => {
             renderer.fit_camera_to_mesh();
@@ -2555,6 +3512,14 @@ fn shortcut_action(key: PhysicalKey, modifiers: ModifiersState) -> Option<UiActi
             Some(UiAction::SaveAs)
         }
         PhysicalKey::Code(KeyCode::KeyS) if modifiers.super_key() => Some(UiAction::Save),
+        PhysicalKey::Code(KeyCode::KeyH)
+            if !modifiers.super_key()
+                && !modifiers.control_key()
+                && !modifiers.alt_key()
+                && !modifiers.shift_key() =>
+        {
+            Some(UiAction::HidePiece)
+        }
         PhysicalKey::Code(KeyCode::KeyF) => Some(UiAction::Fit),
         PhysicalKey::Code(KeyCode::Home) => Some(UiAction::Reset),
         PhysicalKey::Code(KeyCode::Digit1) => Some(UiAction::SetView(ViewMode::Rendered)),
@@ -2588,6 +3553,44 @@ fn load_model_into_app(
     }
 }
 
+fn model_info_from_triangles(
+    path: PathBuf,
+    file_name: String,
+    triangles: &[Triangle],
+) -> ModelInfo {
+    let bounds = bounds_for_triangles(triangles);
+    ModelInfo {
+        path,
+        file_name,
+        stats: MeshStats {
+            triangle_count: triangles.len() as u64,
+            vertex_position_count: triangles.len() as u64 * 3,
+            bounds,
+            source_bytes: 0,
+        },
+        chunk_count: triangles.len().div_ceil(DEFAULT_CHUNK_TRIANGLES),
+        parse_ms: 0.0,
+    }
+}
+
+fn upload_document_mesh(
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    document: &mut MeshDocument,
+) {
+    let Some(model) = model_info.as_ref() else {
+        return;
+    };
+    let path = model.path.clone();
+    let file_name = model.file_name.clone();
+    let visible_triangles = document.visible_triangles();
+    let info = model_info_from_triangles(path, file_name, &visible_triangles);
+    upload_triangles(renderer, &visible_triangles, info.stats.bounds);
+    window.set_title(&format!("MeshMend - {}", info.file_name));
+    *model_info = Some(info);
+}
+
 fn load_model(
     path: &Path,
     renderer: &mut WgpuRenderer<'_>,
@@ -2611,6 +3614,34 @@ fn load_model(
         "loaded STL mesh"
     );
     Ok(info)
+}
+
+fn upload_triangles(renderer: &mut WgpuRenderer<'_>, triangles: &[Triangle], bounds: MeshBounds) {
+    renderer.upload_mesh(
+        triangles
+            .chunks(DEFAULT_CHUNK_TRIANGLES)
+            .enumerate()
+            .map(|(chunk_index, triangles)| {
+                let start_triangle = chunk_index * DEFAULT_CHUNK_TRIANGLES;
+                MeshChunkUpload {
+                    chunk_index: chunk_index as u32,
+                    start_triangle: start_triangle as u64,
+                    bounds: bounds_for_triangles(triangles),
+                    triangles,
+                }
+            }),
+        bounds,
+    );
+}
+
+fn bounds_for_triangles(triangles: &[Triangle]) -> MeshBounds {
+    triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertices)
+        .fold(MeshBounds::EMPTY, |mut bounds, vertex| {
+            bounds.include_point(vertex);
+            bounds
+        })
 }
 
 pub fn analyze_parsed_stl(parsed: &ParsedStl) -> AnalysisReport {
@@ -2648,18 +3679,21 @@ fn upload_parsed_mesh(renderer: &mut WgpuRenderer<'_>, parsed: &ParsedStl) {
     );
 }
 
-fn export_current_stl(source: &Path, output: &Path) -> Result<()> {
-    if same_file_path(source, output) {
-        load_binary_stl(source)?;
-        return Ok(());
+fn save_document_to_path(document: &MeshDocument, output: &Path) -> Result<()> {
+    let triangles = if document.pieces.is_empty() {
+        document.triangles.clone()
+    } else {
+        document
+            .pieces
+            .iter()
+            .filter(|piece| !piece.hidden)
+            .flat_map(|piece| document.triangles[piece.range.clone()].iter().copied())
+            .collect::<Vec<_>>()
+    };
+    if triangles.is_empty() {
+        anyhow::bail!("there are no visible triangles to save");
     }
-    if let Some(parent) = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(source, output)?;
+    write_binary_stl(output, &triangles)?;
     load_binary_stl(output)?;
     Ok(())
 }
@@ -2717,13 +3751,6 @@ fn is_camera_button(button: MouseButton) -> bool {
         button,
         MouseButton::Left | MouseButton::Right | MouseButton::Middle
     )
-}
-
-fn same_file_path(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2845,29 +3872,6 @@ fn current_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn export_current_stl_copies_and_reloads_fixture() {
-        let source = fixture_path("cube_binary.stl");
-        let output = temp_output_path("cube-export.stl");
-
-        export_current_stl(&source, &output).expect("export should copy and validate STL");
-        let source_mesh = load_binary_stl(&source).expect("source fixture should load");
-        let exported_mesh = load_binary_stl(&output).expect("exported STL should reload");
-        assert_eq!(
-            source_mesh.stats.triangle_count,
-            exported_mesh.stats.triangle_count
-        );
-
-        let _ = fs::remove_file(output);
-    }
-
-    #[test]
-    fn export_current_stl_accepts_same_path_as_already_saved() {
-        let source = fixture_path("cube_binary.stl");
-        export_current_stl(&source, &source).expect("same-path save should validate source");
-    }
 
     #[test]
     fn frame_meter_throttles_display_updates() {
@@ -2937,6 +3941,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_palette_has_cut_tool_not_line_selection() {
+        assert_eq!(
+            SelectionTool::ALL,
+            [
+                SelectionTool::Point,
+                SelectionTool::Brush,
+                SelectionTool::Cut
+            ]
+        );
+        assert_eq!(SelectionTool::Cut.shortcut(), "C");
+    }
+
+    #[test]
     fn selection_overlay_only_contains_active_element_type() {
         let mut selected = SelectedElements::default();
         let a = Vec3::new(0.0, 0.0, 0.0);
@@ -2993,14 +4010,43 @@ mod tests {
 
         selection.selected.add_edge(a, b);
         selection.push_undo_snapshot(SelectedElements::default());
-        selection.line_start = Some(Vec2::new(4.0, 8.0));
         selection.brush_active = true;
         selection.reset_for_model_change();
 
         assert!(selection.selected.is_empty());
         assert!(selection.undo_stack.is_empty());
-        assert!(selection.line_start.is_none());
         assert!(!selection.brush_active);
+    }
+
+    #[test]
+    fn hidden_pieces_are_omitted_from_render_mapping() {
+        let triangles = vec![test_triangle(0.0), test_triangle(2.0), test_triangle(4.0)];
+        let mut document = MeshDocument::new(triangles.clone());
+        document.pieces = vec![
+            MeshPiece {
+                label: "Piece A".to_string(),
+                side: CutSide::Positive,
+                range: 0..1,
+                cap_triangle_count: 0,
+                bounds: bounds_for_triangles(&triangles[0..1]),
+                hidden: true,
+            },
+            MeshPiece {
+                label: "Piece B".to_string(),
+                side: CutSide::Negative,
+                range: 1..3,
+                cap_triangle_count: 0,
+                bounds: bounds_for_triangles(&triangles[1..3]),
+                hidden: false,
+            },
+        ];
+
+        let visible = document.visible_triangles();
+
+        assert_eq!(visible.len(), 2);
+        assert_eq!(document.render_index, vec![1, 2]);
+        assert_eq!(document.document_triangle_index(0), Some(1));
+        assert_eq!(document.select_piece_for_render_triangle(0), Some(1));
     }
 
     #[test]
@@ -3016,28 +4062,15 @@ mod tests {
             .all(|point| point.distance(center) <= radius + f32::EPSILON));
     }
 
-    #[test]
-    fn line_samples_include_endpoints() {
-        let start = Vec2::new(10.0, 20.0);
-        let end = Vec2::new(40.0, 20.0);
-        let points = line_sample_points(start, end);
-
-        assert_eq!(points.first().copied(), Some(start));
-        assert_eq!(points.last().copied(), Some(end));
-        assert!(points.len() > 2);
-    }
-
-    fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/stl")
-            .join(name)
-    }
-
-    fn temp_output_path(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("meshmend-{stamp}-{name}"))
+    fn test_triangle(offset: f32) -> Triangle {
+        let vertices = [
+            Vec3::new(offset, 0.0, 0.0),
+            Vec3::new(offset + 1.0, 0.0, 0.0),
+            Vec3::new(offset, 1.0, 0.0),
+        ];
+        Triangle {
+            normal: Vec3::Z,
+            vertices,
+        }
     }
 }

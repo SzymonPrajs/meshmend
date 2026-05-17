@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -39,6 +40,12 @@ struct Vec3f {
 };
 
 using TrianglePoints = std::array<Vec3f, 3>;
+
+struct CutSideMesh {
+  Mesh mesh;
+  std::size_t triangle_count = 0;
+  std::size_t patched_faces = 0;
+};
 
 VertexKey key_for(const Vec3f &value) {
   constexpr double scale = 1.0e9;
@@ -274,6 +281,19 @@ std::vector<TrianglePoints> clip_triangles_to_plane(const std::vector<TrianglePo
   return clipped;
 }
 
+CutSideMesh capped_cut_side(const std::vector<TrianglePoints> &triangles,
+                            const std::array<double, 3> &normal, double offset,
+                            bool keep_positive) {
+  auto clipped_triangles = clip_triangles_to_plane(triangles, normal, offset, keep_positive);
+  auto mesh = mesh_from_triangles(clipped_triangles);
+  const auto patched_faces = fill_all_holes(mesh);
+  return {
+      std::move(mesh),
+      clipped_triangles.size(),
+      patched_faces,
+  };
+}
+
 std::array<double, 3> normalized_plane_normal(const std::string &request_json) {
   const double nx = meshmend::json_number(request_json, "plane_nx").value_or(0.0);
   const double ny = meshmend::json_number(request_json, "plane_ny").value_or(0.0);
@@ -315,20 +335,34 @@ int main(int argc, char **argv) {
       const double offset = meshmend::json_number(request_json, "plane_offset").value_or(0.0);
       const std::string keep = meshmend::json_string(request_json, "keep").value_or("positive");
       const bool keep_positive = keep != "negative";
+      const auto output_positive = meshmend::json_string(request_json, "output_positive");
+      const auto output_negative = meshmend::json_string(request_json, "output_negative");
 
       meshmend::progress(request, "phase", "cut", 0, triangles,
-                         "clipping triangle soup against cut plane");
-      const auto clipped_triangles =
-          clip_triangles_to_plane(read_binary_stl_triangles(request.input_mesh), normal, offset,
-                                  keep_positive);
-      auto mesh = mesh_from_triangles(clipped_triangles);
-      meshmend::progress(request, "progress", "cut", clipped_triangles.size(), triangles,
-                         "capping cut boundary cycles");
-      const auto patched_faces = fill_all_holes(mesh);
-      write_binary_stl(mesh, request.output_mesh);
+                         "clipping triangle soup into both cut sides");
+      const auto input_triangles = read_binary_stl_triangles(request.input_mesh);
+      auto positive = capped_cut_side(input_triangles, normal, offset, true);
+      meshmend::progress(request, "progress", "cut", positive.triangle_count,
+                         positive.triangle_count,
+                         "positive cut side capped");
+      auto negative = capped_cut_side(input_triangles, normal, offset, false);
+      meshmend::progress(request, "progress", "cut", negative.triangle_count,
+                         negative.triangle_count,
+                         "negative cut side capped");
+
+      if (output_positive.has_value()) {
+        write_binary_stl(positive.mesh, *output_positive);
+      }
+      if (output_negative.has_value()) {
+        write_binary_stl(negative.mesh, *output_negative);
+      }
+
+      const auto &selected = keep_positive ? positive : negative;
+      write_binary_stl(selected.mesh, request.output_mesh);
+      const auto patched_faces = positive.patched_faces + negative.patched_faces;
       meshmend::progress(request, "progress", "cut", patched_faces, patched_faces,
-                         "cut mesh capped and written");
-      meshmend::write_response(request, true, triangles, mesh.number_of_faces());
+                         "both cut sides capped and selected side written");
+      meshmend::write_response(request, true, triangles, selected.mesh.number_of_faces());
     } else if (request.operation == "remesh") {
       if (request.output_mesh.empty()) {
         throw std::runtime_error("remesh requires output_mesh");

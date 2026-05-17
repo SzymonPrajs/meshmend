@@ -10,12 +10,17 @@ pub enum Icon {
     Headlight,
     Fit,
     Reset,
+    Hide,
+    ShowAll,
+    Trash,
+    KeepOnly,
+    Export,
     VertexSelect,
     EdgeSelect,
     FaceSelect,
     PointSelect,
     BrushSelect,
-    LineSelect,
+    CutTool,
     ClearSelection,
 }
 
@@ -101,6 +106,53 @@ pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: e
             line(p(7.0, 4.0), p(11.0, 4.0), stroke);
             line(p(7.0, 4.0), p(9.0, 7.0), stroke);
         }
+        Icon::Hide => {
+            painter.circle_stroke(p(12.0, 12.0), rect.width() * 0.16, soft);
+            line(p(4.5, 12.0), p(7.5, 8.5), soft);
+            line(p(7.5, 8.5), p(12.0, 7.0), soft);
+            line(p(12.0, 7.0), p(16.5, 8.5), soft);
+            line(p(16.5, 8.5), p(19.5, 12.0), soft);
+            line(p(4.5, 12.0), p(7.5, 15.5), soft);
+            line(p(7.5, 15.5), p(12.0, 17.0), soft);
+            line(p(12.0, 17.0), p(16.5, 15.5), soft);
+            line(p(16.5, 15.5), p(19.5, 12.0), soft);
+            line(p(5.5, 19.0), p(18.5, 5.0), stroke);
+        }
+        Icon::ShowAll => {
+            painter.circle_stroke(p(12.0, 12.0), rect.width() * 0.16, stroke);
+            line(p(4.5, 12.0), p(7.5, 8.5), stroke);
+            line(p(7.5, 8.5), p(12.0, 7.0), stroke);
+            line(p(12.0, 7.0), p(16.5, 8.5), stroke);
+            line(p(16.5, 8.5), p(19.5, 12.0), stroke);
+            line(p(4.5, 12.0), p(7.5, 15.5), stroke);
+            line(p(7.5, 15.5), p(12.0, 17.0), stroke);
+            line(p(12.0, 17.0), p(16.5, 15.5), stroke);
+            line(p(16.5, 15.5), p(19.5, 12.0), stroke);
+        }
+        Icon::Trash => {
+            line(p(8.0, 9.0), p(16.0, 9.0), stroke);
+            line(p(10.0, 9.0), p(10.5, 18.0), stroke);
+            line(p(14.0, 9.0), p(13.5, 18.0), stroke);
+            line(p(9.0, 18.0), p(15.0, 18.0), stroke);
+            line(p(10.0, 6.0), p(14.0, 6.0), soft);
+            line(p(7.0, 7.0), p(17.0, 7.0), stroke);
+        }
+        Icon::KeepOnly => {
+            let face = vec![p(6.0, 17.0), p(12.0, 6.0), p(19.0, 16.0)];
+            painter.add(egui::Shape::convex_polygon(
+                face,
+                color.gamma_multiply(0.18),
+                stroke,
+            ));
+            line(p(8.0, 12.5), p(11.0, 15.5), stroke);
+            line(p(11.0, 15.5), p(17.0, 9.0), stroke);
+        }
+        Icon::Export => {
+            line(p(12.0, 5.0), p(12.0, 15.0), stroke);
+            line(p(8.0, 9.0), p(12.0, 5.0), stroke);
+            line(p(16.0, 9.0), p(12.0, 5.0), stroke);
+            painter.rect_stroke(r(6.0, 13.0, 18.0, 20.0), egui::Rounding::same(2.0), soft);
+        }
         Icon::VertexSelect => {
             line(p(6.0, 17.0), p(12.0, 6.0), soft);
             line(p(12.0, 6.0), p(19.0, 16.0), soft);
@@ -136,7 +188,7 @@ pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: e
             line(p(14.0, 14.0), p(20.0, 20.0), stroke);
             line(p(17.0, 17.0), p(20.0, 14.0), soft);
         }
-        Icon::LineSelect => {
+        Icon::CutTool => {
             line(p(5.0, 18.0), p(19.0, 6.0), stroke);
             painter.circle_filled(p(5.0, 18.0), rect.width() * 0.09, color);
             painter.circle_filled(p(19.0, 6.0), rect.width() * 0.09, color);

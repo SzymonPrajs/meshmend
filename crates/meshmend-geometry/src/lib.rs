@@ -1,9 +1,9 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
 };
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use meshmend_core::{CrossSectionPlane, MeshBounds, Triangle, TriangleId};
 
 const DEFAULT_LEAF_SIZE: usize = 8;
@@ -300,6 +300,769 @@ pub struct SurfaceBrushFace {
 pub struct Ray {
     pub origin: Vec3,
     pub direction: Vec3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CutPlane {
+    pub normal: Vec3,
+    pub offset: f32,
+}
+
+impl CutPlane {
+    pub fn from_point_normal(point: Vec3, normal: Vec3) -> Option<Self> {
+        let normal = normal.normalize_or_zero();
+        (normal.length_squared() > f32::EPSILON).then_some(Self {
+            normal,
+            offset: point.dot(normal),
+        })
+    }
+
+    pub fn signed_distance(self, point: Vec3) -> f32 {
+        point.dot(self.normal) - self.offset
+    }
+
+    pub fn project_point(self, point: Vec3) -> Vec3 {
+        point - self.normal * self.signed_distance(point)
+    }
+
+    pub fn basis(self) -> (Vec3, Vec3) {
+        let reference = if self.normal.y.abs() < 0.9 {
+            Vec3::Y
+        } else {
+            Vec3::X
+        };
+        let u = reference.cross(self.normal).normalize_or_zero();
+        let v = self.normal.cross(u).normalize_or_zero();
+        (u, v)
+    }
+}
+
+pub fn cut_plane_from_view_rays(
+    eye: Vec3,
+    start_direction: Vec3,
+    end_direction: Vec3,
+) -> Option<CutPlane> {
+    let start_direction = start_direction.normalize_or_zero();
+    let end_direction = end_direction.normalize_or_zero();
+    CutPlane::from_point_normal(eye, start_direction.cross(end_direction))
+}
+
+#[derive(Debug, Clone)]
+pub struct CutPreview {
+    pub segments: Vec<[Vec3; 2]>,
+    pub affected_triangle_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CutMeshOptions {
+    pub weld_tolerance: f32,
+    pub target_edge_length: Option<f32>,
+    pub cap_density: CapDensity,
+    pub smooth_cap: bool,
+}
+
+impl Default for CutMeshOptions {
+    fn default() -> Self {
+        Self {
+            weld_tolerance: 1.0e-5,
+            target_edge_length: None,
+            cap_density: CapDensity::Automatic,
+            smooth_cap: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapDensity {
+    Coarse,
+    Automatic,
+    Fine,
+}
+
+impl CapDensity {
+    fn multiplier(self) -> f32 {
+        match self {
+            Self::Coarse => 1.6,
+            Self::Automatic => 1.0,
+            Self::Fine => 0.55,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CutMeshResult {
+    pub combined_triangles: Vec<Triangle>,
+    pub pieces: [CutPiece; 2],
+    pub loops: Vec<CutLoop>,
+    pub target_edge_length: f32,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CutPiece {
+    pub side: CutSide,
+    pub triangles: Vec<Triangle>,
+    pub cap_triangle_count: usize,
+    pub bounds: MeshBounds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutSide {
+    Positive,
+    Negative,
+}
+
+#[derive(Debug, Clone)]
+pub struct CutLoop {
+    pub vertices: Vec<Vec3>,
+    pub closed: bool,
+    pub length: f32,
+}
+
+pub fn preview_cut(triangles: &[Triangle], plane: CutPlane, epsilon: f32) -> CutPreview {
+    let mut segments = Vec::new();
+    for triangle in triangles {
+        if let Some(segment) = triangle_plane_segment(*triangle, plane, epsilon) {
+            segments.push(segment);
+        }
+    }
+    CutPreview {
+        affected_triangle_count: segments.len(),
+        segments,
+    }
+}
+
+pub fn split_and_cap_mesh(
+    triangles: &[Triangle],
+    plane: CutPlane,
+    options: CutMeshOptions,
+) -> Result<CutMeshResult, CutError> {
+    let bounds = bounds_for_triangles(triangles);
+    let epsilon = options
+        .weld_tolerance
+        .max(bounds.radius().max(1.0) * 1.0e-6)
+        .max(1.0e-7);
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    let mut cut_segments = Vec::new();
+
+    for triangle in triangles {
+        let preview_segment = triangle_plane_segment(*triangle, plane, epsilon);
+        if let Some(segment) = preview_segment {
+            cut_segments.push(segment);
+        }
+        clip_triangle_to_side(*triangle, plane, epsilon, true, &mut positive);
+        clip_triangle_to_side(*triangle, plane, epsilon, false, &mut negative);
+    }
+
+    if cut_segments.is_empty() {
+        return Err(CutError::NoIntersection);
+    }
+
+    let loops = trace_cut_loops(&cut_segments, epsilon * 4.0);
+    if loops.iter().any(|cut_loop| !cut_loop.closed) {
+        return Err(CutError::OpenCutLoops);
+    }
+
+    let target_edge_length = options
+        .target_edge_length
+        .unwrap_or_else(|| target_edge_length_for_loops(&loops, bounds, options.cap_density))
+        .max(epsilon * 8.0);
+    let mut cap_warnings = Vec::new();
+    let mut cap_triangles = triangulate_caps(&loops, plane, target_edge_length, &mut cap_warnings)?;
+    if options.smooth_cap {
+        smooth_cap_triangles(&mut cap_triangles, &loops, epsilon * 4.0);
+    }
+    let positive_cap_count = cap_triangles.len();
+    for triangle in &cap_triangles {
+        positive.push(reverse_triangle(*triangle));
+    }
+    for triangle in &cap_triangles {
+        negative.push(*triangle);
+    }
+
+    let positive_piece = CutPiece {
+        side: CutSide::Positive,
+        bounds: bounds_for_triangles(&positive),
+        triangles: positive,
+        cap_triangle_count: positive_cap_count,
+    };
+    let negative_piece = CutPiece {
+        side: CutSide::Negative,
+        bounds: bounds_for_triangles(&negative),
+        cap_triangle_count: cap_triangles.len(),
+        triangles: negative,
+    };
+    let mut combined_triangles =
+        Vec::with_capacity(positive_piece.triangles.len() + negative_piece.triangles.len());
+    combined_triangles.extend_from_slice(&positive_piece.triangles);
+    combined_triangles.extend_from_slice(&negative_piece.triangles);
+
+    Ok(CutMeshResult {
+        combined_triangles,
+        pieces: [positive_piece, negative_piece],
+        loops,
+        target_edge_length,
+        warnings: cap_warnings,
+    })
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum CutError {
+    #[error("cut line does not intersect the mesh")]
+    NoIntersection,
+    #[error("cut created open or branched boundary loops")]
+    OpenCutLoops,
+    #[error("cut loop self-intersects in the cap plane")]
+    InvalidCutLoop,
+    #[error("cap triangulation failed")]
+    CapTriangulationFailed,
+}
+
+fn triangle_plane_segment(triangle: Triangle, plane: CutPlane, epsilon: f32) -> Option<[Vec3; 2]> {
+    let vertices = triangle.vertices;
+    let distances = vertices.map(|vertex| plane.signed_distance(vertex));
+    if distances.iter().all(|distance| *distance > epsilon)
+        || distances.iter().all(|distance| *distance < -epsilon)
+    {
+        return None;
+    }
+
+    let mut points = Vec::with_capacity(3);
+    for index in 0..3 {
+        let next = (index + 1) % 3;
+        let start = vertices[index];
+        let end = vertices[next];
+        let start_distance = distances[index];
+        let end_distance = distances[next];
+
+        if start_distance.abs() <= epsilon {
+            push_unique_point(&mut points, plane.project_point(start), epsilon * 4.0);
+        }
+        if start_distance * end_distance < -epsilon * epsilon {
+            let t = start_distance / (start_distance - end_distance);
+            push_unique_point(
+                &mut points,
+                plane.project_point(start.lerp(end, t.clamp(0.0, 1.0))),
+                epsilon * 4.0,
+            );
+        }
+        if end_distance.abs() <= epsilon {
+            push_unique_point(&mut points, plane.project_point(end), epsilon * 4.0);
+        }
+    }
+
+    if points.len() >= 2 && points[0].distance_squared(points[1]) > epsilon * epsilon {
+        Some([points[0], points[1]])
+    } else {
+        None
+    }
+}
+
+fn clip_triangle_to_side(
+    triangle: Triangle,
+    plane: CutPlane,
+    epsilon: f32,
+    positive: bool,
+    output: &mut Vec<Triangle>,
+) {
+    let polygon = clip_polygon_to_plane(&triangle.vertices, plane, epsilon, positive);
+    if polygon.len() < 3 {
+        return;
+    }
+    for index in 1..polygon.len() - 1 {
+        push_triangle(output, [polygon[0], polygon[index], polygon[index + 1]]);
+    }
+}
+
+fn clip_polygon_to_plane(
+    vertices: &[Vec3],
+    plane: CutPlane,
+    epsilon: f32,
+    positive: bool,
+) -> Vec<Vec3> {
+    let mut output = Vec::new();
+    if vertices.is_empty() {
+        return output;
+    }
+
+    for index in 0..vertices.len() {
+        let current = vertices[index];
+        let next = vertices[(index + 1) % vertices.len()];
+        let current_distance = plane.signed_distance(current);
+        let next_distance = plane.signed_distance(next);
+        let current_inside = if positive {
+            current_distance >= -epsilon
+        } else {
+            current_distance <= epsilon
+        };
+        let next_inside = if positive {
+            next_distance >= -epsilon
+        } else {
+            next_distance <= epsilon
+        };
+
+        match (current_inside, next_inside) {
+            (true, true) => output.push(next),
+            (true, false) => {
+                let t = current_distance / (current_distance - next_distance);
+                output.push(plane.project_point(current.lerp(next, t.clamp(0.0, 1.0))));
+            }
+            (false, true) => {
+                let t = current_distance / (current_distance - next_distance);
+                output.push(plane.project_point(current.lerp(next, t.clamp(0.0, 1.0))));
+                output.push(next);
+            }
+            (false, false) => {}
+        }
+    }
+
+    dedupe_adjacent_points(output, epsilon * 4.0)
+}
+
+fn push_triangle(output: &mut Vec<Triangle>, vertices: [Vec3; 3]) {
+    let normal = (vertices[1] - vertices[0])
+        .cross(vertices[2] - vertices[0])
+        .normalize_or_zero();
+    if normal.length_squared() <= f32::EPSILON {
+        return;
+    }
+    output.push(Triangle { normal, vertices });
+}
+
+fn reverse_triangle(triangle: Triangle) -> Triangle {
+    let vertices = [
+        triangle.vertices[0],
+        triangle.vertices[2],
+        triangle.vertices[1],
+    ];
+    Triangle {
+        normal: -triangle.normal,
+        vertices,
+    }
+}
+
+fn bounds_for_triangles(triangles: &[Triangle]) -> MeshBounds {
+    triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertices)
+        .fold(MeshBounds::EMPTY, |mut bounds, vertex| {
+            bounds.include_point(vertex);
+            bounds
+        })
+}
+
+fn trace_cut_loops(segments: &[[Vec3; 2]], tolerance: f32) -> Vec<CutLoop> {
+    let mut vertices = Vec::new();
+    let mut lookup = HashMap::<QuantizedPoint, u32>::new();
+    let mut edges = Vec::<[u32; 2]>::new();
+    for [start, end] in segments {
+        let a = vertex_index_for_point(&mut vertices, &mut lookup, *start, tolerance);
+        let b = vertex_index_for_point(&mut vertices, &mut lookup, *end, tolerance);
+        if a != b {
+            let edge = if a < b { [a, b] } else { [b, a] };
+            if !edges.contains(&edge) {
+                edges.push(edge);
+            }
+        }
+    }
+
+    let mut adjacency = HashMap::<u32, Vec<(u32, u32)>>::new();
+    for (edge_index, [a, b]) in edges.iter().copied().enumerate() {
+        adjacency.entry(a).or_default().push((b, edge_index as u32));
+        adjacency.entry(b).or_default().push((a, edge_index as u32));
+    }
+
+    let mut visited = vec![false; edges.len()];
+    let mut loops = Vec::new();
+    for edge_index in 0..edges.len() {
+        if visited[edge_index] {
+            continue;
+        }
+        visited[edge_index] = true;
+        let [start, next] = edges[edge_index];
+        let mut loop_indices = vec![start, next];
+        let mut current = next;
+        let mut previous = start;
+        let mut closed = false;
+
+        while let Some(candidates) = adjacency.get(&current) {
+            if candidates.len() != 2 {
+                break;
+            }
+            let Some((candidate, candidate_edge)) = candidates
+                .iter()
+                .copied()
+                .find(|(_, edge)| !visited[*edge as usize])
+            else {
+                if current == start {
+                    closed = true;
+                }
+                break;
+            };
+            if candidate == previous {
+                break;
+            }
+            visited[candidate_edge as usize] = true;
+            if candidate == start {
+                closed = true;
+                break;
+            }
+            loop_indices.push(candidate);
+            previous = current;
+            current = candidate;
+        }
+
+        let loop_vertices = loop_indices
+            .into_iter()
+            .map(|index| vertices[index as usize])
+            .collect::<Vec<_>>();
+        let length = loop_length(&loop_vertices, closed);
+        loops.push(CutLoop {
+            vertices: loop_vertices,
+            closed,
+            length,
+        });
+    }
+
+    loops
+}
+
+fn target_edge_length_for_loops(loops: &[CutLoop], bounds: MeshBounds, density: CapDensity) -> f32 {
+    let mut lengths = loops
+        .iter()
+        .flat_map(|cut_loop| {
+            cut_loop
+                .vertices
+                .iter()
+                .copied()
+                .zip(cut_loop.vertices.iter().copied().cycle().skip(1))
+                .take(cut_loop.vertices.len())
+                .map(|(a, b)| a.distance(b))
+        })
+        .filter(|length| length.is_finite() && *length > f32::EPSILON)
+        .collect::<Vec<_>>();
+    lengths.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let median = lengths
+        .get(lengths.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or_else(|| bounds.radius().max(1.0) * 0.05);
+    let radius = bounds.radius().max(median);
+    (median * density.multiplier()).clamp(radius * 0.002, radius)
+}
+
+fn triangulate_caps(
+    loops: &[CutLoop],
+    plane: CutPlane,
+    target_edge_length: f32,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Triangle>, CutError> {
+    let mut triangles = Vec::new();
+    for cut_loop in loops
+        .iter()
+        .filter(|cut_loop| cut_loop.closed && cut_loop.vertices.len() >= 3)
+    {
+        let mut loop_2d = project_loop(cut_loop, plane, target_edge_length);
+        if loop_2d.len() < 3 {
+            continue;
+        }
+        if polygon_self_intersects(&loop_2d) {
+            return Err(CutError::InvalidCutLoop);
+        }
+        if polygon_area(&loop_2d) < 0.0 {
+            loop_2d.reverse();
+        }
+        triangulate_ring_grid(
+            &loop_2d,
+            plane,
+            target_edge_length,
+            &mut triangles,
+            warnings,
+        );
+    }
+
+    if triangles.is_empty() {
+        return Err(CutError::CapTriangulationFailed);
+    }
+    Ok(triangles)
+}
+
+fn triangulate_ring_grid(
+    boundary: &[Vec2],
+    plane: CutPlane,
+    target_edge_length: f32,
+    output: &mut Vec<Triangle>,
+    warnings: &mut Vec<String>,
+) {
+    let (u, v) = plane.basis();
+    let origin = plane.normal * plane.offset;
+    let center = boundary.iter().copied().sum::<Vec2>() / boundary.len() as f32;
+    let max_radius = boundary
+        .iter()
+        .map(|point| point.distance(center))
+        .fold(0.0, f32::max);
+    let ring_count = (max_radius / target_edge_length.max(1.0e-6))
+        .ceil()
+        .clamp(1.0, 96.0) as usize;
+    if ring_count == 96 {
+        warnings.push("cap ring count was clamped to keep triangle count bounded".to_string());
+    }
+
+    for ring_index in 0..ring_count {
+        let outer_scale = 1.0 - ring_index as f32 / ring_count as f32;
+        let inner_scale = 1.0 - (ring_index + 1) as f32 / ring_count as f32;
+        for index in 0..boundary.len() {
+            let next = (index + 1) % boundary.len();
+            let outer_a = center + (boundary[index] - center) * outer_scale;
+            let outer_b = center + (boundary[next] - center) * outer_scale;
+            if inner_scale <= f32::EPSILON {
+                push_triangle(
+                    output,
+                    [
+                        point_2d_to_3d(outer_a, origin, u, v),
+                        point_2d_to_3d(outer_b, origin, u, v),
+                        point_2d_to_3d(center, origin, u, v),
+                    ],
+                );
+            } else {
+                let inner_a = center + (boundary[index] - center) * inner_scale;
+                let inner_b = center + (boundary[next] - center) * inner_scale;
+                push_triangle(
+                    output,
+                    [
+                        point_2d_to_3d(outer_a, origin, u, v),
+                        point_2d_to_3d(outer_b, origin, u, v),
+                        point_2d_to_3d(inner_b, origin, u, v),
+                    ],
+                );
+                push_triangle(
+                    output,
+                    [
+                        point_2d_to_3d(outer_a, origin, u, v),
+                        point_2d_to_3d(inner_b, origin, u, v),
+                        point_2d_to_3d(inner_a, origin, u, v),
+                    ],
+                );
+            }
+        }
+    }
+}
+
+fn smooth_cap_triangles(triangles: &mut [Triangle], loops: &[CutLoop], tolerance: f32) {
+    let tolerance = tolerance.max(1.0e-7);
+    let boundary = loops
+        .iter()
+        .flat_map(|cut_loop| cut_loop.vertices.iter().copied())
+        .map(|point| QuantizedPoint::new(point, tolerance))
+        .collect::<HashSet<_>>();
+    let mut positions = HashMap::<QuantizedPoint, Vec3>::new();
+    let mut adjacency = HashMap::<QuantizedPoint, HashSet<QuantizedPoint>>::new();
+
+    for triangle in triangles.iter() {
+        let keys = triangle
+            .vertices
+            .map(|vertex| QuantizedPoint::new(vertex, tolerance));
+        for (key, vertex) in keys.into_iter().zip(triangle.vertices) {
+            positions.entry(key).or_insert(vertex);
+            adjacency.entry(key).or_default();
+        }
+        for [a, b] in [[keys[0], keys[1]], [keys[1], keys[2]], [keys[2], keys[0]]] {
+            adjacency.entry(a).or_default().insert(b);
+            adjacency.entry(b).or_default().insert(a);
+        }
+    }
+
+    let mut smoothed = HashMap::<QuantizedPoint, Vec3>::new();
+    for (key, position) in &positions {
+        if boundary.contains(key) {
+            continue;
+        }
+        let Some(neighbors) = adjacency.get(key).filter(|neighbors| !neighbors.is_empty()) else {
+            continue;
+        };
+        let mut sum = Vec3::ZERO;
+        let mut count = 0.0_f32;
+        for neighbor in neighbors {
+            if let Some(position) = positions.get(neighbor) {
+                sum += *position;
+                count += 1.0;
+            }
+        }
+        if count > 0.0 {
+            smoothed.insert(*key, sum / count);
+        } else {
+            smoothed.insert(*key, *position);
+        }
+    }
+
+    for triangle in triangles.iter_mut() {
+        for vertex in &mut triangle.vertices {
+            let key = QuantizedPoint::new(*vertex, tolerance);
+            if let Some(position) = smoothed.get(&key) {
+                *vertex = *position;
+            }
+        }
+        triangle.normal = (triangle.vertices[1] - triangle.vertices[0])
+            .cross(triangle.vertices[2] - triangle.vertices[0])
+            .normalize_or_zero();
+    }
+}
+
+fn point_2d_to_3d(point: Vec2, origin: Vec3, u: Vec3, v: Vec3) -> Vec3 {
+    origin + u * point.x + v * point.y
+}
+
+fn project_loop(cut_loop: &CutLoop, plane: CutPlane, _target_edge_length: f32) -> Vec<Vec2> {
+    let (u, v) = plane.basis();
+    cut_loop
+        .vertices
+        .iter()
+        .map(|point| Vec2::new(point.dot(u), point.dot(v)))
+        .collect()
+}
+
+fn polygon_area(points: &[Vec2]) -> f32 {
+    points
+        .iter()
+        .copied()
+        .zip(points.iter().copied().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| a.perp_dot(b))
+        .sum::<f32>()
+        * 0.5
+}
+
+fn polygon_self_intersects(points: &[Vec2]) -> bool {
+    if points.len() < 4 {
+        return false;
+    }
+    for index in 0..points.len() {
+        let next = (index + 1) % points.len();
+        for other in index + 1..points.len() {
+            let other_next = (other + 1) % points.len();
+            if index == other
+                || next == other
+                || index == other_next
+                || (index == 0 && other == points.len() - 1)
+            {
+                continue;
+            }
+            if segments_intersect_2d(
+                points[index],
+                points[next],
+                points[other],
+                points[other_next],
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn segments_intersect_2d(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+    const EPSILON: f32 = 1.0e-6;
+    let ab_c = (b - a).perp_dot(c - a);
+    let ab_d = (b - a).perp_dot(d - a);
+    let cd_a = (d - c).perp_dot(a - c);
+    let cd_b = (d - c).perp_dot(b - c);
+
+    if ab_c.abs() <= EPSILON && point_on_segment_2d(c, a, b) {
+        return true;
+    }
+    if ab_d.abs() <= EPSILON && point_on_segment_2d(d, a, b) {
+        return true;
+    }
+    if cd_a.abs() <= EPSILON && point_on_segment_2d(a, c, d) {
+        return true;
+    }
+    if cd_b.abs() <= EPSILON && point_on_segment_2d(b, c, d) {
+        return true;
+    }
+
+    ((ab_c > EPSILON && ab_d < -EPSILON) || (ab_c < -EPSILON && ab_d > EPSILON))
+        && ((cd_a > EPSILON && cd_b < -EPSILON) || (cd_a < -EPSILON && cd_b > EPSILON))
+}
+
+fn point_on_segment_2d(point: Vec2, start: Vec2, end: Vec2) -> bool {
+    let min = start.min(end) - Vec2::splat(1.0e-6);
+    let max = start.max(end) + Vec2::splat(1.0e-6);
+    point.x >= min.x && point.x <= max.x && point.y >= min.y && point.y <= max.y
+}
+
+fn loop_length(vertices: &[Vec3], closed: bool) -> f32 {
+    if vertices.len() < 2 {
+        return 0.0;
+    }
+    let mut length = vertices
+        .windows(2)
+        .map(|segment| segment[0].distance(segment[1]))
+        .sum::<f32>();
+    if closed {
+        length += vertices[vertices.len() - 1].distance(vertices[0]);
+    }
+    length
+}
+
+fn push_unique_point(points: &mut Vec<Vec3>, point: Vec3, tolerance: f32) {
+    if points
+        .iter()
+        .any(|existing| existing.distance_squared(point) <= tolerance * tolerance)
+    {
+        return;
+    }
+    points.push(point);
+}
+
+fn dedupe_adjacent_points(points: Vec<Vec3>, tolerance: f32) -> Vec<Vec3> {
+    let mut deduped = Vec::new();
+    for point in points {
+        if deduped
+            .last()
+            .map(|last: &Vec3| last.distance_squared(point) <= tolerance * tolerance)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        deduped.push(point);
+    }
+    if deduped.len() > 1
+        && deduped[0].distance_squared(*deduped.last().unwrap()) <= tolerance * tolerance
+    {
+        deduped.pop();
+    }
+    deduped
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct QuantizedPoint {
+    x: i64,
+    y: i64,
+    z: i64,
+}
+
+impl QuantizedPoint {
+    fn new(point: Vec3, tolerance: f32) -> Self {
+        Self {
+            x: (point.x / tolerance).round() as i64,
+            y: (point.y / tolerance).round() as i64,
+            z: (point.z / tolerance).round() as i64,
+        }
+    }
+}
+
+fn vertex_index_for_point(
+    vertices: &mut Vec<Vec3>,
+    lookup: &mut HashMap<QuantizedPoint, u32>,
+    point: Vec3,
+    tolerance: f32,
+) -> u32 {
+    let key = QuantizedPoint::new(point, tolerance);
+    *lookup.entry(key).or_insert_with(|| {
+        let index = vertices.len() as u32;
+        vertices.push(point);
+        index
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -896,6 +1659,159 @@ mod tests {
         assert!(faces.iter().any(|face| face.source_id == id(1)));
     }
 
+    #[test]
+    fn cut_preview_finds_cube_midline_segments() {
+        let cube = nested_cubes()
+            .into_iter()
+            .take(12)
+            .map(|(_, triangle)| triangle)
+            .collect::<Vec<_>>();
+        let plane = CutPlane::from_point_normal(Vec3::ZERO, Vec3::X).unwrap();
+
+        let preview = preview_cut(&cube, plane, 1.0e-6);
+
+        assert!(!preview.segments.is_empty());
+        assert_eq!(preview.affected_triangle_count, preview.segments.len());
+        assert!(preview
+            .segments
+            .iter()
+            .flat_map(|segment| segment.iter())
+            .all(|point| point.x.abs() < 1.0e-5));
+    }
+
+    #[test]
+    fn cut_preview_ignores_single_vertex_plane_touch() {
+        let triangle = tri(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+        );
+        let plane = CutPlane::from_point_normal(Vec3::ZERO, Vec3::X).unwrap();
+
+        let preview = preview_cut(&[triangle], plane, 1.0e-6);
+
+        assert!(preview.segments.is_empty());
+    }
+
+    #[test]
+    fn view_line_plane_contains_eye_and_rays() {
+        let eye = Vec3::new(0.0, 0.0, 4.0);
+        let start = Vec3::new(-0.25, 0.0, -1.0);
+        let end = Vec3::new(0.25, 0.0, -1.0);
+
+        let plane = cut_plane_from_view_rays(eye, start, end).expect("rays define a plane");
+
+        assert!(plane.signed_distance(eye).abs() < 1.0e-6);
+        assert!(plane.signed_distance(eye + start.normalize()).abs() < 1.0e-6);
+        assert!(plane.signed_distance(eye + end.normalize()).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn split_and_cap_cube_creates_two_closed_pieces() {
+        let cube = nested_cubes()
+            .into_iter()
+            .take(12)
+            .map(|(_, triangle)| triangle)
+            .collect::<Vec<_>>();
+        let plane = CutPlane::from_point_normal(Vec3::ZERO, Vec3::X).unwrap();
+
+        let result =
+            split_and_cap_mesh(&cube, plane, CutMeshOptions::default()).expect("cube should cut");
+
+        assert_eq!(result.pieces.len(), 2);
+        assert_eq!(result.loops.len(), 1);
+        assert!(result.loops[0].closed);
+        assert!(result.pieces[0].cap_triangle_count > 1);
+        assert!(result.pieces[1].cap_triangle_count > 1);
+        for piece in &result.pieces {
+            let mesh = IndexedMesh::from_triangles(
+                piece
+                    .triangles
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, triangle)| (id(index as u32), triangle)),
+                1.0e-5,
+            );
+            assert_eq!(mesh.connectivity.boundary_loops.len(), 0);
+        }
+    }
+
+    #[test]
+    fn split_and_cap_cylinder_creates_dense_closed_caps() {
+        let cylinder = cylinder(24, 1.0, 1.0);
+        let plane = CutPlane::from_point_normal(Vec3::ZERO, Vec3::Z).unwrap();
+
+        let result = split_and_cap_mesh(
+            &cylinder,
+            plane,
+            CutMeshOptions {
+                smooth_cap: true,
+                ..CutMeshOptions::default()
+            },
+        )
+        .expect("cylinder cut");
+
+        assert_eq!(result.loops.len(), 1);
+        for piece in &result.pieces {
+            assert!(piece.cap_triangle_count >= 24);
+            assert_closed(&piece.triangles);
+        }
+    }
+
+    #[test]
+    fn split_and_cap_cube_handles_slanted_plane() {
+        let cube = nested_cubes()
+            .into_iter()
+            .take(12)
+            .map(|(_, triangle)| triangle)
+            .collect::<Vec<_>>();
+        let plane = CutPlane::from_point_normal(Vec3::ZERO, Vec3::new(1.0, 1.0, 0.35)).unwrap();
+
+        let result =
+            split_and_cap_mesh(&cube, plane, CutMeshOptions::default()).expect("slanted cut");
+
+        assert!(!result.loops.is_empty());
+        for piece in &result.pieces {
+            assert!(piece.cap_triangle_count > 1);
+            assert_closed(&piece.triangles);
+        }
+    }
+
+    #[test]
+    fn cut_target_edge_length_tracks_loop_edges() {
+        let cut_loop = CutLoop {
+            vertices: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            closed: true,
+            length: 4.0,
+        };
+        let bounds = MeshBounds {
+            min: Vec3::ZERO,
+            max: Vec3::ONE,
+        };
+
+        let target = target_edge_length_for_loops(&[cut_loop], bounds, CapDensity::Automatic);
+
+        assert!((0.9..=1.1).contains(&target));
+    }
+
+    #[test]
+    fn cap_loop_detection_rejects_self_intersections() {
+        let bow_tie = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 0.0),
+        ];
+
+        assert!(polygon_self_intersects(&bow_tie));
+    }
+
     fn id(local_index: u32) -> TriangleId {
         TriangleId {
             chunk: 0,
@@ -909,6 +1825,18 @@ mod tests {
             normal,
             vertices: [a, b, c],
         }
+    }
+
+    fn assert_closed(triangles: &[Triangle]) {
+        let mesh = IndexedMesh::from_triangles(
+            triangles
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, triangle)| (id(index as u32), triangle)),
+            1.0e-5,
+        );
+        assert_eq!(mesh.connectivity.boundary_loops.len(), 0);
     }
 
     fn nested_cubes() -> Vec<(TriangleId, Triangle)> {
@@ -964,5 +1892,32 @@ mod tests {
             output.push((id(first), tri(a, b, c)));
             output.push((id(first + 1), tri(a, c, d)));
         }
+    }
+
+    fn cylinder(segments: usize, radius: f32, half_height: f32) -> Vec<Triangle> {
+        let mut triangles = Vec::new();
+        let top_center = Vec3::new(0.0, 0.0, half_height);
+        let bottom_center = Vec3::new(0.0, 0.0, -half_height);
+        for index in 0..segments {
+            let angle = index as f32 / segments as f32 * std::f32::consts::TAU;
+            let next_angle = (index + 1) as f32 / segments as f32 * std::f32::consts::TAU;
+            let bottom_a = Vec3::new(angle.cos() * radius, angle.sin() * radius, -half_height);
+            let bottom_b = Vec3::new(
+                next_angle.cos() * radius,
+                next_angle.sin() * radius,
+                -half_height,
+            );
+            let top_a = Vec3::new(angle.cos() * radius, angle.sin() * radius, half_height);
+            let top_b = Vec3::new(
+                next_angle.cos() * radius,
+                next_angle.sin() * radius,
+                half_height,
+            );
+            triangles.push(tri(bottom_a, bottom_b, top_b));
+            triangles.push(tri(bottom_a, top_b, top_a));
+            triangles.push(tri(top_center, top_a, top_b));
+            triangles.push(tri(bottom_center, bottom_b, bottom_a));
+        }
+        triangles
     }
 }
