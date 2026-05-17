@@ -414,10 +414,6 @@ impl ViewMode {
             Self::Headlight => Icon::Headlight,
         }
     }
-
-    fn tooltip(self) -> String {
-        format!("{} ({})", self.label(), self.shortcut())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1333,7 +1329,6 @@ fn draw_view_toolbar(
 
 fn view_button(ui: &mut egui::Ui, mode: ViewMode, selected: bool) -> egui::Response {
     toolbar_button(ui, mode.icon(), mode.label(), mode.shortcut(), selected)
-        .on_hover_text(mode.tooltip())
 }
 
 fn toolbar_command_button(
@@ -1352,7 +1347,8 @@ fn toolbar_button(
     shortcut: &str,
     selected: bool,
 ) -> egui::Response {
-    let size = egui::vec2(112.0, 44.0);
+    let estimated_label_width = label.chars().count() as f32 * 6.4;
+    let size = egui::vec2((44.0 + estimated_label_width).clamp(72.0, 108.0), 34.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let visuals = ui.visuals();
     let fill = if selected {
@@ -1375,25 +1371,18 @@ fn toolbar_button(
         egui::Stroke::new(1.0, stroke_color.gamma_multiply(0.78)),
     );
     let icon_rect = egui::Rect::from_min_size(
-        rect.left_center() + egui::vec2(10.0, -11.0),
-        egui::vec2(22.0, 22.0),
+        rect.left_center() + egui::vec2(9.0, -9.0),
+        egui::vec2(18.0, 18.0),
     );
     draw_icon(ui.painter(), icon_rect, icon, stroke_color);
     ui.painter().text(
-        rect.left_center() + egui::vec2(38.0, -5.0),
+        rect.left_center() + egui::vec2(33.0, 0.0),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(12.0),
         stroke_color,
     );
-    ui.painter().text(
-        rect.left_center() + egui::vec2(38.0, 11.0),
-        egui::Align2::LEFT_CENTER,
-        shortcut,
-        egui::FontId::monospace(10.5),
-        stroke_color.gamma_multiply(0.68),
-    );
-    response
+    response.on_hover_text(format!("{label} ({shortcut})"))
 }
 
 fn draw_status_bar(
