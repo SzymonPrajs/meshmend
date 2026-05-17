@@ -1,7 +1,7 @@
 # MeshMend
 
-This workspace is now focused on MeshMend, a clean Tauri STL viewer prototype
-for inspecting and later repairing AI-generated mesh files.
+This workspace is focused on MeshMend, a native Rust STL inspection app for
+AI-generated 3D model meshes.
 
 The previous Python mesh-repair toolchain has been moved out of the active
 source tree:
@@ -26,25 +26,24 @@ track code and planning files, not raw model data.
 
 ## Active Plan
 
-The viewer plan is here:
+The native WGPU master plan is here:
 
 ```text
-docs/tauri-stl-viewer-plan.md
+docs/meshmend-native-wgpu-master-plan.md
 ```
 
-The first implementation milestone should be only a viewer:
+The replacement implementation is intentionally staged:
 
-- accept STL files
-- load any STL file manually through the app
-- use `rose/raw.stl` as the local ignored test model
-- render the mesh
-- support orbit, pan, and zoom
-- fit the camera to the model bounds
-- avoid repair, slicing, picking, and mesh editing until the viewer is stable
+- native `winit` desktop window
+- native `wgpu` renderer
+- Rust binary STL parsing and validation
+- orbit, pan, zoom, fit, and reset camera controls
+- mesh stats, notes, selection, screenshots, and performance metrics
+- CI/release workflows after the native viewer core is measurable
 
 ## App Location
 
-The Tauri app is under:
+The native app crate is under:
 
 ```text
 apps/meshmend/
@@ -52,25 +51,24 @@ apps/meshmend/
 
 The intended stack is:
 
-- Tauri 2 for the native Rust shell
-- Vite and TypeScript for the frontend
-- Three.js for the first renderer
-- WebGPU only as a later evaluated renderer path if the STL workload proves to
-  need it
+- Rust workspace
+- `winit` for the native event loop
+- `wgpu` for native GPU rendering
+- `egui` for overlay UI
+- `rayon` and `memmap2` for large STL loading
 
 Current implementation commands:
 
 ```bash
-cd apps/meshmend
-npm install
-npm run tauri dev
+cargo run -p meshmend
+cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
 ```
 
 Verification:
 
 ```bash
-cd apps/meshmend
-npm run build
-npm run verify:viewer
-npm run tauri build -- --bundles app
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace --release
 ```

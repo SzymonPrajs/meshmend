@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ICON_DIR = ROOT / "src-tauri" / "icons"
+ICON_DIR = ROOT / "assets" / "icons"
 SOURCE_SIZE = 1024
 
 PNG_TARGETS = {

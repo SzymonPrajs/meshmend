@@ -18,7 +18,7 @@ __pycache__/
 .env.*
 !.env.example
 
-# Node, Vite, and Tauri build outputs
+# Build outputs
 node_modules/
 dist/
 target/
@@ -73,9 +73,10 @@ screenshots/
 *.mp4
 *.webm
 
-# Tauri app icons are source assets required by the bundle config.
-!apps/*/src-tauri/icons/
-!apps/*/src-tauri/icons/*.png
+# App icons are source assets required by release packaging.
+!assets/
+!assets/icons/
+!assets/icons/*.png
 
 # Generated reports and large analysis outputs
 *.report.json

@@ -1,17 +1,17 @@
 # Agent Notes
 
 This workspace has pivoted away from the failed global mesh-repair experiments.
-The active direction is MeshMend, a Tauri STL viewer prototype for inspecting
-and later repairing AI-generated mesh files.
+The active direction is MeshMend, a native Rust STL inspection app for viewing,
+annotating, and later repairing AI-generated mesh files.
 
 ## Current Boundary
 
 Build toward:
 
-- a local desktop app
+- a local native desktop app
 - STL input only
 - orbit, pan, and zoom viewing
-- a clean foundation for later defect marking and cross-section tools
+- a clean foundation for selection, notes, validation, and later repair tools
 
 Do not revive the old Python repair pipeline as active product code. It is
 archived at:
@@ -37,34 +37,37 @@ planning files, not raw model data.
 ## Implementation Rules
 
 - Put the app under `apps/meshmend/`.
-- Use Tauri 2 with a Rust shell and a TypeScript frontend.
-- Use Three.js first. It already provides the practical viewer pieces needed
-  for STL loading, camera control, lighting, and ray picking later.
-- Treat WebGPU as a later comparison point, not as the first milestone.
-- Keep milestone 1 viewer-only. No repair, no mesh simplification, no slicing,
-  no ROI tools, and no defect classification.
+- Use a Rust workspace with `winit`, native `wgpu`, and `egui`.
+- Keep the hot path in Rust: STL parsing, validation, chunking, GPU upload,
+  camera math, picking, notes, screenshots, and performance metrics.
+- Do not reintroduce the Three.js/Vite/Tauri webview viewer as active product
+  code.
+- Keep the native viewer focused on inspection. No repair, mesh
+  simplification, slicing, ROI tools, or defect classification until the native
+  viewer core is stable.
 - Keep source assets and generated app artifacts separate.
-- Keep generated build outputs, `node_modules`, Rust `target`, and large STL
-  outputs ignored.
+- Keep generated build outputs, Rust `target`, large STL outputs, and local
+  raw model files ignored.
 
 ## First Milestone Definition
 
-The first milestone is complete when:
+The native viewer milestone is complete when:
 
-- a Tauri app launches locally
+- a native Rust app launches locally
 - the app accepts an STL file selected from disk
 - `rose/raw.stl` renders correctly as the local test model
 - orbit, pan, and zoom work smoothly enough to inspect the loaded mesh
 - the camera fits the model to view after loading
 - the app reports basic mesh stats such as triangle count and bounds
+- basic selection, notes, screenshots, and performance metrics work
 
 Anything beyond that belongs to a later milestone.
 
-Use these checks after viewer changes:
+Use these checks after native viewer changes:
 
 ```bash
-cd apps/meshmend
-npm run build
-npm run verify:viewer
-npm run tauri build -- --bundles app
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
 ```
