@@ -45,6 +45,8 @@ The active implementation is now the native viewer:
   boundary loops and exporting a repaired STL
 - OpenVDB-backed `meshmend local-wrap` path for rebuilding a mesh through an
   explicit voxel/SDF surface extraction and exporting the wrapped STL
+- CGAL-backed `meshmend cut` straight bisect path that clips by a plane, caps
+  the kept side, validates topology, and exports STL
 
 ## App Location
 

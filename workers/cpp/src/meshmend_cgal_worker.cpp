@@ -37,6 +37,8 @@ struct Vec3f {
   float z;
 };
 
+using TrianglePoints = std::array<Vec3f, 3>;
+
 VertexKey key_for(const Vec3f &value) {
   constexpr double scale = 1.0e9;
   return {
@@ -70,7 +72,7 @@ Mesh::Vertex_index vertex_for(Mesh &mesh, std::map<VertexKey, Mesh::Vertex_index
   return vertex;
 }
 
-Mesh read_binary_stl_mesh(const std::filesystem::path &path) {
+std::vector<TrianglePoints> read_binary_stl_triangles(const std::filesystem::path &path) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("failed to open STL " + path.string());
@@ -89,15 +91,23 @@ Mesh read_binary_stl_mesh(const std::filesystem::path &path) {
     throw std::runtime_error("STL byte size does not match declared triangle count");
   }
 
-  Mesh mesh;
-  std::map<VertexKey, Mesh::Vertex_index> vertices;
+  std::vector<TrianglePoints> triangles;
+  triangles.reserve(count);
   for (std::uint32_t triangle = 0; triangle < count; ++triangle) {
     const char *record = bytes.data() + 84 + static_cast<std::size_t>(triangle) * 50;
-    std::array<Vec3f, 3> points = {{
+    triangles.push_back({{
         {read_f32(record + 12), read_f32(record + 16), read_f32(record + 20)},
         {read_f32(record + 24), read_f32(record + 28), read_f32(record + 32)},
         {read_f32(record + 36), read_f32(record + 40), read_f32(record + 44)},
-    }};
+    }});
+  }
+  return triangles;
+}
+
+Mesh mesh_from_triangles(const std::vector<TrianglePoints> &triangles) {
+  Mesh mesh;
+  std::map<VertexKey, Mesh::Vertex_index> vertices;
+  for (const auto &points : triangles) {
     const auto a = vertex_for(mesh, vertices, points[0]);
     const auto b = vertex_for(mesh, vertices, points[1]);
     const auto c = vertex_for(mesh, vertices, points[2]);
@@ -108,6 +118,10 @@ Mesh read_binary_stl_mesh(const std::filesystem::path &path) {
     (void)face;
   }
   return mesh;
+}
+
+Mesh read_binary_stl_mesh(const std::filesystem::path &path) {
+  return mesh_from_triangles(read_binary_stl_triangles(path));
 }
 
 std::array<float, 3> normal_for(const Point &a, const Point &b, const Point &c) {
@@ -178,11 +192,90 @@ std::size_t fill_all_holes(Mesh &mesh) {
   return patched_faces;
 }
 
+double signed_distance(const Vec3f &point, const std::array<double, 3> &normal, double offset) {
+  return static_cast<double>(point.x) * normal[0] + static_cast<double>(point.y) * normal[1] +
+         static_cast<double>(point.z) * normal[2] - offset;
+}
+
+Vec3f interpolate(const Vec3f &a, const Vec3f &b, double t) {
+  return {
+      static_cast<float>(static_cast<double>(a.x) +
+                         (static_cast<double>(b.x) - static_cast<double>(a.x)) * t),
+      static_cast<float>(static_cast<double>(a.y) +
+                         (static_cast<double>(b.y) - static_cast<double>(a.y)) * t),
+      static_cast<float>(static_cast<double>(a.z) +
+                         (static_cast<double>(b.z) - static_cast<double>(a.z)) * t),
+  };
+}
+
+std::vector<Vec3f> clip_polygon_to_plane(const TrianglePoints &triangle,
+                                         const std::array<double, 3> &normal, double offset,
+                                         bool keep_positive) {
+  constexpr double epsilon = 1.0e-9;
+  std::vector<Vec3f> input = {triangle[0], triangle[1], triangle[2]};
+  std::vector<Vec3f> output;
+  output.reserve(4);
+
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    const Vec3f &current = input[i];
+    const Vec3f &next = input[(i + 1) % input.size()];
+    const double current_distance = signed_distance(current, normal, offset);
+    const double next_distance = signed_distance(next, normal, offset);
+    const bool current_kept =
+        keep_positive ? current_distance >= -epsilon : current_distance <= epsilon;
+    const bool next_kept = keep_positive ? next_distance >= -epsilon : next_distance <= epsilon;
+
+    if (current_kept && next_kept) {
+      output.push_back(next);
+    } else if (current_kept && !next_kept) {
+      const double denominator = current_distance - next_distance;
+      const double t = denominator == 0.0 ? 0.0 : current_distance / denominator;
+      output.push_back(interpolate(current, next, t));
+    } else if (!current_kept && next_kept) {
+      const double denominator = current_distance - next_distance;
+      const double t = denominator == 0.0 ? 0.0 : current_distance / denominator;
+      output.push_back(interpolate(current, next, t));
+      output.push_back(next);
+    }
+  }
+
+  return output;
+}
+
+std::vector<TrianglePoints> clip_triangles_to_plane(const std::vector<TrianglePoints> &triangles,
+                                                    const std::array<double, 3> &normal,
+                                                    double offset, bool keep_positive) {
+  std::vector<TrianglePoints> clipped;
+  clipped.reserve(triangles.size());
+  for (const auto &triangle : triangles) {
+    const auto polygon = clip_polygon_to_plane(triangle, normal, offset, keep_positive);
+    if (polygon.size() < 3) {
+      continue;
+    }
+    for (std::size_t index = 1; index + 1 < polygon.size(); ++index) {
+      clipped.push_back({{polygon[0], polygon[index], polygon[index + 1]}});
+    }
+  }
+  return clipped;
+}
+
+std::array<double, 3> normalized_plane_normal(const std::string &request_json) {
+  const double nx = meshmend::json_number(request_json, "plane_nx").value_or(0.0);
+  const double ny = meshmend::json_number(request_json, "plane_ny").value_or(0.0);
+  const double nz = meshmend::json_number(request_json, "plane_nz").value_or(0.0);
+  const double length = std::sqrt(nx * nx + ny * ny + nz * nz);
+  if (length <= 0.0 || !std::isfinite(length)) {
+    throw std::runtime_error("cut requires a non-zero plane normal");
+  }
+  return {nx / length, ny / length, nz / length};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
-    const auto request = meshmend::parse_request(meshmend::request_path_from_args(argc, argv));
+    const auto request_path = meshmend::request_path_from_args(argc, argv);
+    const auto request = meshmend::parse_request(request_path);
     meshmend::progress(request, "started", "load", 0, 1, "CGAL worker started");
     const auto triangles = meshmend::binary_stl_triangle_count(request.input_mesh);
 
@@ -197,6 +290,29 @@ int main(int argc, char **argv) {
       write_binary_stl(mesh, request.output_mesh);
       meshmend::progress(request, "progress", "hole_fill", patched_faces, patched_faces,
                          "filled boundary cycles");
+      meshmend::write_response(request, true, triangles, mesh.number_of_faces());
+    } else if (request.operation == "cut") {
+      if (request.output_mesh.empty()) {
+        throw std::runtime_error("cut requires output_mesh");
+      }
+      const auto request_json = meshmend::read_text(request_path);
+      const auto normal = normalized_plane_normal(request_json);
+      const double offset = meshmend::json_number(request_json, "plane_offset").value_or(0.0);
+      const std::string keep = meshmend::json_string(request_json, "keep").value_or("positive");
+      const bool keep_positive = keep != "negative";
+
+      meshmend::progress(request, "phase", "cut", 0, triangles,
+                         "clipping triangle soup against cut plane");
+      const auto clipped_triangles =
+          clip_triangles_to_plane(read_binary_stl_triangles(request.input_mesh), normal, offset,
+                                  keep_positive);
+      auto mesh = mesh_from_triangles(clipped_triangles);
+      meshmend::progress(request, "progress", "cut", clipped_triangles.size(), triangles,
+                         "capping cut boundary cycles");
+      const auto patched_faces = fill_all_holes(mesh);
+      write_binary_stl(mesh, request.output_mesh);
+      meshmend::progress(request, "progress", "cut", patched_faces, patched_faces,
+                         "cut mesh capped and written");
       meshmend::write_response(request, true, triangles, mesh.number_of_faces());
     } else {
       meshmend::progress(request, "progress", "inspect", triangles, triangles,

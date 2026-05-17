@@ -73,6 +73,18 @@ enum Command {
         #[arg(long, value_name = "MODEL_UNITS")]
         voxel_size: Option<f64>,
     },
+    Cut {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "STL")]
+        output: PathBuf,
+        #[arg(long, num_args = 3, value_names = ["X", "Y", "Z"])]
+        normal: Vec<f64>,
+        #[arg(long, default_value_t = 0.0)]
+        offset: f64,
+        #[arg(long, value_enum, default_value_t = CutKeepSide::Positive)]
+        keep: CutKeepSide,
+    },
     Perf {
         #[arg(value_name = "STL")]
         path: PathBuf,
@@ -103,6 +115,21 @@ enum ProjectCommand {
 enum WorkerBackend {
     Cgal,
     Openvdb,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CutKeepSide {
+    Positive,
+    Negative,
+}
+
+impl CutKeepSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::Negative => "negative",
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -272,6 +299,67 @@ fn main() -> Result<()> {
             if !result.response.success {
                 anyhow::bail!(
                     "local wrap worker failed: {}",
+                    result
+                        .response
+                        .error
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            let parsed = load_binary_stl_with_options(
+                &output,
+                &LoadOptions {
+                    parallel: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            let report = app::analyze_parsed_stl(&parsed);
+            println!("wrote: {}", output.display());
+            println!("triangles: {}", parsed.stats.triangle_count);
+            println!("boundary loops: {}", report.topology.boundary_loop_count);
+            println!(
+                "non-manifold edges: {}",
+                report.topology.non_manifold_edge_count
+            );
+        }
+        Some(Command::Cut {
+            path,
+            output,
+            normal,
+            offset,
+            keep,
+        }) => {
+            if normal.len() != 3 {
+                anyhow::bail!("cut --normal requires exactly three values");
+            }
+            let binary = discover_worker_binary("meshmend-cgal-worker").ok_or_else(|| {
+                anyhow::anyhow!("CGAL worker was not found; run `just worker-build`")
+            })?;
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let response_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("cut-response.json");
+            let request_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("cut-request.json");
+            let mut request = WorkerRequest::new(WorkerOperation::Cut, path.clone(), response_path);
+            request.output_mesh = Some(output.clone());
+            request.preview = false;
+            request.options = serde_json::json!({
+                "plane_nx": normal[0],
+                "plane_ny": normal[1],
+                "plane_nz": normal[2],
+                "plane_offset": offset,
+                "keep": keep.as_str(),
+            });
+            let result = WorkerRunner::new(binary).run(&request, &request_path)?;
+            if !result.response.success {
+                anyhow::bail!(
+                    "cut worker failed: {}",
                     result
                         .response
                         .error
