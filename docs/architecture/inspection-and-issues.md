@@ -22,6 +22,12 @@ labels, not point issues. The first active label types are:
 - repair target: the damaged or hollow area to heal
 - exclude: nearby surface that should not be pulled into a local repair solve
 
+Brush size is measured in mesh-detail units. When an STL loads, MeshMend samples
+triangle edge lengths and uses the average edge length as unit 1. A brush radius
+of 10 therefore records a world-space radius of roughly 10 average triangle
+edges for that model. This keeps dense models paintable without tying labels to
+screen percentage or window size.
+
 Current issue fields:
 
 - model file name
@@ -39,7 +45,7 @@ Current brush stroke fields:
 
 - stroke ID
 - label kind
-- brush radius
+- brush radius in model-space units
 - sampled triangle IDs
 - sampled model-space positions
 

@@ -10,9 +10,16 @@ The intended workflow is:
 - Optionally paint excluded nearby surface that should not be pulled into the
   solve.
 - Build a local repair volume from the labeled area plus a small margin.
-- Choose repair resolution from the brush radius and local triangle density.
+- Choose repair resolution from the brush radius, mesh-detail unit, and local
+  triangle density.
 - Reconstruct only the local target volume, then blend the patch back into the
   healthy boundary.
+
+The label brush stores each stroke radius in model-space units. The UI radius is
+scaled from the loaded mesh's average triangle edge length, so a radius of 10 is
+about 10 local detail units on the current model. Local repair should use that
+stored radius as the first ROI expansion distance before choosing voxel or
+shrink-wrap resolution.
 
 The first implementation target is a local shrink-wrap or voxel-wrap prototype
 that eliminates the internal cavity without changing the full model. Global

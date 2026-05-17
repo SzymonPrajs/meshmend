@@ -31,6 +31,7 @@ struct ModelInfo {
     stats: MeshStats,
     chunk_count: usize,
     parse_ms: f64,
+    brush_unit: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +54,7 @@ enum UiAction {
 struct BrushToolState {
     enabled: bool,
     kind: BrushLabelKind,
-    radius: f32,
+    size_units: f32,
     min_screen_spacing: f32,
     active_stroke_index: Option<usize>,
     last_sample_screen: Option<glam::Vec2>,
@@ -64,7 +65,7 @@ impl Default for BrushToolState {
         Self {
             enabled: false,
             kind: BrushLabelKind::default(),
-            radius: 0.0,
+            size_units: 40.0,
             min_screen_spacing: 10.0,
             active_stroke_index: None,
             last_sample_screen: None,
@@ -73,6 +74,10 @@ impl Default for BrushToolState {
 }
 
 impl BrushToolState {
+    fn world_radius(&self, model: &ModelInfo) -> f32 {
+        (self.size_units.max(1.0) * model.brush_unit).max(model.brush_unit)
+    }
+
     fn finish_stroke(&mut self) {
         self.active_stroke_index = None;
         self.last_sample_screen = None;
@@ -285,6 +290,7 @@ pub fn run_native(
                                     sample_label_brush(
                                         &mut renderer,
                                         issue_session.as_mut(),
+                                        model_info.as_ref(),
                                         &mut brush_tool,
                                         position,
                                         &mut selected_pick,
@@ -344,6 +350,7 @@ pub fn run_native(
                                     sample_label_brush(
                                         &mut renderer,
                                         issue_session.as_mut(),
+                                        model_info.as_ref(),
                                         &mut brush_tool,
                                         glam::Vec2::new(position.x as f32, position.y as f32),
                                         &mut selected_pick,
@@ -930,6 +937,7 @@ fn load_model(
     window: &winit::window::Window,
 ) -> Result<ModelInfo> {
     let parsed = load_binary_stl(path)?;
+    let brush_unit = estimate_mesh_detail_unit(&parsed);
     upload_parsed_mesh(renderer, &parsed);
     let info = ModelInfo {
         path: parsed.source_path.clone(),
@@ -937,6 +945,7 @@ fn load_model(
         stats: parsed.stats.clone(),
         chunk_count: parsed.chunks.len(),
         parse_ms: parsed.timings.parse.as_secs_f64() * 1000.0,
+        brush_unit,
     };
     window.set_title(&format!("MeshMend - {}", info.file_name));
     tracing::info!(
@@ -947,6 +956,55 @@ fn load_model(
         "loaded STL mesh"
     );
     Ok(info)
+}
+
+fn estimate_mesh_detail_unit(parsed: &ParsedStl) -> f32 {
+    const MAX_SAMPLED_TRIANGLES: usize = 50_000;
+    const MIN_BOUND_FRACTION: f32 = 0.0001;
+    const FALLBACK_BOUND_FRACTION: f32 = 0.01;
+
+    let triangle_count = parsed.stats.triangle_count as usize;
+    let step = (triangle_count / MAX_SAMPLED_TRIANGLES).max(1);
+    let mut edge_total = 0.0_f64;
+    let mut edge_count = 0_u64;
+    let mut sampled = 0_usize;
+    let mut triangle_index = 0_usize;
+
+    for chunk in &parsed.chunks {
+        for triangle in &chunk.triangles {
+            if triangle_index % step == 0 {
+                let [a, b, c] = triangle.vertices;
+                edge_total += f64::from(a.distance(b));
+                edge_total += f64::from(b.distance(c));
+                edge_total += f64::from(c.distance(a));
+                edge_count += 3;
+                sampled += 1;
+                if sampled >= MAX_SAMPLED_TRIANGLES {
+                    break;
+                }
+            }
+            triangle_index += 1;
+        }
+        if sampled >= MAX_SAMPLED_TRIANGLES {
+            break;
+        }
+    }
+
+    let bounds_radius = parsed.stats.bounds.radius();
+    let bounds_radius = if bounds_radius.is_finite() && bounds_radius > 0.0 {
+        bounds_radius
+    } else {
+        1.0
+    };
+    let fallback = bounds_radius * FALLBACK_BOUND_FRACTION;
+    let minimum = bounds_radius * MIN_BOUND_FRACTION;
+    let average_edge = if edge_count == 0 {
+        fallback
+    } else {
+        (edge_total / edge_count as f64) as f32
+    };
+
+    average_edge.max(minimum).max(f32::EPSILON)
 }
 
 fn upload_parsed_mesh(renderer: &mut WgpuRenderer<'_>, parsed: &ParsedStl) {
@@ -981,15 +1039,18 @@ fn update_label_strokes(renderer: &mut WgpuRenderer<'_>, session: &IssueSession)
                 .iter()
                 .map(|sample| glam::Vec3::from_array(sample.position))
                 .collect(),
+            radius: stroke.radius,
             color: stroke.kind.color(),
         })
         .collect::<Vec<_>>();
     renderer.set_label_strokes(&strokes);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_label_brush(
     renderer: &mut WgpuRenderer<'_>,
     session: Option<&mut IssueSession>,
+    model_info: Option<&ModelInfo>,
     brush: &mut BrushToolState,
     screen_position: glam::Vec2,
     selected_pick: &mut Option<PickResult>,
@@ -1005,9 +1066,12 @@ fn sample_label_brush(
         }
     }
 
+    let brush_radius = model_info
+        .map(|model| brush.world_radius(model))
+        .unwrap_or_else(|| brush.size_units.max(1.0));
     let stroke_index = brush
         .active_stroke_index
-        .unwrap_or_else(|| session.start_label_stroke(brush.kind, brush.radius.max(0.001)));
+        .unwrap_or_else(|| session.start_label_stroke(brush.kind, brush_radius));
     brush.active_stroke_index = Some(stroke_index);
 
     match renderer.pick(screen_position) {
@@ -1076,6 +1140,7 @@ fn draw_ui(
                 ui.label(format!("Chunks: {}", model.chunk_count));
                 ui.label(format!("Bytes: {}", model.stats.source_bytes));
                 ui.label(format!("Parse: {:.2} ms", model.parse_ms));
+                ui.label(format!("Brush unit: {:.5}", model.brush_unit));
                 ui.label(format!(
                     "GPU buffers: {:.2} MB",
                     gpu_buffer_bytes as f64 / (1024.0 * 1024.0)
@@ -1165,13 +1230,11 @@ fn draw_ui(
                     }
                 });
 
-            let max_radius = (model.stats.bounds.radius() * 0.08).max(0.01);
-            if brush_tool.radius <= 0.0 {
-                brush_tool.radius = (model.stats.bounds.radius() * 0.015).max(0.01);
-            }
-            ui.add(
-                egui::Slider::new(&mut brush_tool.radius, 0.001..=max_radius).text("Brush radius"),
-            );
+            ui.add(egui::Slider::new(&mut brush_tool.size_units, 1.0..=200.0).text("Brush radius"));
+            ui.label(format!(
+                "World radius: {:.5}",
+                brush_tool.world_radius(model)
+            ));
             ui.add(
                 egui::Slider::new(&mut brush_tool.min_screen_spacing, 2.0..=32.0).text("Spacing"),
             );

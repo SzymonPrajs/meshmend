@@ -56,6 +56,7 @@ pub struct ScreenshotStats {
 #[derive(Debug, Clone)]
 pub struct LabelStrokeOverlay {
     pub points: Vec<Vec3>,
+    pub radius: f32,
     pub color: [f32; 4],
 }
 
@@ -812,8 +813,8 @@ impl<'window> WgpuRenderer<'window> {
     }
 
     pub fn set_label_strokes(&mut self, strokes: &[LabelStrokeOverlay]) {
-        self.label_strokes = (!strokes.is_empty())
-            .then(|| SceneLines::label_strokes(&self.device, strokes, self.marker_radius() * 0.45));
+        self.label_strokes =
+            (!strokes.is_empty()).then(|| SceneLines::label_strokes(&self.device, strokes));
     }
 
     fn update_cross_section_guide(&mut self) {
@@ -1196,11 +1197,7 @@ impl SceneLines {
         }
     }
 
-    fn label_strokes(
-        device: &wgpu::Device,
-        strokes: &[LabelStrokeOverlay],
-        point_radius: f32,
-    ) -> Self {
+    fn label_strokes(device: &wgpu::Device, strokes: &[LabelStrokeOverlay]) -> Self {
         let mut vertices = Vec::new();
         for stroke in strokes {
             for segment in stroke.points.windows(2) {
@@ -1214,26 +1211,34 @@ impl SceneLines {
                 });
             }
 
-            if let Some(first) = stroke.points.first() {
-                let radius = point_radius.max(0.001);
-                vertices.extend_from_slice(&[
-                    LineVertex {
-                        position: (*first + Vec3::new(-radius, 0.0, 0.0)).to_array(),
-                        color: stroke.color,
-                    },
-                    LineVertex {
-                        position: (*first + Vec3::new(radius, 0.0, 0.0)).to_array(),
-                        color: stroke.color,
-                    },
-                    LineVertex {
-                        position: (*first + Vec3::new(0.0, -radius, 0.0)).to_array(),
-                        color: stroke.color,
-                    },
-                    LineVertex {
-                        position: (*first + Vec3::new(0.0, radius, 0.0)).to_array(),
-                        color: stroke.color,
-                    },
-                ]);
+            let radius = stroke.radius.max(0.001);
+            for (index, point) in stroke.points.iter().enumerate() {
+                if index % 2 == 0 || index + 1 == stroke.points.len() {
+                    Self::push_ring(
+                        &mut vertices,
+                        *point,
+                        radius,
+                        Vec3::X,
+                        Vec3::Y,
+                        stroke.color,
+                    );
+                    Self::push_ring(
+                        &mut vertices,
+                        *point,
+                        radius,
+                        Vec3::X,
+                        Vec3::Z,
+                        stroke.color,
+                    );
+                    Self::push_ring(
+                        &mut vertices,
+                        *point,
+                        radius,
+                        Vec3::Y,
+                        Vec3::Z,
+                        stroke.color,
+                    );
+                }
             }
         }
 
@@ -1247,6 +1252,32 @@ impl SceneLines {
             buffer,
             grid_vertex_count: vertices.len() as u32,
             axes_vertex_count: 0,
+        }
+    }
+
+    fn push_ring(
+        vertices: &mut Vec<LineVertex>,
+        center: Vec3,
+        radius: f32,
+        axis_a: Vec3,
+        axis_b: Vec3,
+        color: [f32; 4],
+    ) {
+        const SEGMENTS: usize = 32;
+
+        for segment in 0..SEGMENTS {
+            let start_angle = segment as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let end_angle = (segment + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let start = center + (axis_a * start_angle.cos() + axis_b * start_angle.sin()) * radius;
+            let end = center + (axis_a * end_angle.cos() + axis_b * end_angle.sin()) * radius;
+            vertices.push(LineVertex {
+                position: start.to_array(),
+                color,
+            });
+            vertices.push(LineVertex {
+                position: end.to_array(),
+                color,
+            });
         }
     }
 
