@@ -65,6 +65,7 @@ enum UiAction {
     SaveAs,
     ClearSelection,
     ApplyCut,
+    SelectPiece(usize),
     HidePiece,
     ShowAllPieces,
     DeletePiece,
@@ -758,6 +759,10 @@ impl CutState {
         self.start.is_some() || self.current.is_some() || self.dragging
     }
 
+    fn can_begin_gesture(&self) -> bool {
+        !self.has_preview()
+    }
+
     fn has_preview(&self) -> bool {
         self.start.is_some() && self.current.is_some() && self.plane.is_some()
     }
@@ -810,6 +815,19 @@ impl MeshDocument {
 
     fn selected_piece(&self) -> Option<&MeshPiece> {
         self.selected_piece.and_then(|index| self.pieces.get(index))
+    }
+
+    fn selected_piece_index(&self) -> Option<usize> {
+        self.selected_piece
+    }
+
+    fn smallest_visible_piece_index(&self) -> Option<usize> {
+        self.pieces
+            .iter()
+            .enumerate()
+            .filter(|(_, piece)| !piece.hidden)
+            .min_by_key(|(_, piece)| piece.range.len())
+            .map(|(index, _)| index)
     }
 
     fn select_piece_for_render_triangle(&mut self, render_triangle_index: usize) -> Option<usize> {
@@ -1288,14 +1306,25 @@ fn apply_cut_preview(
             hidden: false,
         },
     ];
-    document.selected_piece = None;
+    let selected_piece = document.smallest_visible_piece_index();
+    document.selected_piece = selected_piece;
     document.dirty = true;
     upload_document_mesh(renderer, window, model_info, document);
     selection.reset_for_model_change();
+    selection.tool = SelectionTool::Point;
+    selection.element = SelectionElement::Face;
     cut.cancel(renderer);
-    renderer.set_selection_overlay(&cap_overlay_for_document(document));
+    if let Some(selected_piece) = selected_piece {
+        renderer.set_selection_overlay(&piece_selection_overlay(document, selected_piece));
+    } else {
+        renderer.set_selection_overlay(&cap_overlay_for_document(document));
+    }
+    let selected_label = selected_piece
+        .and_then(|index| document.pieces.get(index))
+        .map(|piece| piece.label.as_str())
+        .unwrap_or("no piece");
     *status = format!(
-        "Cut applied: {} loops, {:.5} target cap edge, {} cap triangles",
+        "Cut applied: {selected_label} selected. Click a piece or use Delete / Keep / Hide. {} loops, {:.5} target cap edge, {} cap triangles",
         result.loops.len(),
         result.target_edge_length,
         result.pieces[0].cap_triangle_count + result.pieces[1].cap_triangle_count
@@ -1321,6 +1350,56 @@ fn cap_overlay_for_document(document: &MeshDocument) -> SelectionOverlay {
         edges: Vec::new(),
         faces,
     }
+}
+
+fn piece_selection_overlay(document: &MeshDocument, piece_index: usize) -> SelectionOverlay {
+    let Some(piece) = document.pieces.get(piece_index) else {
+        return SelectionOverlay::default();
+    };
+    if piece.hidden {
+        return SelectionOverlay::default();
+    }
+    SelectionOverlay {
+        vertices: Vec::new(),
+        edges: Vec::new(),
+        faces: document.triangles[piece.range.clone()]
+            .iter()
+            .map(|triangle| triangle.vertices)
+            .collect(),
+    }
+}
+
+fn select_piece_by_index(
+    renderer: &mut WgpuRenderer<'_>,
+    document: &mut MeshDocument,
+    piece_index: usize,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) -> bool {
+    let Some(piece) = document.pieces.get(piece_index) else {
+        *status = "Cut piece no longer exists".to_string();
+        *needs_redraw = true;
+        return false;
+    };
+    if piece.hidden {
+        *status = format!("{} is hidden; use Show All to restore it", piece.label);
+        *needs_redraw = true;
+        return false;
+    }
+
+    document.selected_piece = Some(piece_index);
+    renderer.set_selection_overlay(&piece_selection_overlay(document, piece_index));
+    let piece = &document.pieces[piece_index];
+    *status = format!(
+        "Selected {} ({:?}, {} triangles, {} cap triangles, radius {:.4}). Use Delete, Keep, Hide, or Export.",
+        piece.label,
+        piece.side,
+        piece.range.len(),
+        piece.cap_triangle_count,
+        piece.bounds.radius()
+    );
+    *needs_redraw = true;
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1370,25 +1449,7 @@ fn select_piece_at_screen(
     let Some(piece_index) = document.select_piece_for_render_triangle(global_index) else {
         return false;
     };
-    let piece = &document.pieces[piece_index];
-    renderer.set_selection_overlay(&SelectionOverlay {
-        vertices: Vec::new(),
-        edges: Vec::new(),
-        faces: document.triangles[piece.range.clone()]
-            .iter()
-            .map(|triangle| triangle.vertices)
-            .collect(),
-    });
-    *status = format!(
-        "Selected {} ({:?}, {} triangles, {} cap triangles)",
-        piece.label,
-        piece.side,
-        piece.range.len(),
-        piece.cap_triangle_count
-    );
-    *status = format!("{}, radius {:.4}", *status, piece.bounds.radius());
-    *needs_redraw = true;
-    true
+    select_piece_by_index(renderer, document, piece_index, status, needs_redraw)
 }
 
 fn delete_selected_piece(
@@ -2039,6 +2100,7 @@ pub fn run_native(
                             if button == MouseButton::Left
                                 && selection_state.tool == SelectionTool::Cut
                                 && !active_modifiers.shift_key()
+                                && cut_state.can_begin_gesture()
                                 && ui_input.allows_pointer_action(window.scale_factor() as f32) =>
                         {
                             if let Some(position) = selection_state.cursor_position {
@@ -2154,6 +2216,7 @@ pub fn run_native(
                         } else if selection_state.tool == SelectionTool::Cut
                             && cut_state.has_anchor()
                             && !cut_state.has_preview()
+                            && ui_input.allows_pointer_action(window.scale_factor() as f32)
                         {
                             cut_state.current = Some(cursor);
                             needs_redraw = true;
@@ -2762,6 +2825,30 @@ fn draw_ui(
             if toolbar_command_button(ui, Icon::Reset, "Reset", "Home").clicked() {
                 *action = UiAction::Reset;
             }
+            if let Some(document) = mesh_document.filter(|document| document.has_pieces()) {
+                ui.separator();
+                for (piece_index, piece) in document
+                    .pieces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, piece)| !piece.hidden)
+                {
+                    let selected = document.selected_piece_index() == Some(piece_index);
+                    let label = piece.label.as_str();
+                    let hover = format!(
+                        "{}: {} triangles, {} cap triangles",
+                        piece.label,
+                        piece.range.len(),
+                        piece.cap_triangle_count
+                    );
+                    if toolbar_button(ui, Icon::FaceSelect, label, "", selected)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        *action = UiAction::SelectPiece(piece_index);
+                    }
+                }
+            }
             if mesh_document
                 .and_then(MeshDocument::selected_piece)
                 .is_some()
@@ -3209,7 +3296,11 @@ fn toolbar_button(
         egui::FontId::proportional(12.0),
         stroke_color,
     );
-    response.on_hover_text(format!("{label} ({shortcut})"))
+    if shortcut.is_empty() {
+        response.on_hover_text(label)
+    } else {
+        response.on_hover_text(format!("{label} ({shortcut})"))
+    }
 }
 
 fn draw_status_bar(
@@ -3415,6 +3506,14 @@ fn handle_ui_action(
                 status,
                 needs_redraw,
             );
+        }
+        UiAction::SelectPiece(piece_index) => {
+            let Some(document) = mesh_document.as_mut() else {
+                *status = "No cut pieces available".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            select_piece_by_index(renderer, document, piece_index, status, needs_redraw);
         }
         UiAction::HidePiece => {
             hide_selected_piece(
@@ -3951,6 +4050,19 @@ mod tests {
             ]
         );
         assert_eq!(SelectionTool::Cut.shortcut(), "C");
+    }
+
+    #[test]
+    fn pending_cut_preview_blocks_new_cut_gesture() {
+        let mut cut = CutState::default();
+        assert!(cut.can_begin_gesture());
+
+        cut.start = Some(Vec2::new(10.0, 20.0));
+        cut.current = Some(Vec2::new(80.0, 90.0));
+        cut.plane = CutPlane::from_point_normal(Vec3::ZERO, Vec3::Z);
+
+        assert!(cut.has_preview());
+        assert!(!cut.can_begin_gesture());
     }
 
     #[test]
