@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rust:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev libxkbcommon-dev libwayland-dev libgtk-3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --workspace --release
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/MeshMend-linux-x86_64
+          cp target/release/meshmend dist/MeshMend-linux-x86_64/
+          tar -czf dist/MeshMend-linux-x86_64.tar.gz -C dist MeshMend-linux-x86_64
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/MeshMend-windows-x86_64 | Out-Null
+          Copy-Item target/release/meshmend.exe dist/MeshMend-windows-x86_64/
+          Compress-Archive -Path dist/MeshMend-windows-x86_64 -DestinationPath dist/MeshMend-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeshMend-${{ runner.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: ignore

@@ -62,6 +62,10 @@ Current implementation commands:
 ```bash
 cargo run -p meshmend
 cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --screenshot fixtures/stl/cube_binary.stl outputs/cube.png
+cargo run -p meshmend -- perf fixtures/stl/cube_binary.stl --output outputs/perf-cube.json
 ```
 
 Verification:
@@ -71,4 +75,13 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace --release
+```
+
+Local large-model checks use the ignored file:
+
+```bash
+cargo run -p meshmend -- inspect rose/raw.stl --parallel
+cargo run -p meshmend -- rose/raw.stl
+cargo run -p meshmend -- --verify-render rose/raw.stl
+cargo run -p meshmend -- perf rose/raw.stl --output outputs/perf-rose.json
 ```

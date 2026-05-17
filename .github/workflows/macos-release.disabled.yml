@@ -1,0 +1,27 @@
+name: Manual macOS Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --workspace --release
+
+      - name: Package app preview
+        run: |
+          mkdir -p dist/MeshMend-macos
+          cp target/release/meshmend dist/MeshMend-macos/
+          ditto -c -k --keepParent dist/MeshMend-macos dist/MeshMend-macos-universal.zip
+          shasum -a 256 dist/MeshMend-macos-universal.zip > dist/MeshMend-macos-universal.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeshMend-macos-manual
+          path: dist/*

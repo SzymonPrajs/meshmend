@@ -246,35 +246,31 @@ pub fn run_native(
                         }
                         _ => {}
                     },
-                    WindowEvent::CursorMoved { position, .. } => {
-                        if !egui_response.consumed {
-                            if let Some((button, delta)) =
-                                camera_input.cursor_delta(position.x, position.y)
-                            {
-                                let mut camera = renderer.camera();
-                                match button {
-                                    MouseButton::Left => camera.orbit(delta),
-                                    MouseButton::Right | MouseButton::Middle => {
-                                        camera.pan(delta, renderer.size().height as f32);
-                                    }
-                                    _ => {}
-                                }
-                                renderer.set_camera(camera);
-                                needs_redraw = true;
-                            }
-                        }
-                    }
-                    WindowEvent::MouseWheel { delta, .. } => {
-                        if !egui_response.consumed {
-                            let wheel_delta = match delta {
-                                MouseScrollDelta::LineDelta(_, y) => y,
-                                MouseScrollDelta::PixelDelta(position) => position.y as f32 * 0.02,
-                            };
+                    WindowEvent::CursorMoved { position, .. } if !egui_response.consumed => {
+                        if let Some((button, delta)) =
+                            camera_input.cursor_delta(position.x, position.y)
+                        {
                             let mut camera = renderer.camera();
-                            camera.zoom(wheel_delta, renderer.mesh_bounds());
+                            match button {
+                                MouseButton::Left => camera.orbit(delta),
+                                MouseButton::Right | MouseButton::Middle => {
+                                    camera.pan(delta, renderer.size().height as f32);
+                                }
+                                _ => {}
+                            }
                             renderer.set_camera(camera);
                             needs_redraw = true;
                         }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } if !egui_response.consumed => {
+                        let wheel_delta = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y,
+                            MouseScrollDelta::PixelDelta(position) => position.y as f32 * 0.02,
+                        };
+                        let mut camera = renderer.camera();
+                        camera.zoom(wheel_delta, renderer.mesh_bounds());
+                        renderer.set_camera(camera);
+                        needs_redraw = true;
                     }
                     WindowEvent::KeyboardInput { event, .. }
                         if event.state == ElementState::Pressed && !egui_response.consumed =>
@@ -294,11 +290,9 @@ pub fn run_native(
                     _ => {}
                 }
             }
-            Event::AboutToWait => {
-                if needs_redraw {
-                    redraw_window.request_redraw();
-                    needs_redraw = false;
-                }
+            Event::AboutToWait if needs_redraw => {
+                redraw_window.request_redraw();
+                needs_redraw = false;
             }
             _ => {}
         }
@@ -350,11 +344,9 @@ pub fn run_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
                 *result_writer.lock().expect("capture result lock poisoned") = Some(capture);
                 target.exit();
             }
-            Event::AboutToWait => {
-                if needs_redraw {
-                    redraw_window.request_redraw();
-                    needs_redraw = false;
-                }
+            Event::AboutToWait if needs_redraw => {
+                redraw_window.request_redraw();
+                needs_redraw = false;
             }
             _ => {}
         }
@@ -461,11 +453,9 @@ pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
                 *result_writer.lock().expect("perf result lock poisoned") = Some(capture);
                 target.exit();
             }
-            Event::AboutToWait => {
-                if needs_redraw {
-                    redraw_window.request_redraw();
-                    needs_redraw = false;
-                }
+            Event::AboutToWait if needs_redraw => {
+                redraw_window.request_redraw();
+                needs_redraw = false;
             }
             _ => {}
         }
@@ -477,6 +467,7 @@ pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
         .unwrap_or_else(|| Err(anyhow!("performance capture did not run")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_ui_action(
     action: UiAction,
     renderer: &mut WgpuRenderer<'_>,
@@ -655,6 +646,7 @@ fn update_note_markers(renderer: &mut WgpuRenderer<'_>, session: &NoteSession) {
     renderer.set_note_markers(&positions);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_ui(
     ctx: &egui::Context,
     renderer_info: &RendererInfo,
