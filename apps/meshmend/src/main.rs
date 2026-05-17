@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::commands::ViewModeName;
+use crate::commands::{AppCommand, ViewModeName};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use glam::Vec3;
@@ -14,6 +14,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
 mod commands;
+mod control;
 mod icons;
 mod input;
 mod render_script;
@@ -26,6 +27,12 @@ mod session;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    #[arg(long, value_name = "SOCKET")]
+    control_socket: Option<String>,
+
+    #[arg(long)]
+    replace_control_socket: bool,
 
     #[arg(long, value_names = ["STL", "PNG"], num_args = 2)]
     screenshot: Option<Vec<PathBuf>>,
@@ -165,6 +172,12 @@ enum Command {
         #[arg(value_name = "STL")]
         path: PathBuf,
     },
+    Control {
+        #[arg(long, value_name = "SOCKET")]
+        socket: PathBuf,
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,6 +198,52 @@ enum WorkerBackend {
 enum CutKeepSide {
     Positive,
     Negative,
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlCommand {
+    State,
+    Screenshot {
+        #[arg(value_name = "PNG")]
+        path: PathBuf,
+    },
+    PreviewCut {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    },
+    ApplyCut,
+    SetView {
+        #[arg(value_enum)]
+        mode: ViewModeName,
+    },
+    FitCamera,
+    Orbit {
+        dx: f32,
+        dy: f32,
+    },
+    Pan {
+        dx: f32,
+        dy: f32,
+    },
+    Zoom {
+        delta: f32,
+    },
+    SelectObject {
+        index: usize,
+    },
+    SelectObjectAt {
+        x: f32,
+        y: f32,
+    },
+    DeleteSelectedObject,
+    HideSelectedObject,
+    KeepOnlySelectedObject,
+    ExportVisible {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -618,12 +677,58 @@ fn main() -> Result<()> {
             );
             println!("progress events: {}", result.progress.len());
         }
+        Some(Command::Control { socket, command }) => {
+            let response = control::send_control_command(socket, control_command_to_app(command))?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            if !response.ok {
+                anyhow::bail!(
+                    "{}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "control command failed".to_string())
+                );
+            }
+        }
         None => {
-            app::run_native(cli.input, cli.smoke_window, cli.smoke_pick_center)?;
+            let control_socket = cli
+                .control_socket
+                .map(|value| control::ControlSocketConfig {
+                    path: control::resolve_control_socket(&value),
+                    replace_existing: cli.replace_control_socket,
+                });
+            app::run_native(
+                cli.input,
+                cli.smoke_window,
+                cli.smoke_pick_center,
+                control_socket,
+            )?;
         }
     }
 
     Ok(())
+}
+
+fn control_command_to_app(command: ControlCommand) -> AppCommand {
+    match command {
+        ControlCommand::State => AppCommand::StateReport { path: None },
+        ControlCommand::Screenshot { path } => AppCommand::Screenshot { path },
+        ControlCommand::PreviewCut { x1, y1, x2, y2 } => AppCommand::PreviewViewLineCut {
+            start: [x1, y1],
+            end: [x2, y2],
+        },
+        ControlCommand::ApplyCut => AppCommand::ApplyCut,
+        ControlCommand::SetView { mode } => AppCommand::SetViewMode { mode },
+        ControlCommand::FitCamera => AppCommand::FitCamera,
+        ControlCommand::Orbit { dx, dy } => AppCommand::OrbitCamera { delta: [dx, dy] },
+        ControlCommand::Pan { dx, dy } => AppCommand::PanCamera { delta: [dx, dy] },
+        ControlCommand::Zoom { delta } => AppCommand::ZoomCamera { delta },
+        ControlCommand::SelectObject { index } => AppCommand::SelectObject { index },
+        ControlCommand::SelectObjectAt { x, y } => AppCommand::SelectObjectAt { position: [x, y] },
+        ControlCommand::DeleteSelectedObject => AppCommand::DeleteSelectedObject,
+        ControlCommand::HideSelectedObject => AppCommand::HideSelectedObject,
+        ControlCommand::KeepOnlySelectedObject => AppCommand::KeepOnlySelectedObject,
+        ControlCommand::ExportVisible { path } => AppCommand::ExportVisible { path },
+    }
 }
 
 fn init_logging() {

@@ -49,6 +49,41 @@ scenario-rose:
     test -f rose/raw.stl
     cargo run -p meshmend -- render rose/raw.stl --output outputs/scenario-rose-load-render/rose-loaded.png --state outputs/scenario-rose-load-render/state.json --width 1600 --height 1000 --view rendered
 
+control-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p meshmend
+    mkdir -p outputs/control-smoke target/meshmend-control
+    sock="target/meshmend-control/smoke.sock"
+    rm -f "$sock"
+    log="outputs/control-smoke/app.log"
+    target/debug/meshmend --control-socket "$sock" --replace-control-socket fixtures/stl/cube_binary.stl >"$log" 2>&1 &
+    pid=$!
+    cleanup() {
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" >/dev/null 2>&1 || true
+        rm -f "$sock"
+    }
+    trap cleanup EXIT
+    for _ in {1..80}; do
+        [[ -S "$sock" ]] && break
+        sleep 0.1
+    done
+    [[ -S "$sock" ]] || { echo "socket was not created"; cat "$log" || true; exit 1; }
+    target/debug/meshmend control --socket "$sock" state > outputs/control-smoke/01-state.json
+    target/debug/meshmend control --socket "$sock" pan 25 10 > outputs/control-smoke/02-pan.json
+    target/debug/meshmend control --socket "$sock" zoom 0.5 > outputs/control-smoke/03-zoom.json
+    target/debug/meshmend control --socket "$sock" screenshot outputs/control-smoke/04-live.png > outputs/control-smoke/04-screenshot.json
+    target/debug/meshmend control --socket "$sock" preview-cut 500 120 780 680 > outputs/control-smoke/05-preview.json
+    target/debug/meshmend control --socket "$sock" apply-cut > outputs/control-smoke/06-apply.json
+    target/debug/meshmend control --socket "$sock" select-object 0 > outputs/control-smoke/07-select-object.json
+    target/debug/meshmend control --socket "$sock" export-visible outputs/control-smoke/live-cut.stl > outputs/control-smoke/08-export.json
+    jq -e '.ok == true and .state.triangles > 0' outputs/control-smoke/01-state.json >/dev/null
+    jq -e '.ok == true' outputs/control-smoke/08-export.json >/dev/null
+    test -s outputs/control-smoke/04-live.png
+    test -s outputs/control-smoke/live-cut.stl
+    cargo run -p meshmend -- analyze outputs/control-smoke/live-cut.stl --output outputs/control-smoke/live-cut-analysis.json >/dev/null
+
 smoke:
     cargo run -p meshmend -- --smoke-window
 

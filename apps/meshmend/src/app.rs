@@ -4,6 +4,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -32,6 +33,12 @@ use winit::{
 };
 
 use crate::{
+    commands::{
+        AppCommand, BoundsSnapshot, CameraState, CutPreviewSnapshot, ObjectSnapshot,
+        SelectionDepthName, SelectionElementName, SelectionSnapshot, StateSnapshot, ToolName,
+        ViewModeName,
+    },
+    control::{ControlEvent, ControlResponse, ControlSocketConfig},
     icons::{draw_icon, Icon},
     input::CameraInput,
 };
@@ -42,14 +49,17 @@ const CUT_MIN_SCREEN_DISTANCE_SQUARED: f32 = 16.0;
 const SIDE_PALETTE_TOP_OFFSET: f32 = 92.0;
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum AppEvent {
     Menu(muda::MenuEvent),
+    Control(ControlEvent),
 }
 
 #[cfg(not(target_os = "macos"))]
-#[derive(Debug, Clone)]
-enum AppEvent {}
+#[derive(Clone)]
+enum AppEvent {
+    Control(ControlEvent),
+}
 
 #[derive(Debug, Clone)]
 struct ModelInfo {
@@ -1986,8 +1996,22 @@ pub fn run_native(
     initial_file: Option<PathBuf>,
     smoke_window: bool,
     smoke_pick_center: bool,
+    control_socket: Option<ControlSocketConfig>,
 ) -> Result<()> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build()?;
+    let _control_socket_guard = if let Some(config) = control_socket {
+        let path = config.path.clone();
+        let proxy = event_loop.create_proxy();
+        let guard = crate::control::spawn_control_socket(config, move |event| {
+            proxy
+                .send_event(AppEvent::Control(event))
+                .map_err(|err| anyhow!("failed to dispatch control event: {err}"))
+        })?;
+        tracing::info!(socket = %path.display(), "control socket listening");
+        Some(guard)
+    } else {
+        None
+    };
     let native_menu = NativeAppMenu::install(&event_loop)?;
     let title = initial_file
         .as_ref()
@@ -2051,6 +2075,23 @@ pub fn run_native(
         target.set_control_flow(ControlFlow::Wait);
 
         match event {
+            Event::UserEvent(AppEvent::Control(control_event)) => {
+                let response = handle_control_event(
+                    control_event.request.id,
+                    control_event.request.command,
+                    &mut renderer,
+                    redraw_window,
+                    &mut model_info,
+                    &mut view_mode,
+                    &mut status,
+                    &mut selection_state,
+                    &mut cut_state,
+                    &mut mesh_document,
+                    &mut needs_redraw,
+                );
+                let _ = control_event.response_tx.send(response);
+                native_menu.set_model_loaded(model_info.is_some());
+            }
             #[cfg(target_os = "macos")]
             Event::UserEvent(AppEvent::Menu(menu_event)) => {
                 if let Some(action) = native_menu.action_for_event(&menu_event) {
@@ -3773,6 +3814,551 @@ fn handle_ui_action(
             renderer.set_display_settings(settings);
             *status = format!("View: {}", mode.label());
             *needs_redraw = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_control_event(
+    id: u64,
+    command: AppCommand,
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    view_mode: &mut ViewMode,
+    status: &mut String,
+    selection_state: &mut SelectionState,
+    cut_state: &mut CutState,
+    mesh_document: &mut Option<MeshDocument>,
+    needs_redraw: &mut bool,
+) -> ControlResponse {
+    let result = apply_control_command(
+        command,
+        renderer,
+        window,
+        model_info,
+        view_mode,
+        status,
+        selection_state,
+        cut_state,
+        mesh_document,
+        needs_redraw,
+    );
+    match result {
+        Ok(message) => ControlResponse::ok(
+            id,
+            message,
+            app_state_snapshot(
+                model_info.as_ref(),
+                mesh_document.as_ref(),
+                *view_mode,
+                renderer,
+                selection_state,
+                cut_state,
+                status,
+                None,
+            ),
+        ),
+        Err(err) => {
+            let error = err.to_string();
+            *status = format!("Control failed: {error}");
+            *needs_redraw = true;
+            ControlResponse::error(id, error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_control_command(
+    command: AppCommand,
+    renderer: &mut WgpuRenderer<'_>,
+    window: &Window,
+    model_info: &mut Option<ModelInfo>,
+    view_mode: &mut ViewMode,
+    status: &mut String,
+    selection_state: &mut SelectionState,
+    cut_state: &mut CutState,
+    mesh_document: &mut Option<MeshDocument>,
+    needs_redraw: &mut bool,
+) -> Result<String> {
+    match command {
+        AppCommand::LoadStl { path } => {
+            load_model_into_app(&path, renderer, window, model_info, status);
+            if model_info.is_none() {
+                anyhow::bail!("{status}");
+            }
+            *mesh_document = model_info
+                .as_ref()
+                .map(|_| MeshDocument::new(renderer.all_triangles()));
+            selection_state.reset_for_model_change();
+            cut_state.cancel(renderer);
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetViewMode { mode } => {
+            *view_mode = view_mode_from_name(mode);
+            let mut settings = renderer.display_settings();
+            apply_view_mode(*view_mode, &mut settings);
+            renderer.set_display_settings(settings);
+            *status = format!("View: {}", view_mode.label());
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::FitCamera => {
+            renderer.fit_camera_to_mesh();
+            *status = "Framed mesh".to_string();
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::ResetCamera => {
+            reset_camera(renderer);
+            *status = "Reset view".to_string();
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetCamera { camera } => {
+            renderer.set_camera(camera.into());
+            *status = "Set camera".to_string();
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::OrbitCamera { delta } => {
+            let mut camera = renderer.camera();
+            camera.orbit(Vec2::from_array(delta));
+            renderer.set_camera(camera);
+            *status = format!("Orbit camera by [{:.1}, {:.1}]", delta[0], delta[1]);
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::PanCamera { delta } => {
+            let mut camera = renderer.camera();
+            camera.pan(Vec2::from_array(delta), renderer.size().height as f32);
+            renderer.set_camera(camera);
+            *status = format!("Pan camera by [{:.1}, {:.1}]", delta[0], delta[1]);
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::ZoomCamera { delta } => {
+            let mut camera = renderer.camera();
+            camera.zoom(delta, renderer.mesh_bounds());
+            renderer.set_camera(camera);
+            *status = format!("Zoom camera by {delta:.3}");
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetTool { tool } => {
+            selection_state.tool = selection_tool_from_name(tool);
+            selection_state.cancel_active_gesture();
+            *status = format!("Tool: {}", selection_state.tool.label());
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetSelectionElement { element } => {
+            selection_state.element = selection_element_from_name(element);
+            sync_selection_overlay(renderer, selection_state);
+            *status = selection_state.summary();
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetSelectionDepth { depth } => {
+            selection_state.depth = selection_depth_from_name(depth);
+            *status = format!("Selection depth: {}", selection_state.depth.label());
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetBrushRadius { radius } => {
+            selection_state.brush_radius_px = radius.clamp(8.0, 240.0);
+            *status = format!("Brush radius: {:.0}px", selection_state.brush_radius_px);
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SelectAt { position } => {
+            handle_selection_click(
+                renderer,
+                selection_state,
+                Vec2::from_array(position),
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::BrushSelect { center, radius } => {
+            let previous_tool = selection_state.tool;
+            let previous_radius = selection_state.brush_radius_px;
+            selection_state.tool = SelectionTool::Brush;
+            if let Some(radius) = radius {
+                selection_state.brush_radius_px = radius.clamp(8.0, 240.0);
+            }
+            handle_brush_selection(
+                renderer,
+                selection_state,
+                Vec2::from_array(center),
+                status,
+                needs_redraw,
+            );
+            selection_state.tool = previous_tool;
+            selection_state.brush_radius_px = previous_radius;
+            Ok(status.clone())
+        }
+        AppCommand::ClearSelection => {
+            cut_state.cancel(renderer);
+            if clear_selection(renderer, selection_state, true) {
+                *status = "Selection cleared".to_string();
+            } else {
+                *status = "Selection already clear".to_string();
+            }
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SetCutOptions {
+            cap_density,
+            smooth_cap,
+        } => {
+            cut_state.cap_density = cap_density.into();
+            cut_state.smooth_cap = smooth_cap;
+            *status = format!(
+                "Cut options: {:?}, smooth={smooth_cap}",
+                cut_state.cap_density
+            );
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::PreviewViewLineCut { start, end } => {
+            refresh_cut_preview(
+                renderer,
+                cut_state,
+                Vec2::from_array(start),
+                Vec2::from_array(end),
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::ApplyCut => {
+            apply_cut_preview(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                cut_state,
+                selection_state,
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::CancelCut => {
+            cut_state.cancel(renderer);
+            *status = "Cut canceled".to_string();
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::SelectObject { index } => {
+            let Some(document) = mesh_document.as_mut() else {
+                anyhow::bail!("no cut objects available");
+            };
+            select_piece_by_index(renderer, document, index, status, needs_redraw);
+            Ok(status.clone())
+        }
+        AppCommand::SelectObjectAt { position } => {
+            if !select_piece_at_screen(
+                renderer,
+                mesh_document,
+                Vec2::from_array(position),
+                status,
+                needs_redraw,
+            ) {
+                anyhow::bail!("no cut object under position");
+            }
+            Ok(status.clone())
+        }
+        AppCommand::HideSelectedObject => {
+            hide_selected_piece(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::DeleteSelectedObject => {
+            delete_selected_piece(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::KeepOnlySelectedObject => {
+            keep_only_selected_piece(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::ShowAllObjects => {
+            show_all_pieces(
+                renderer,
+                window,
+                model_info,
+                mesh_document,
+                status,
+                needs_redraw,
+            );
+            Ok(status.clone())
+        }
+        AppCommand::ExportVisible { path } => {
+            let Some(document) = mesh_document.as_ref() else {
+                anyhow::bail!("load an STL before exporting");
+            };
+            save_document_to_path(document, &path)?;
+            *status = format!("Exported {}", path.display());
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::ExportObject { index, path } => {
+            let Some(document) = mesh_document.as_ref() else {
+                anyhow::bail!("no mesh loaded");
+            };
+            let Some(piece) = document.pieces.get(index) else {
+                anyhow::bail!("cut object {index} does not exist");
+            };
+            write_binary_stl(&path, &document.triangles[piece.range.clone()])?;
+            *status = format!("Exported {}", path.display());
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::ExportAllObjects { directory } => {
+            let Some(document) = mesh_document.as_ref() else {
+                anyhow::bail!("no mesh loaded");
+            };
+            let exported = export_all_pieces_to_directory(document, &directory)?;
+            *status = format!("Exported {exported} cut objects to {}", directory.display());
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::Screenshot { path } => {
+            let stats = renderer.screenshot(Some(&path))?;
+            *status = format!(
+                "Screenshot {} coverage {:.4}",
+                path.display(),
+                stats.coverage
+            );
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::StateReport { path } => {
+            let snapshot = app_state_snapshot(
+                model_info.as_ref(),
+                mesh_document.as_ref(),
+                *view_mode,
+                renderer,
+                selection_state,
+                cut_state,
+                status,
+                None,
+            );
+            if let Some(path) = path {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, serde_json::to_string_pretty(&snapshot)?)?;
+                *status = format!("Wrote state report {}", path.display());
+            } else {
+                *status = "State report ready".to_string();
+            }
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+        AppCommand::WaitForSelectionAcceleration => {
+            let started = Instant::now();
+            while !renderer.selection_acceleration_ready() {
+                if started.elapsed() > Duration::from_secs(5) {
+                    anyhow::bail!("selection acceleration did not finish in time");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            *status = "Selection acceleration ready".to_string();
+            *needs_redraw = true;
+            Ok(status.clone())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn app_state_snapshot(
+    model_info: Option<&ModelInfo>,
+    mesh_document: Option<&MeshDocument>,
+    view_mode: ViewMode,
+    renderer: &WgpuRenderer<'_>,
+    selection_state: &SelectionState,
+    cut_state: &CutState,
+    status: &str,
+    latest_error: Option<String>,
+) -> StateSnapshot {
+    let object_snapshots: Vec<ObjectSnapshot> = mesh_document
+        .map(|document| {
+            document
+                .pieces
+                .iter()
+                .enumerate()
+                .map(|(index, piece)| ObjectSnapshot {
+                    index,
+                    name: piece.label.clone(),
+                    side: format!("{:?}", piece.side).to_lowercase(),
+                    visible: !piece.hidden,
+                    selected: document.selected_piece_index() == Some(index),
+                    triangles: piece.range.len(),
+                    cap_triangles: piece.cap_triangle_count,
+                    bounds: piece.bounds.into(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let triangle_count = mesh_document
+        .map(|document| document.triangles.len())
+        .or_else(|| model_info.map(|model| model.stats.triangle_count as usize))
+        .unwrap_or(0);
+    StateSnapshot {
+        file: model_info.map(|model| model.path.display().to_string()),
+        triangles: triangle_count,
+        bounds: model_info.map(|model| BoundsSnapshot::from(model.stats.bounds)),
+        view_mode: view_mode.into(),
+        camera: CameraState::from(renderer.camera()),
+        tool: selection_state.tool.into(),
+        selection_element: selection_state.element.into(),
+        selection_depth: selection_state.depth.into(),
+        brush_radius: selection_state.brush_radius_px,
+        selection: SelectionSnapshot {
+            vertices: selection_state.selected.vertices.len(),
+            edges: selection_state.selected.edges.len(),
+            faces: selection_state.selected.faces.len(),
+        },
+        cut_preview: CutPreviewSnapshot {
+            active: cut_state.has_preview(),
+            segments: cut_state.preview_segments,
+            affected_triangles: cut_state.affected_triangles,
+            start: cut_state.start.map(|position| [position.x, position.y]),
+            end: cut_state.current.map(|position| [position.x, position.y]),
+        },
+        object_count: object_snapshots.len(),
+        visible_object_count: object_snapshots
+            .iter()
+            .filter(|object| object.visible)
+            .count(),
+        selected_object: mesh_document.and_then(MeshDocument::selected_piece_index),
+        objects: object_snapshots,
+        dirty: mesh_document
+            .map(|document| document.dirty)
+            .unwrap_or(false),
+        status: status.to_string(),
+        latest_error,
+    }
+}
+
+fn export_all_pieces_to_directory(document: &MeshDocument, directory: &Path) -> Result<usize> {
+    if !document.has_pieces() {
+        anyhow::bail!("cut objects are only available after applying a cut");
+    }
+    std::fs::create_dir_all(directory)?;
+    let mut exported = 0;
+    for piece in &document.pieces {
+        let filename = format!("{}.stl", piece.label.replace(' ', "-").to_lowercase());
+        let path = directory.join(filename);
+        write_binary_stl(&path, &document.triangles[piece.range.clone()])?;
+        exported += 1;
+    }
+    Ok(exported)
+}
+
+fn view_mode_from_name(mode: ViewModeName) -> ViewMode {
+    match mode {
+        ViewModeName::Rendered => ViewMode::Rendered,
+        ViewModeName::Wireframe => ViewMode::Wireframe,
+        ViewModeName::SurfaceWire => ViewMode::SurfaceWire,
+        ViewModeName::XrayWire => ViewMode::XrayWire,
+        ViewModeName::Transparent => ViewMode::Transparent,
+        ViewModeName::Normals => ViewMode::Normals,
+        ViewModeName::Studio => ViewMode::Studio,
+        ViewModeName::Headlight => ViewMode::Headlight,
+    }
+}
+
+fn selection_tool_from_name(tool: ToolName) -> SelectionTool {
+    match tool {
+        ToolName::Point => SelectionTool::Point,
+        ToolName::Brush => SelectionTool::Brush,
+        ToolName::Cut => SelectionTool::Cut,
+    }
+}
+
+fn selection_element_from_name(element: SelectionElementName) -> SelectionElement {
+    match element {
+        SelectionElementName::Vertex => SelectionElement::Vertex,
+        SelectionElementName::Edge => SelectionElement::Edge,
+        SelectionElementName::Face => SelectionElement::Face,
+    }
+}
+
+fn selection_depth_from_name(depth: SelectionDepthName) -> SelectionDepth {
+    match depth {
+        SelectionDepthName::Front => SelectionDepth::Front,
+        SelectionDepthName::Through => SelectionDepth::Through,
+    }
+}
+
+impl From<ViewMode> for ViewModeName {
+    fn from(value: ViewMode) -> Self {
+        match value {
+            ViewMode::Rendered => Self::Rendered,
+            ViewMode::Wireframe => Self::Wireframe,
+            ViewMode::SurfaceWire => Self::SurfaceWire,
+            ViewMode::XrayWire => Self::XrayWire,
+            ViewMode::Transparent => Self::Transparent,
+            ViewMode::Normals => Self::Normals,
+            ViewMode::Studio => Self::Studio,
+            ViewMode::Headlight => Self::Headlight,
+        }
+    }
+}
+
+impl From<SelectionTool> for ToolName {
+    fn from(value: SelectionTool) -> Self {
+        match value {
+            SelectionTool::Point => Self::Point,
+            SelectionTool::Brush => Self::Brush,
+            SelectionTool::Cut => Self::Cut,
+        }
+    }
+}
+
+impl From<SelectionElement> for SelectionElementName {
+    fn from(value: SelectionElement) -> Self {
+        match value {
+            SelectionElement::Vertex => Self::Vertex,
+            SelectionElement::Edge => Self::Edge,
+            SelectionElement::Face => Self::Face,
+        }
+    }
+}
+
+impl From<SelectionDepth> for SelectionDepthName {
+    fn from(value: SelectionDepth) -> Self {
+        match value {
+            SelectionDepth::Front => Self::Front,
+            SelectionDepth::Through => Self::Through,
         }
     }
 }
