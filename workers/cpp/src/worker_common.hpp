@@ -110,7 +110,8 @@ inline void progress(const WorkerRequest &request, const std::string &event,
 }
 
 inline void write_response(const WorkerRequest &request, bool success,
-                           std::uint64_t triangles,
+                           std::uint64_t input_triangles,
+                           std::optional<std::uint64_t> output_triangles = std::nullopt,
                            const std::string &warning = "") {
   std::filesystem::create_directories(request.response_path.parent_path());
   std::ofstream output(request.response_path);
@@ -118,11 +119,19 @@ inline void write_response(const WorkerRequest &request, bool success,
   output << "  \"schema_version\": 1,\n";
   output << "  \"operation_id\": \"" << request.operation_id << "\",\n";
   output << "  \"success\": " << (success ? "true" : "false") << ",\n";
-  output << "  \"output_mesh\": null,\n";
+  if (success && !request.output_mesh.empty()) {
+    output << "  \"output_mesh\": \"" << request.output_mesh.string() << "\",\n";
+  } else {
+    output << "  \"output_mesh\": null,\n";
+  }
   output << "  \"changed_bounds\": null,\n";
   output << "  \"metrics\": {\n";
-  output << "    \"input_triangles\": " << triangles << ",\n";
-  output << "    \"output_triangles\": null,\n";
+  output << "    \"input_triangles\": " << input_triangles << ",\n";
+  if (output_triangles.has_value()) {
+    output << "    \"output_triangles\": " << *output_triangles << ",\n";
+  } else {
+    output << "    \"output_triangles\": null,\n";
+  }
   output << "    \"components\": null,\n";
   output << "    \"boundary_loops\": null,\n";
   output << "    \"non_manifold_edges\": null\n";

@@ -36,6 +36,11 @@ verify-rose:
     cargo run -p meshmend -- inspect rose/raw.stl --parallel
     cargo run -p meshmend -- --verify-render rose/raw.stl
 
+repair-smoke:
+    just worker-build
+    cargo run -p meshmend -- hole-fill fixtures/stl/cube_missing_top.stl --output outputs/cube-missing-top-filled.stl
+    cargo run -p meshmend -- analyze outputs/cube-missing-top-filled.stl --output outputs/cube-missing-top-filled-analysis.json
+
 perf path:
     mkdir -p outputs
     stem="$(basename "{{path}}" .stl)"; cargo run -p meshmend -- perf "{{path}}" --output "outputs/perf-${stem}.json"

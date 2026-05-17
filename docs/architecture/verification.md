@@ -36,6 +36,8 @@ Worker checks:
 just worker-build
 cargo run -p meshmend -- worker-smoke cgal fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- worker-smoke openvdb fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- hole-fill fixtures/stl/cube_missing_top.stl --output outputs/cube-missing-top-filled.stl
+cargo run -p meshmend -- analyze outputs/cube-missing-top-filled.stl --output outputs/cube-missing-top-filled-analysis.json
 ```
 
 Renderer checks:

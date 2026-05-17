@@ -59,6 +59,12 @@ enum Command {
         #[arg(long, value_name = "JSON")]
         output: Option<PathBuf>,
     },
+    HoleFill {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "STL")]
+        output: PathBuf,
+    },
     Perf {
         #[arg(value_name = "STL")]
         path: PathBuf,
@@ -182,6 +188,52 @@ fn main() -> Result<()> {
                 std::fs::write(&output, serde_json::to_string_pretty(&report)?)?;
                 println!("wrote: {}", output.display());
             }
+        }
+        Some(Command::HoleFill { path, output }) => {
+            let binary = discover_worker_binary("meshmend-cgal-worker").ok_or_else(|| {
+                anyhow::anyhow!("CGAL worker was not found; run `just worker-build`")
+            })?;
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let response_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("hole-fill-response.json");
+            let request_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("hole-fill-request.json");
+            let mut request =
+                WorkerRequest::new(WorkerOperation::HoleFill, path.clone(), response_path);
+            request.output_mesh = Some(output.clone());
+            request.preview = false;
+            let result = WorkerRunner::new(binary).run(&request, &request_path)?;
+            if !result.response.success {
+                anyhow::bail!(
+                    "hole fill worker failed: {}",
+                    result
+                        .response
+                        .error
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            let parsed = load_binary_stl_with_options(
+                &output,
+                &LoadOptions {
+                    parallel: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            let report = app::analyze_parsed_stl(&parsed);
+            println!("wrote: {}", output.display());
+            println!("triangles: {}", parsed.stats.triangle_count);
+            println!("boundary loops: {}", report.topology.boundary_loop_count);
+            println!(
+                "non-manifold edges: {}",
+                report.topology.non_manifold_edge_count
+            );
         }
         Some(Command::Perf { path, output }) => {
             app::run_perf(path, output)?;

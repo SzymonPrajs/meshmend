@@ -41,6 +41,8 @@ The active implementation is now the native viewer:
   reports via `meshmend analyze`
 - process-based C++ worker protocol with CGAL and OpenVDB smoke workers built
   by `just worker-build`
+- CGAL-backed `meshmend hole-fill` repair smoke path for closing simple
+  boundary loops and exporting a repaired STL
 
 ## App Location
 
@@ -69,6 +71,7 @@ just test
 just lint
 just verify
 just smoke
+just repair-smoke
 just verify-rose
 just perf fixtures/stl/cube_binary.stl
 ```
