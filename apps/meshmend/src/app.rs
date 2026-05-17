@@ -15,7 +15,9 @@ use meshmend_analysis::AnalysisReport;
 use meshmend_core::{
     CrossSectionAxis, CrossSectionState, MeshBounds, MeshStats, Triangle, TriangleId,
 };
-use meshmend_geometry::{split_and_cap_mesh, CapDensity, CutMeshOptions, CutPlane, CutSide};
+use meshmend_geometry::{
+    split_and_cap_mesh, CapDensity, CutMeshOptions, CutPlane, CutSide, IndexedMesh,
+};
 use meshmend_render::{
     DisplaySettings, LightingMode, MeshChunkUpload, PickResult, RendererInfo, SelectionOverlay,
     WgpuRenderer,
@@ -37,6 +39,7 @@ use crate::{
 const FPS_DISPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const SELECTION_UNDO_LIMIT: usize = 64;
 const CUT_MIN_SCREEN_DISTANCE_SQUARED: f32 = 16.0;
+const SIDE_PALETTE_TOP_OFFSET: f32 = 92.0;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
@@ -830,6 +833,15 @@ impl MeshDocument {
             .map(|(index, _)| index)
     }
 
+    fn smallest_capped_piece_index(&self) -> Option<usize> {
+        self.pieces
+            .iter()
+            .enumerate()
+            .filter(|(_, piece)| !piece.hidden && piece.cap_triangle_count > 0)
+            .min_by_key(|(_, piece)| piece.range.len())
+            .map(|(index, _)| index)
+    }
+
     fn select_piece_for_render_triangle(&mut self, render_triangle_index: usize) -> Option<usize> {
         let document_triangle_index = self.document_triangle_index(render_triangle_index)?;
         let piece_index = self
@@ -897,6 +909,14 @@ struct MeshPiece {
     cap_triangle_count: usize,
     bounds: MeshBounds,
     hidden: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CutComponent {
+    side: CutSide,
+    triangles: Vec<Triangle>,
+    cap_triangle_count: usize,
+    bounds: MeshBounds,
 }
 
 #[derive(Debug, Clone)]
@@ -1285,31 +1305,20 @@ fn apply_cut_preview(
         }
     };
 
-    let positive_len = result.pieces[0].triangles.len();
-    let negative_len = result.pieces[1].triangles.len();
-    document.triangles = result.combined_triangles;
-    document.pieces = vec![
-        MeshPiece {
-            label: "Piece A".to_string(),
-            side: result.pieces[0].side,
-            range: 0..positive_len,
-            cap_triangle_count: result.pieces[0].cap_triangle_count,
-            bounds: result.pieces[0].bounds,
-            hidden: false,
-        },
-        MeshPiece {
-            label: "Piece B".to_string(),
-            side: result.pieces[1].side,
-            range: positive_len..positive_len + negative_len,
-            cap_triangle_count: result.pieces[1].cap_triangle_count,
-            bounds: result.pieces[1].bounds,
-            hidden: false,
-        },
-    ];
-    let selected_piece = document.smallest_visible_piece_index();
-    document.selected_piece = selected_piece;
+    let preferred_pick_position = cut
+        .start
+        .zip(cut.current)
+        .map(|(start, current)| (start + current) * 0.5);
+    let components = cut_components_from_result(&result.pieces, bounds.radius().max(1.0) * 1.0e-6);
+    replace_document_with_components(document, components);
+    document.selected_piece = None;
     document.dirty = true;
     upload_document_mesh(renderer, window, model_info, document);
+    let selected_piece = preferred_pick_position
+        .and_then(|position| piece_index_at_screen(renderer, document, position))
+        .or_else(|| document.smallest_capped_piece_index())
+        .or_else(|| document.smallest_visible_piece_index());
+    document.selected_piece = selected_piece;
     selection.reset_for_model_change();
     selection.tool = SelectionTool::Point;
     selection.element = SelectionElement::Face;
@@ -1322,9 +1331,9 @@ fn apply_cut_preview(
     let selected_label = selected_piece
         .and_then(|index| document.pieces.get(index))
         .map(|piece| piece.label.as_str())
-        .unwrap_or("no piece");
+        .unwrap_or("no object");
     *status = format!(
-        "Cut applied: {selected_label} selected. Click a piece or use Delete / Keep / Hide. {} loops, {:.5} target cap edge, {} cap triangles",
+        "Cut applied: {selected_label} selected. Click an object or use Delete / Keep / Hide. {} loops, {:.5} target cap edge, {} cap triangles",
         result.loops.len(),
         result.target_edge_length,
         result.pieces[0].cap_triangle_count + result.pieces[1].cap_triangle_count
@@ -1333,6 +1342,107 @@ fn apply_cut_preview(
         *status = format!("{} ({})", *status, result.warnings.join("; "));
     }
     *needs_redraw = true;
+}
+
+fn cut_components_from_result(
+    pieces: &[meshmend_geometry::CutPiece],
+    weld_tolerance: f32,
+) -> Vec<CutComponent> {
+    let mut components = Vec::new();
+    for piece in pieces {
+        components.extend(cut_components_for_side(
+            piece.side,
+            &piece.triangles,
+            piece.cap_triangle_count,
+            weld_tolerance,
+        ));
+    }
+    components
+}
+
+fn cut_components_for_side(
+    side: CutSide,
+    triangles: &[Triangle],
+    cap_triangle_count: usize,
+    weld_tolerance: f32,
+) -> Vec<CutComponent> {
+    if triangles.is_empty() {
+        return Vec::new();
+    }
+    let mesh = IndexedMesh::from_triangles(
+        triangles
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, triangle)| {
+                (
+                    TriangleId {
+                        chunk: 0,
+                        local_index: index as u32,
+                    },
+                    triangle,
+                )
+            }),
+        weld_tolerance,
+    );
+    let component_count = mesh.connectivity.component_count as usize;
+    if component_count <= 1 {
+        return vec![CutComponent {
+            side,
+            triangles: triangles.to_vec(),
+            cap_triangle_count,
+            bounds: bounds_for_triangles(triangles),
+        }];
+    }
+
+    let mut component_triangles = vec![Vec::new(); component_count];
+    let mut component_cap_counts = vec![0_usize; component_count];
+    let cap_start = triangles.len().saturating_sub(cap_triangle_count);
+    for (face_index, component_id) in mesh.connectivity.component_ids.iter().copied().enumerate() {
+        let component_index = component_id as usize;
+        if let Some(triangle) = triangles.get(face_index).copied() {
+            component_triangles[component_index].push(triangle);
+            if face_index >= cap_start {
+                component_cap_counts[component_index] += 1;
+            }
+        }
+    }
+
+    component_triangles
+        .into_iter()
+        .zip(component_cap_counts)
+        .filter_map(|(triangles, cap_triangle_count)| {
+            (!triangles.is_empty()).then(|| CutComponent {
+                side,
+                cap_triangle_count,
+                bounds: bounds_for_triangles(&triangles),
+                triangles,
+            })
+        })
+        .collect()
+}
+
+fn replace_document_with_components(document: &mut MeshDocument, components: Vec<CutComponent>) {
+    document.triangles.clear();
+    document.pieces.clear();
+    for component in components {
+        let start = document.triangles.len();
+        document.triangles.extend(component.triangles);
+        let end = document.triangles.len();
+        let piece_index = document.pieces.len();
+        document.pieces.push(MeshPiece {
+            label: piece_label(piece_index),
+            side: component.side,
+            range: start..end,
+            cap_triangle_count: component.cap_triangle_count,
+            bounds: component.bounds,
+            hidden: false,
+        });
+    }
+}
+
+fn piece_label(index: usize) -> String {
+    format!("Object {}", index + 1)
 }
 
 fn cap_overlay_for_document(document: &MeshDocument) -> SelectionOverlay {
@@ -1377,7 +1487,7 @@ fn select_piece_by_index(
     needs_redraw: &mut bool,
 ) -> bool {
     let Some(piece) = document.pieces.get(piece_index) else {
-        *status = "Cut piece no longer exists".to_string();
+        *status = "Cut object no longer exists".to_string();
         *needs_redraw = true;
         return false;
     };
@@ -1400,6 +1510,20 @@ fn select_piece_by_index(
     );
     *needs_redraw = true;
     true
+}
+
+fn piece_index_at_screen(
+    renderer: &mut WgpuRenderer<'_>,
+    document: &MeshDocument,
+    screen_position: Vec2,
+) -> Option<usize> {
+    let pick = renderer.pick(screen_position).ok().flatten()?;
+    let global_index = renderer.triangle_global_index(pick.triangle_id)?;
+    let document_triangle_index = document.document_triangle_index(global_index)?;
+    document
+        .pieces
+        .iter()
+        .position(|piece| piece.range.contains(&document_triangle_index) && !piece.hidden)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,7 +1590,7 @@ fn delete_selected_piece(
         return;
     };
     let Some(selected) = document.selected_piece else {
-        *status = "Select a cut piece first".to_string();
+        *status = "Select a cut object first".to_string();
         *needs_redraw = true;
         return;
     };
@@ -1484,7 +1608,7 @@ fn delete_selected_piece(
     document.dirty = true;
     upload_document_mesh(renderer, window, model_info, document);
     renderer.set_selection_overlay(&SelectionOverlay::default());
-    *status = "Deleted selected cut piece".to_string();
+    *status = "Deleted selected cut object".to_string();
     *needs_redraw = true;
 }
 
@@ -1502,12 +1626,12 @@ fn hide_selected_piece(
         return;
     };
     let Some(selected) = document.selected_piece else {
-        *status = "Select a cut piece first".to_string();
+        *status = "Select a cut object first".to_string();
         *needs_redraw = true;
         return;
     };
     if document.visible_piece_count() <= 1 {
-        *status = "Cannot hide the last visible piece".to_string();
+        *status = "Cannot hide the last visible object".to_string();
         *needs_redraw = true;
         return;
     }
@@ -1519,7 +1643,7 @@ fn hide_selected_piece(
     document.dirty = true;
     upload_document_mesh(renderer, window, model_info, document);
     renderer.set_selection_overlay(&SelectionOverlay::default());
-    *status = format!("Hidden {label}; Show All restores hidden pieces");
+    *status = format!("Hidden {label}; Show All restores hidden objects");
     *needs_redraw = true;
 }
 
@@ -1537,7 +1661,7 @@ fn show_all_pieces(
         return;
     };
     if !document.any_hidden_pieces() {
-        *status = "No hidden pieces".to_string();
+        *status = "No hidden objects".to_string();
         *needs_redraw = true;
         return;
     }
@@ -1550,7 +1674,7 @@ fn show_all_pieces(
     document.dirty = true;
     upload_document_mesh(renderer, window, model_info, document);
     renderer.set_selection_overlay(&SelectionOverlay::default());
-    *status = "Showing all cut pieces".to_string();
+    *status = "Showing all cut objects".to_string();
     *needs_redraw = true;
 }
 
@@ -1568,7 +1692,7 @@ fn keep_only_selected_piece(
         return;
     };
     let Some(selected) = document.selected_piece else {
-        *status = "Select a cut piece first".to_string();
+        *status = "Select a cut object first".to_string();
         *needs_redraw = true;
         return;
     };
@@ -1580,7 +1704,7 @@ fn keep_only_selected_piece(
     document.dirty = true;
     upload_document_mesh(renderer, window, model_info, document);
     renderer.set_selection_overlay(&SelectionOverlay::default());
-    *status = "Kept selected cut piece".to_string();
+    *status = "Kept selected cut object".to_string();
     *needs_redraw = true;
 }
 
@@ -1591,13 +1715,13 @@ fn export_all_pieces(
     needs_redraw: &mut bool,
 ) {
     if !document.has_pieces() {
-        *status = "Cut pieces are only available after applying a cut".to_string();
+        *status = "Cut objects are only available after applying a cut".to_string();
         *needs_redraw = true;
         return;
     }
     let default_name = model_info
         .map(|model| model.file_name.trim_end_matches(".stl").to_string())
-        .unwrap_or_else(|| "meshmend-pieces".to_string());
+        .unwrap_or_else(|| "meshmend-objects".to_string());
     let Some(folder) = meshmend_io::pick_export_folder() else {
         return;
     };
@@ -1618,7 +1742,7 @@ fn export_all_pieces(
             }
         }
     }
-    *status = format!("Exported {exported} cut pieces to {}", folder.display());
+    *status = format!("Exported {exported} cut objects to {}", folder.display());
     *needs_redraw = true;
 }
 
@@ -2825,80 +2949,29 @@ fn draw_ui(
             if toolbar_command_button(ui, Icon::Reset, "Reset", "Home").clicked() {
                 *action = UiAction::Reset;
             }
-            if let Some(document) = mesh_document.filter(|document| document.has_pieces()) {
-                ui.separator();
-                for (piece_index, piece) in document
-                    .pieces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, piece)| !piece.hidden)
-                {
-                    let selected = document.selected_piece_index() == Some(piece_index);
-                    let label = piece.label.as_str();
-                    let hover = format!(
-                        "{}: {} triangles, {} cap triangles",
-                        piece.label,
-                        piece.range.len(),
-                        piece.cap_triangle_count
-                    );
-                    if toolbar_button(ui, Icon::FaceSelect, label, "", selected)
-                        .on_hover_text(hover)
-                        .clicked()
-                    {
-                        *action = UiAction::SelectPiece(piece_index);
-                    }
-                }
-            }
-            if mesh_document
-                .and_then(MeshDocument::selected_piece)
-                .is_some()
-            {
-                ui.separator();
-                if toolbar_command_button(ui, Icon::Hide, "Hide", "H").clicked() {
-                    *action = UiAction::HidePiece;
-                }
-                if toolbar_command_button(ui, Icon::Trash, "Delete", "Del").clicked() {
-                    *action = UiAction::DeletePiece;
-                }
-                if toolbar_command_button(ui, Icon::KeepOnly, "Keep", "K").clicked() {
-                    *action = UiAction::KeepOnlyPiece;
-                }
-                if toolbar_command_button(ui, Icon::Export, "Export", "").clicked() {
-                    *action = UiAction::ExportPiece;
-                }
-            }
-            if mesh_document
-                .map(|document| document.has_pieces())
-                .unwrap_or(false)
-            {
-                ui.separator();
-                if mesh_document
-                    .map(MeshDocument::any_hidden_pieces)
-                    .unwrap_or(false)
-                    && toolbar_command_button(ui, Icon::ShowAll, "Show All", "").clicked()
-                {
-                    *action = UiAction::ShowAllPieces;
-                }
-                if toolbar_command_button(ui, Icon::Export, "Export All", "").clicked() {
-                    *action = UiAction::ExportAllPieces;
-                }
-            }
         });
     });
     ui_regions.add(top_response.response.rect);
+
+    let context_response = egui::TopBottomPanel::top("context_toolbar")
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_min_height(36.0);
+            ui.horizontal_wrapped(|ui| {
+                draw_context_toolbar(ui, selection_state, cut_state, mesh_document, action);
+            });
+        });
+    ui_regions.add(context_response.response.rect);
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
         .show(ctx, |_ui| {});
 
-    if let Some(rect) = draw_selection_palette(ctx, selection_state, cut_state, action) {
+    if let Some(rect) = draw_selection_palette(ctx, selection_state, action) {
         ui_regions.add(rect);
     }
     draw_selection_cursor(ctx, selection_state, scale_factor);
     draw_cut_cursor(ctx, cut_state, scale_factor);
-    if let Some(rect) = draw_cut_confirm_popover(ctx, cut_state, scale_factor, action) {
-        ui_regions.add(rect);
-    }
 
     let bottom_response = egui::TopBottomPanel::bottom("status_bar")
         .resizable(false)
@@ -2929,14 +3002,160 @@ fn draw_ui(
     }
 }
 
+fn draw_context_toolbar(
+    ui: &mut egui::Ui,
+    selection_state: &mut SelectionState,
+    cut_state: &mut CutState,
+    mesh_document: Option<&MeshDocument>,
+    action: &mut UiAction,
+) {
+    ui.label(
+        egui::RichText::new(selection_state.tool.label())
+            .size(12.0)
+            .color(ui.visuals().weak_text_color()),
+    );
+
+    match selection_state.tool {
+        SelectionTool::Point => {}
+        SelectionTool::Brush => {
+            ui.separator();
+            ui.label("Brush");
+            if mini_button(ui, "-")
+                .on_hover_text("Decrease brush radius")
+                .clicked()
+            {
+                selection_state.brush_radius_px = (selection_state.brush_radius_px - 4.0).max(8.0);
+            }
+            ui.label(format!("{:.0}px", selection_state.brush_radius_px));
+            if mini_button(ui, "+")
+                .on_hover_text("Increase brush radius")
+                .clicked()
+            {
+                selection_state.brush_radius_px =
+                    (selection_state.brush_radius_px + 4.0).min(180.0);
+            }
+        }
+        SelectionTool::Cut => {
+            ui.separator();
+            ui.label("Cap");
+            for (density, label) in [
+                (CapDensity::Automatic, "Auto"),
+                (CapDensity::Fine, "Fine"),
+                (CapDensity::Coarse, "Coarse"),
+            ] {
+                if toolbar_text_button(
+                    ui,
+                    label,
+                    "Cut cap triangle density",
+                    cut_state.cap_density == density,
+                )
+                .clicked()
+                {
+                    cut_state.cap_density = density;
+                }
+            }
+            if toolbar_text_button(
+                ui,
+                "Smooth",
+                "Smooth generated cap interior",
+                cut_state.smooth_cap,
+            )
+            .clicked()
+            {
+                cut_state.smooth_cap = !cut_state.smooth_cap;
+            }
+            if cut_state.has_preview() {
+                ui.separator();
+                if toolbar_command_button(ui, Icon::CutTool, "Apply Cut", "Enter").clicked() {
+                    *action = UiAction::ApplyCut;
+                }
+            }
+        }
+    }
+
+    if let Some(document) = mesh_document.filter(|document| document.has_pieces()) {
+        ui.separator();
+        draw_piece_context_toolbar(ui, document, action);
+    }
+}
+
+fn draw_piece_context_toolbar(ui: &mut egui::Ui, document: &MeshDocument, action: &mut UiAction) {
+    let visible_count = document.visible_piece_count();
+    let hidden_count = document.hidden_piece_count();
+    ui.label(format!("Objects: {visible_count}"));
+    if hidden_count > 0 {
+        ui.label(
+            egui::RichText::new(format!("{hidden_count} hidden"))
+                .size(11.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+    }
+
+    let selected_text = document
+        .selected_piece()
+        .map(|piece| piece.label.as_str())
+        .unwrap_or("Select object");
+    egui::ComboBox::from_id_source("object_selector")
+        .width(170.0)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for (piece_index, piece) in document
+                .pieces
+                .iter()
+                .enumerate()
+                .filter(|(_, piece)| !piece.hidden)
+            {
+                let selected = document.selected_piece_index() == Some(piece_index);
+                let label = format!(
+                    "{}  {} triangles, {} cap",
+                    piece.label,
+                    piece.range.len(),
+                    piece.cap_triangle_count
+                );
+                if ui.selectable_label(selected, label).clicked() {
+                    *action = UiAction::SelectPiece(piece_index);
+                    ui.close_menu();
+                }
+            }
+        });
+
+    if document.selected_piece().is_some() {
+        ui.separator();
+        if toolbar_command_button(ui, Icon::Hide, "Hide", "H").clicked() {
+            *action = UiAction::HidePiece;
+        }
+        if toolbar_command_button(ui, Icon::Trash, "Delete", "Del").clicked() {
+            *action = UiAction::DeletePiece;
+        }
+        if toolbar_command_button(ui, Icon::KeepOnly, "Keep", "K").clicked() {
+            *action = UiAction::KeepOnlyPiece;
+        }
+        if toolbar_command_button(ui, Icon::Export, "Export", "").clicked() {
+            *action = UiAction::ExportPiece;
+        }
+    }
+
+    ui.separator();
+    if document.any_hidden_pieces()
+        && toolbar_command_button(ui, Icon::ShowAll, "Show All", "").clicked()
+    {
+        *action = UiAction::ShowAllPieces;
+    }
+    if toolbar_command_button(ui, Icon::Export, "Export All", "").clicked() {
+        *action = UiAction::ExportAllPieces;
+    }
+}
+
 fn draw_selection_palette(
     ctx: &egui::Context,
     selection_state: &mut SelectionState,
-    cut_state: &mut CutState,
     action: &mut UiAction,
 ) -> Option<egui::Rect> {
     let response = egui::Area::new(egui::Id::new("selection_palette"))
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 50.0))
+        .anchor(
+            egui::Align2::LEFT_TOP,
+            egui::vec2(8.0, SIDE_PALETTE_TOP_OFFSET),
+        )
         .show(ctx, |ui| {
             egui::Frame::dark_canvas(ui.style())
                 .rounding(egui::Rounding::same(7.0))
@@ -2991,51 +3210,6 @@ fn draw_selection_palette(
                     .clicked()
                     {
                         selection_state.depth = selection_state.depth.next();
-                    }
-
-                    if selection_state.tool == SelectionTool::Brush {
-                        ui.add_space(5.0);
-                        ui.horizontal(|ui| {
-                            if mini_button(ui, "-").clicked() {
-                                selection_state.brush_radius_px =
-                                    (selection_state.brush_radius_px - 4.0).max(8.0);
-                            }
-                            ui.label(format!("{:.0}", selection_state.brush_radius_px));
-                            if mini_button(ui, "+").clicked() {
-                                selection_state.brush_radius_px =
-                                    (selection_state.brush_radius_px + 4.0).min(180.0);
-                            }
-                        });
-                    }
-                    if selection_state.tool == SelectionTool::Cut {
-                        ui.add_space(5.0);
-                        palette_caption(ui, "Cap");
-                        for (density, label) in [
-                            (CapDensity::Automatic, "Auto"),
-                            (CapDensity::Fine, "Fine"),
-                            (CapDensity::Coarse, "Crse"),
-                        ] {
-                            if palette_button(
-                                ui,
-                                label,
-                                "Cut cap triangle density",
-                                cut_state.cap_density == density,
-                            )
-                            .clicked()
-                            {
-                                cut_state.cap_density = density;
-                            }
-                        }
-                        if palette_button(
-                            ui,
-                            "Smth",
-                            "Smooth generated cap interior",
-                            cut_state.smooth_cap,
-                        )
-                        .clicked()
-                        {
-                            cut_state.smooth_cap = !cut_state.smooth_cap;
-                        }
                     }
 
                     ui.add_space(5.0);
@@ -3201,46 +3375,6 @@ fn draw_cut_cursor(ctx: &egui::Context, cut_state: &CutState, scale_factor: f32)
     painter.circle_filled(current, 3.5, egui::Color32::from_rgb(255, 190, 90));
 }
 
-fn draw_cut_confirm_popover(
-    ctx: &egui::Context,
-    cut_state: &CutState,
-    scale_factor: f32,
-    action: &mut UiAction,
-) -> Option<egui::Rect> {
-    if cut_state.dragging || !cut_state.has_preview() {
-        return None;
-    }
-    let (Some(start), Some(current)) = (cut_state.start, cut_state.current) else {
-        return None;
-    };
-    let scale_factor = scale_factor.max(0.1);
-    let midpoint = (start + current) * 0.5 / scale_factor;
-    let screen_rect = ctx.screen_rect();
-    let position = egui::pos2(
-        midpoint
-            .x
-            .clamp(screen_rect.left() + 80.0, screen_rect.right() - 140.0),
-        midpoint
-            .y
-            .clamp(screen_rect.top() + 64.0, screen_rect.bottom() - 80.0),
-    );
-
-    let response = egui::Area::new(egui::Id::new("cut_confirm_popover"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(position)
-        .show(ctx, |ui| {
-            egui::Frame::dark_canvas(ui.style())
-                .rounding(egui::Rounding::same(7.0))
-                .inner_margin(egui::Margin::symmetric(6.0, 5.0))
-                .show(ui, |ui| {
-                    if toolbar_command_button(ui, Icon::CutTool, "Apply Cut", "Enter").clicked() {
-                        *action = UiAction::ApplyCut;
-                    }
-                });
-        });
-    Some(response.response.rect)
-}
-
 fn view_button(ui: &mut egui::Ui, mode: ViewMode, selected: bool) -> egui::Response {
     toolbar_button(ui, mode.icon(), mode.label(), mode.shortcut(), selected)
 }
@@ -3252,6 +3386,45 @@ fn toolbar_command_button(
     shortcut: &str,
 ) -> egui::Response {
     toolbar_button(ui, icon, label, shortcut, false)
+}
+
+fn toolbar_text_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    tooltip: &str,
+    selected: bool,
+) -> egui::Response {
+    let estimated_label_width = label.chars().count() as f32 * 7.0;
+    let size = egui::vec2((24.0 + estimated_label_width).clamp(54.0, 86.0), 28.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        visuals.widgets.inactive.bg_fill
+    };
+    let stroke_color = if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.widgets.inactive.fg_stroke.color
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(6.0), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(6.0),
+        egui::Stroke::new(1.0, stroke_color.gamma_multiply(0.78)),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        stroke_color,
+    );
+    response.on_hover_text(tooltip)
 }
 
 fn toolbar_button(
@@ -3375,9 +3548,9 @@ fn draw_shortcuts_window(ctx: &egui::Context, show_shortcuts: &mut bool) -> Opti
             ui.monospace("Esc/Delete   Clear selection");
             ui.monospace("Cmd/Ctrl+Z   Undo latest selection or mesh operation");
             ui.separator();
-            ui.label("Cut Pieces");
-            ui.monospace("H            Hide selected piece");
-            ui.monospace("Delete       Delete selected piece");
+            ui.label("Cut Objects");
+            ui.monospace("H            Hide selected object");
+            ui.monospace("Delete       Delete selected object");
         })
         .map(|response| response.response.rect)
 }
@@ -3509,7 +3682,7 @@ fn handle_ui_action(
         }
         UiAction::SelectPiece(piece_index) => {
             let Some(document) = mesh_document.as_mut() else {
-                *status = "No cut pieces available".to_string();
+                *status = "No cut objects available".to_string();
                 *needs_redraw = true;
                 return;
             };
@@ -3562,7 +3735,7 @@ fn handle_ui_action(
                 return;
             };
             let Some(piece) = document.selected_piece() else {
-                *status = "Select a cut piece first".to_string();
+                *status = "Select a cut object first".to_string();
                 *needs_redraw = true;
                 return;
             };
@@ -4159,6 +4332,36 @@ mod tests {
         assert_eq!(document.render_index, vec![1, 2]);
         assert_eq!(document.document_triangle_index(0), Some(1));
         assert_eq!(document.select_piece_for_render_triangle(0), Some(1));
+    }
+
+    #[test]
+    fn cut_components_split_disconnected_side_pieces() {
+        let triangles = vec![test_triangle(0.0), test_triangle(4.0)];
+
+        let components = cut_components_for_side(CutSide::Positive, &triangles, 1, 1.0e-6);
+
+        assert_eq!(components.len(), 2);
+        assert_eq!(
+            components
+                .iter()
+                .map(|component| component.triangles.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(
+            components
+                .iter()
+                .map(|component| component.cap_triangle_count)
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn piece_labels_extend_past_two_cuts() {
+        assert_eq!(piece_label(0), "Object 1");
+        assert_eq!(piece_label(1), "Object 2");
+        assert_eq!(piece_label(29), "Object 30");
     }
 
     #[test]

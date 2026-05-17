@@ -1,510 +1,1005 @@
-# MeshMend View-Line Cut and Triangulated Cap Plan
+# MeshMend Command, Scenario, and Visual Control Plan
 
 ## Purpose
 
-MeshMend is not a general Blender replacement. The app is for repairing and preparing AI-generated meshes for resin printing. The cut tool should solve one specific repeated workflow:
+MeshMend is being developed through tight visual iteration. That means every user-visible tool needs a way to be exercised without manual clicking, and every repair workflow needs a way to produce repeatable evidence:
 
-- Load an AI-generated STL.
-- Draw a simple line across the view where an unwanted part should be cut away.
-- Split the mesh through that view line.
-- Automatically cap both newly open sides with printable, sculptable triangle grids.
-- Let the user keep, hide, delete, or export the resulting pieces.
+- a render or screenshot of the viewport,
+- a structured state report,
+- output STL files when geometry changes,
+- enough command coverage that bugs can be reproduced from a script.
+
+The current app has useful CLI commands for geometry operations and render checks, but the desktop UI has started to move faster than the command surface. The goal of this plan is to close that gap by adding a shared command layer, a batch scenario runner, deterministic viewport rendering, and later an optional live local control socket.
+
+This is not a web server project. It should remain a Rust desktop app and Rust CLI. Any live control mode should be local-only, lightweight, and off by default.
+
+## Current Baseline
 
-The existing line selection tool is the wrong abstraction. A line gesture should not select edges or faces as an end in itself. It should define a cut operation.
+The repo already has these useful foundations:
 
-## Core Product Decision
+- `apps/meshmend/src/main.rs` uses `clap` and exposes commands such as `inspect`, `analyze`, `cut`, `remesh`, `export`, `perf`, `worker-smoke`, and project validation.
+- Hidden verification flags already exercise some renderer paths:
+  - `--screenshot STL PNG`
+  - `--verify-render STL`
+  - `--verify-cross-section STL`
+  - `--verify-view-modes STL`
+  - `--verify-hit-stack STL`
+  - `--smoke-window`
+- `apps/meshmend/src/app.rs` already contains the desktop event loop, viewer rendering, camera operations, cut preview/application, object selection, object hide/delete/keep/export, and screenshot capture.
+- `crates/meshmend-render` already supports off-screen screenshots through the same WGPU renderer used by the app.
+- `just verify`, `just smoke`, and `just repair-smoke` already prove a subset of behavior.
 
-Remove `Line` from the selection tool group.
+The main gap is that many UI actions are not yet represented as reusable commands. The UI currently owns too much behavior directly.
 
-Keep selection tools focused on selecting mesh elements:
+## Product Decision
 
-- Point select.
-- Brush select.
-- Vertex, edge, and face element modes.
-- Front surface and through selection depth.
+Every meaningful UI action should have a corresponding command that can be run from tests or scripts.
 
-Add a separate cut tool:
+The UI should become one front end for commands. The batch scenario runner and optional live control socket should be two more front ends for the same commands.
 
-- Name: `Cut`.
-- User-facing behavior: draw a line in screen space.
-- Geometry behavior: cut the mesh by the view-defined cutting plane created from that line.
-- Output behavior: split the mesh and cap both resulting cut boundaries with triangle grids.
+The implementation should therefore introduce a command/session architecture:
 
-This makes the UI match the real workflow. Selecting by line is not useful here; cutting by line is.
+```text
+UI button / keyboard shortcut
+Batch scenario step
+Live control socket request
+        |
+        v
+Shared AppCommand executor
+        |
+        v
+Mesh session + renderer session
+        |
+        v
+State report, viewport image, STL output
+```
 
-## User Workflow
+If the UI can do something important, a scenario should eventually be able to do it too.
 
-1. The user loads an STL.
-2. The user orbits/zooms until the intended cut is visible.
-3. The user activates the `Cut` tool from the left tool palette.
-4. The cursor changes to a cut-line cursor.
-5. The user clicks or drags two points in the viewport.
-6. The app previews an infinite line across the full viewport, not only the segment between the two points.
-7. The preview highlights the projected intersection path on the visible mesh.
-8. The user confirms the cut with release/Enter, or cancels with Escape.
-9. The mesh is split along the view-defined cut plane.
-10. Both newly open sides are capped with triangle grids whose target edge length is derived from the cut boundary.
-11. The app shows the two resulting pieces as selectable pieces.
-12. The user can hide/delete one piece, keep both pieces, or export.
+## Key Concepts
 
-For the rose example:
+### Mesh Session
 
-- The user draws a line across the stem.
-- The tool cuts the stem through that line.
-- The rose-side stump and the removed stem-side stump both get capped.
-- The caps are not one giant polygon; they are dense enough triangle grids to sculpt later.
+The mesh session owns logical document state:
 
-## View-Line Geometry
+- loaded STL path and display name,
+- current triangle data,
+- cut objects,
+- selected object,
+- hidden objects,
+- undo history for geometry operations,
+- dirty state,
+- export paths,
+- geometry reports.
 
-The cut gesture is a 2D screen-space line, but the actual mesh operation needs a 3D cutting plane.
+This should be independent of egui and winit.
 
-For the current perspective camera:
+### View Session
 
-1. Convert the two screen points to camera rays.
-2. Build a plane from:
-   - camera eye position,
-   - ray through point A,
-   - ray through point B.
-3. The plane normal is `normalize(ray_a.direction cross ray_b.direction)`.
-4. The plane is infinite.
-5. Every mesh edge whose endpoints lie on opposite sides of that plane is cut.
+The view session owns viewport and display state:
 
-This is mathematically a plane cut, but the user should experience it as drawing a line. We should avoid exposing generic plane-slice controls here because that is not the intended workflow.
+- viewport width and height,
+- camera eye/target/up or orbit parameters,
+- view mode,
+- lighting mode,
+- display toggles,
+- active cut preview overlay,
+- active selection/object overlay,
+- screenshot output settings.
 
-If an orthographic camera is added later, the view-line plane should be:
+Some of this state will still be applied through `WgpuRenderer`, but the desired state should be serializable so a scenario can reproduce it.
 
-- line direction in world space from the two unprojected points,
-- camera forward direction,
-- plane normal from `line_direction cross camera_forward`.
+### App Command
 
-## Preview Behavior
+An app command is a single operation that changes the mesh session, the view session, the renderer, or the output artifacts.
 
-The cut preview needs to answer: "What will this line cut?"
+Examples:
 
-During the line gesture:
+- `LoadStl`
+- `SetViewMode`
+- `FitCamera`
+- `SetCamera`
+- `SetTool`
+- `SetCutOptions`
+- `PreviewViewLineCut`
+- `ApplyCut`
+- `SelectObject`
+- `SelectObjectAt`
+- `HideSelectedObject`
+- `DeleteSelectedObject`
+- `KeepOnlySelectedObject`
+- `ExportVisible`
+- `Screenshot`
 
-- Draw the infinite screen-space line across the viewport.
-- Compute a lightweight preview of intersected mesh edges/faces.
-- Highlight the projected cut path in orange.
-- Do not mutate the mesh until confirm.
-- Show status text such as `Cut preview: 142 boundary intersections`.
+### Scenario
 
-The first version can preview the affected triangles and cut segments using CPU geometry. It does not need to generate caps during hover/drag.
+A scenario is a JSON or TOML file containing a deterministic sequence of commands. It should be runnable from the CLI and should produce screenshots, state reports, and exported meshes.
 
-## Mesh Split Algorithm
+### Live Control Socket
 
-The cut operation should create real mesh topology, not just visual selection.
+The live control socket is optional and later-stage. It allows another process to send commands to a running app instance. It should use local IPC, not HTTP and not Node.
 
-Input:
-
-- Current triangle mesh.
-- View-defined cut plane.
-- Epsilon based on model bounds and local edge size.
-
-Steps:
-
-1. Classify every vertex by signed distance to the cut plane.
-2. Snap vertices very close to the plane onto the plane.
-3. For each triangle:
-   - If all vertices are on the positive side, copy it to positive piece.
-   - If all vertices are on the negative side, copy it to negative piece.
-   - If it crosses the plane, split it.
-4. For crossing triangles:
-   - Find intersection points on crossed triangle edges.
-   - Reuse each intersection vertex for both adjacent triangles by caching by original edge key.
-   - Emit the split triangles on both sides.
-   - Record the cut segment created inside that original triangle.
-5. Preserve triangle winding.
-6. Preserve source IDs where useful for debugging.
-7. Build connected components for each side after the split.
-
-Common cases:
-
-- One vertex on one side, two on the other: create one triangle on the single-vertex side and two triangles on the other side.
-- One vertex exactly on the plane and the opposite edge crosses: reuse the on-plane vertex plus one new intersection.
-- An entire triangle edge lies on the plane: treat it as a boundary segment and avoid duplicate cap edges.
-
-The cut plane can intersect multiple parts of the mesh. That is acceptable. The user is drawing an infinite line through the whole view, so all crossed parts should be cut unless a later masking mode is added.
-
-## Boundary Loop Construction
-
-After splitting, the cut creates open boundary loops. These loops define the caps.
-
-Steps:
-
-1. Collect all cut segments.
-2. Weld segment endpoints using a tolerance derived from the model scale.
-3. Build an undirected graph of cut vertices and cut edges.
-4. Trace closed loops.
-5. Mark problematic loops:
-   - open chains,
-   - branch vertices,
-   - self-intersections in the cap plane,
-   - extremely short edges,
-   - degenerate loops.
-6. For valid loops, project vertices into 2D coordinates on the cut plane.
-
-The app should expect multiple loops. A single cut can hit both sides of a hollow region, overlapping petals, supports, or unrelated geometry.
-
-## Cap Target Resolution
-
-The cap must be sculptable after export. It should not be a single n-gon or a fan of long skinny triangles.
-
-Target edge length:
-
-1. For each cap loop, measure the cut boundary edge lengths.
-2. Use a robust statistic, not a raw average:
-   - start with median boundary edge length,
-   - optionally blend with trimmed mean,
-   - ignore tiny epsilon edges.
-3. Clamp the target against local mesh scale:
-   - lower bound avoids millions of cap triangles from tiny sliver edges,
-   - upper bound avoids a visibly coarse cap.
-4. Use this target length as the desired interior triangle size.
-
-For the rose stem case, the cap grid should roughly match the size of the triangles around the cut perimeter.
-
-## Cap Triangulation
-
-The cap should be generated as a constrained triangle mesh in the cut plane.
-
-Recommended implementation:
-
-- Use the existing C++ worker architecture for the robust triangulation phase.
-- Use CGAL constrained triangulation or 2D mesh generation in the cap plane.
-- Keep Rust responsible for app state, preview, user interaction, and file/project orchestration.
-
-Cap generation steps:
-
-1. Project each boundary loop to 2D in the cut plane.
-2. Insert loop edges as constraints.
-3. Generate interior Steiner points at approximately the target edge spacing.
-4. Run constrained Delaunay triangulation or CGAL 2D meshing.
-5. Keep triangles inside the boundary loops.
-6. Convert the 2D cap vertices back into 3D.
-7. Orient cap triangles correctly:
-   - one cap faces the positive piece exterior,
-   - the other cap faces the negative piece exterior.
-8. Append the cap triangles to each resulting piece.
-9. Optionally run a local remesh/smoothing pass only on cap triangles and the immediate cut rim.
-
-The first complete version should prioritize clean, printable topology over visual smoothness. Later we can add cap smoothing controls.
-
-## Two-Sided Output
-
-The cut produces two sides, and both sides should be valid outputs.
-
-For each resulting side:
-
-- Original triangles on that side.
-- Split triangles created by the cut.
-- Cap triangles closing the newly open loops.
-- Piece ID.
-- Bounds.
-- Triangle count.
-- Cap triangle count.
-- Cut-loop diagnostics.
-
-The UI should show the pieces immediately after the cut:
-
-- Piece A and Piece B should be separately selectable.
-- Hovering a piece should outline it.
-- Clicking a piece should select it.
-- Actions should include `Hide`, `Delete`, `Keep Only`, and `Export Piece`.
-
-Deleting the unwanted stem should become a single obvious action after the cut, not a sequence of Blender-style manual steps.
-
-## Undo and Project State
-
-Cutting changes the mesh, so it must use mesh-level undo, not selection undo.
-
-Requirements:
-
-- Before applying a cut, store a mesh revision.
-- `Cmd/Ctrl+Z` should undo the cut result.
-- Selection undo and mesh undo need clear ownership:
-  - selection actions undo selection changes,
-  - mesh operations undo mesh revisions.
-- The status bar should say what was undone.
-
-The current selection undo stack is not enough for this operation.
-
-## UI Changes
-
-Tool palette:
-
-- Keep element selector for selection modes.
-- Keep point and brush selection.
-- Remove line selection from the selection tool set.
-- Add a separate cut tool icon.
-
-Top toolbar:
-
-- Keep view modes.
-- Add no complex cut controls here for the first version.
-
-Cut tool controls:
-
-- Minimal viewport-first behavior.
-- Status bar shows preview/apply state.
-- Escape cancels active cut gesture.
-- Enter applies if two points are present.
-- Undo restores previous mesh.
-
-Shortcuts:
-
-- `Q`: point select.
-- `W`: brush select.
-- `C` or `K`: cut tool.
-- `Esc`: cancel active cut gesture, otherwise clear selection.
-- `Enter`: apply cut when cut preview is active.
-- `Cmd/Ctrl+Z`: undo selection or mesh operation, depending on the latest action.
-
-Visual language:
-
-- Orange is for active cuts, selected boundaries, and highlighted future edits.
-- Blue should not be used for active cut geometry.
-- Cut preview line should be orange.
-- Generated cap area can use a subtle orange fill until accepted.
-
-## Data Model
-
-Add explicit tool mode state separate from element selection:
-
-- `ActiveTool::Select`
-- `ActiveTool::BrushSelect`
-- `ActiveTool::Cut`
-
-Add cut gesture state:
-
-- first screen point,
-- current/second screen point,
-- computed cut plane,
-- preview segments,
-- preview affected triangle count,
-- validation status.
-
-Add mesh revision state:
-
-- current mesh,
-- revision stack,
-- resulting pieces after operations,
-- selected piece IDs.
-
-Add cap metadata:
-
-- source cut plane,
-- loop count,
-- target cap edge length,
-- cap triangle count,
-- warnings.
-
-## Worker Architecture
-
-The robust cap operation is complex enough to belong in the worker layer.
-
-Rust app responsibilities:
-
-- Gesture handling.
-- View-line to plane conversion.
-- Preview selection/intersection.
-- Request/response orchestration.
-- UI state and undo revisions.
-- Export/save.
-
-Worker responsibilities:
-
-- Exact mesh splitting.
-- Boundary loop tracing.
-- Constrained triangulated caps.
-- Local cap remeshing.
-- Diagnostics.
-
-Worker request should include:
-
-- input mesh path or mesh payload,
-- cut plane origin/normal,
-- cap target edge length policy,
-- weld tolerance,
-- output path or response payload path.
-
-Worker response should include:
-
-- output mesh path,
-- piece metadata,
-- cut loop metadata,
-- cap statistics,
-- warnings and errors.
-
-The existing coarse `cut` CLI worker should not be treated as the finished tool. It should be replaced or upgraded to produce the two-sided, triangulated-cap result described here.
-
-## File Saving and Export
-
-After a cut:
-
-- The in-app mesh should update to the cut result.
-- Save should write the current full mesh state.
-- Export Piece should write only the selected piece.
-- Export All Pieces should write separate STL files.
-- Reports should describe cut plane, cap edge length, cap loops, cap triangles, and any warnings.
-
-STL has no native piece metadata, so piece separation should be managed in app state and export naming.
-
-## Edge Cases
-
-The implementation must handle:
-
-- Cut plane misses the mesh.
-- Cut plane touches but does not split a triangle.
-- Cut line crosses multiple disconnected components.
-- Cut produces multiple loops.
-- Cut produces nested loops.
-- Mesh has existing holes near the cut.
-- Mesh has non-manifold edges.
-- Mesh has duplicated triangles.
-- Boundary loop self-intersects after projection.
-- Very small stem or thin geometry creates tiny cut edges.
-
-For the first implementation, if a cap loop is invalid, the operation should fail before mutating the mesh and explain the problem in the status bar. It should not create a broken output.
-
-## Implementation Phases
-
-### Phase 1: Replace Line Selection With Cut Tool UX
-
-- Remove `Line` from `SelectionTool`.
-- Remove line-selection sampling and line-selection tests.
-- Add `Cut` as a separate active tool.
-- Add cut icon and shortcut.
-- Draw two-point cut gesture preview.
-- Use orange for preview.
-- Escape cancels preview.
-- Enter applies only after later phases are ready.
-
-Verification:
-
-- App builds.
-- Existing point and brush selection still work.
-- No line selection appears in the selection palette.
-- Cut gesture can be drawn and canceled.
-
-### Phase 2: View-Line Plane and Preview
-
-- Convert screen line to a view-defined 3D plane.
-- Intersect mesh triangles with that plane for preview.
-- Highlight cut segments on the mesh.
-- Show affected triangle and segment counts in the status bar.
-- Keep preview non-mutating.
-
-Verification:
-
-- Unit tests for screen-line to plane conversion.
-- Unit tests for triangle-plane intersection.
-- Visual check on `rose/raw.stl`.
-
-### Phase 3: Rust Mesh Split Prototype
-
-- Implement deterministic triangle splitting in Rust.
-- Preserve winding.
-- Cache edge intersections.
-- Produce positive and negative side meshes.
-- Produce cut segment graph.
-- Add tests with simple cubes, cylinders, and slanted cuts.
-
-Verification:
-
-- Cube cut produces two valid open-side meshes before capping.
-- Cut segment counts match expected cases.
-- No degenerate triangles from normal cases.
-
-### Phase 4: Boundary Loop Tracing
-
-- Weld cut segment endpoints.
-- Trace loops.
-- Detect invalid open chains and branches.
-- Project loops to 2D cut-plane coordinates.
-- Compute cap target edge length from loop statistics.
-
-Verification:
-
-- Unit tests for single loop, multiple loops, nested loops, and broken loop detection.
-- Rose stem cut preview reports plausible loop counts.
-
-### Phase 5: Triangulated Cap Worker
-
-- Upgrade the C++ CGAL worker for constrained triangulated cap generation.
-- Insert boundary constraints.
-- Generate interior triangles with target edge length.
-- Return cap metadata and warnings.
-- Keep both cut sides capped.
-
-Verification:
-
-- Cube cut creates capped closed pieces.
-- Cylinder/stem fixture creates many cap triangles with reasonable edge lengths.
-- Analysis reports no new open boundary on the cut caps.
-
-### Phase 6: Apply Cut In App
-
-- Add mesh revision before applying cut.
-- Send cut request to worker.
-- Load cut result back into renderer.
-- Show pieces and cap highlights.
-- Add progress/status messages.
-- Undo restores previous mesh.
-
-Verification:
-
-- Cut can be applied from the viewport.
-- Undo restores the uncut model.
-- Save/export writes the cut result.
-
-### Phase 7: Piece Selection and Deletion
-
-- Build connected components after cut.
-- Let user click a resulting piece.
-- Add `Hide`, `Delete`, `Keep Only`, and `Export Piece`.
-- Ensure deleted piece removal preserves the cap on the kept side.
-
-Verification:
-
-- Rose stem can be cut, selected, hidden/deleted, and exported.
-- Remaining rose mesh is closed at the cut.
-
-### Phase 8: Quality Controls
-
-- Add optional cap density controls:
-  - automatic,
-  - finer,
-  - coarser.
-- Add cap smoothing option constrained to cap region.
-- Add diagnostics overlay for cap loops.
-
-Verification:
-
-- Cap edge length distribution is close to target.
-- Cap triangles remain sculptable and not stretched.
-
-## Acceptance Criteria
-
-The feature is complete when:
-
-- There is no line selection tool.
-- The user can activate a cut tool.
-- The user can draw a line across the view.
-- The line defines a full view-through cut.
-- The mesh is split into pieces.
-- Both sides of the cut are capped.
-- Caps are triangulated with roughly local mesh-sized triangles.
-- The user can remove the unwanted piece.
-- The kept piece remains closed and printable.
-- The result can be saved/exported as STL.
-- Undo restores the previous mesh state.
+On macOS this should be a Unix domain socket. Messages should be JSON lines or a small JSON-RPC-like format.
 
 ## Non-Goals
 
-- General-purpose modeling.
-- Arbitrary Blender-style edit mode.
-- Manual edge/vertex cleanup workflows.
-- Complex multi-plane CAD cutting.
-- N-gon cap output.
-- A line selection tool as a final feature.
+- Do not add a Node server.
+- Do not add a network listener by default.
+- Do not make a remote-control API that is exposed outside the local machine.
+- Do not make UI automation depend on fragile mouse coordinates when a semantic command exists.
+- Do not require exact pixel-perfect screenshot comparison in the first version.
+- Do not rewrite the renderer for this; use the existing WGPU renderer.
+
+## Phase 1: Inventory and Command Coverage Map
+
+### Goal
+
+Create a complete map from UI functionality to commands, so we know what needs parity.
+
+### Work
+
+Audit current UI actions in `apps/meshmend/src/app.rs`:
+
+- menu actions,
+- top toolbar actions,
+- context toolbar actions,
+- left palette actions,
+- keyboard shortcuts,
+- mouse gestures,
+- cut preview and apply flow,
+- object selection and object operations,
+- save/export actions.
+
+Create a table in the plan or a new internal tracking comment that maps:
+
+```text
+UI action -> existing function -> desired AppCommand -> CLI/scenario support
+```
+
+Initial command coverage should include:
+
+| Area | UI Behavior | Command Required |
+| --- | --- | --- |
+| File | open STL | `LoadStl` |
+| File | save/export STL | `ExportVisible` |
+| View | rendered/wire/x-ray/normals/etc. | `SetViewMode` |
+| View | fit/reset | `FitCamera`, `ResetCamera` |
+| Camera | orbit/pan/zoom | `SetCamera`, `OrbitCamera`, `PanCamera`, `ZoomCamera` |
+| Tools | point/brush/cut | `SetTool` |
+| Selection | vertex/edge/face | `SetSelectionElement` |
+| Selection | front/through | `SetSelectionDepth` |
+| Cut | cap density/smooth | `SetCutOptions` |
+| Cut | draw line | `PreviewViewLineCut` |
+| Cut | apply | `ApplyCut` |
+| Objects | select object | `SelectObject`, `SelectObjectAt` |
+| Objects | hide/delete/keep/export | matching object commands |
+| Rendering | screenshot | `Screenshot` |
+| Reporting | inspect state | `StateSnapshot` |
+
+### Acceptance Criteria
+
+- There is a clear list of all currently exposed UI actions.
+- Each UI action has a command name, even if not implemented yet.
+- Missing CLI/scenario support is explicitly visible.
+
+## Phase 2: Extract Mesh Session
+
+### Goal
+
+Move document and geometry operation logic out of the UI event loop so it can be called by UI, CLI, and scenarios.
+
+### New Module
+
+Create a module such as:
+
+```text
+apps/meshmend/src/session.rs
+```
+
+or split it further later:
+
+```text
+apps/meshmend/src/session/document.rs
+apps/meshmend/src/session/commands.rs
+apps/meshmend/src/session/reports.rs
+```
+
+Start simple. Do not over-split before the interfaces settle.
+
+### MeshSession Responsibilities
+
+`MeshSession` should own:
+
+- `model_info`,
+- `mesh_document`,
+- selected object,
+- hidden object state,
+- dirty state,
+- undo stack for mesh operations,
+- status text or structured last operation result.
+
+It should expose methods like:
+
+```rust
+load_stl(path) -> Result<SessionReport>
+apply_view_line_cut(cut_plane, cut_options, preferred_pick) -> Result<SessionReport>
+select_object(index) -> Result<SessionReport>
+select_object_for_render_triangle(render_triangle_index) -> Result<SessionReport>
+hide_selected_object() -> Result<SessionReport>
+delete_selected_object() -> Result<SessionReport>
+keep_only_selected_object() -> Result<SessionReport>
+export_visible(path) -> Result<SessionReport>
+export_object(index, path) -> Result<SessionReport>
+undo() -> Result<SessionReport>
+```
+
+### Important Detail
+
+The session should not know about egui. It may know about renderer-independent screen coordinates only where needed for semantic operations, but it should not draw or receive raw UI events.
+
+The UI should become thinner:
+
+- translate mouse/keyboard/ui widgets into commands,
+- call the session/command executor,
+- ask renderer to update buffers or overlays,
+- display the resulting status/report.
+
+### Acceptance Criteria
+
+- Existing UI behavior still works.
+- Existing tests still pass.
+- Object operations can be unit-tested without a running window.
+- The geometry state after a cut can be inspected without reading UI state.
+
+## Phase 3: Define Serializable Commands and State Reports
+
+### Goal
+
+Introduce a stable command schema that can be used by batch scenarios and later by a live control socket.
+
+### AppCommand Enum
+
+Create a serializable command enum:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AppCommand {
+    LoadStl { path: PathBuf },
+    SetViewMode { mode: ViewModeName },
+    FitCamera,
+    ResetCamera,
+    SetCamera { camera: CameraState },
+    OrbitCamera { delta: [f32; 2] },
+    PanCamera { delta: [f32; 2] },
+    ZoomCamera { delta: f32 },
+    SetTool { tool: ToolName },
+    SetSelectionElement { element: SelectionElementName },
+    SetSelectionDepth { depth: SelectionDepthName },
+    SetCutOptions { cap_density: CapDensityName, smooth_cap: bool },
+    PreviewViewLineCut { start: [f32; 2], end: [f32; 2] },
+    ApplyCut,
+    CancelCut,
+    SelectObject { index: usize },
+    SelectObjectAt { position: [f32; 2] },
+    HideSelectedObject,
+    DeleteSelectedObject,
+    KeepOnlySelectedObject,
+    ShowAllObjects,
+    ExportVisible { path: PathBuf },
+    ExportObject { index: usize, path: PathBuf },
+    Screenshot { path: PathBuf },
+    StateReport { path: Option<PathBuf> },
+}
+```
+
+Names can be adjusted during implementation, but commands should be semantic and not UI-widget-specific.
+
+### State Snapshot
+
+Create a serializable snapshot containing:
+
+- loaded file,
+- triangle count,
+- bounds,
+- current view mode,
+- camera state,
+- active tool,
+- active cut preview summary,
+- object count,
+- visible object count,
+- selected object,
+- per-object triangle count,
+- per-object cap triangle count,
+- per-object bounds,
+- hidden state,
+- latest status,
+- latest error if any.
+
+Example:
+
+```json
+{
+  "file": "rose/raw.stl",
+  "triangles": 1949244,
+  "viewMode": "rendered",
+  "tool": "cut",
+  "cutPreview": {
+    "active": true,
+    "segments": 48,
+    "affectedTriangles": 48
+  },
+  "objects": [
+    {
+      "index": 0,
+      "name": "Object 1",
+      "visible": true,
+      "selected": false,
+      "triangles": 103928,
+      "capTriangles": 824,
+      "bounds": {
+        "min": [-0.1, -0.2, -0.3],
+        "max": [0.2, 0.1, 0.4]
+      }
+    }
+  ]
+}
+```
+
+### Acceptance Criteria
+
+- Commands serialize and deserialize from JSON.
+- State reports serialize to JSON.
+- Unit tests cover command parsing for representative commands.
+- UI code can call command executor directly for at least one command before moving all commands.
+
+## Phase 4: Renderer Session and Deterministic Screenshots
+
+### Goal
+
+Make viewport rendering scriptable and deterministic enough for repeatable visual checks.
+
+### Work
+
+Introduce a renderer/session bridge that can:
+
+- create a hidden window with fixed size,
+- load a mesh,
+- apply a view mode,
+- apply camera state,
+- apply overlays,
+- render one or more frames,
+- write a PNG screenshot,
+- return image statistics.
+
+Existing screenshot code in `run_capture_with_options` should be refactored so it is reusable by scenarios.
+
+### Camera State
+
+Define serializable camera state:
+
+```json
+{
+  "eye": [0.0, 0.0, 2.5],
+  "target": [0.0, 0.0, 0.0],
+  "up": [0.0, 1.0, 0.0]
+}
+```
+
+Also support simple camera operations in scenario steps:
+
+- `fitCamera`
+- `resetCamera`
+- `orbitCamera`
+- `panCamera`
+- `zoomCamera`
+
+The important capability is to launch into a reproducible view for a screenshot.
+
+### CLI Command
+
+Add a first-class render command:
+
+```bash
+meshmend render rose/raw.stl \
+  --output outputs/rose-rendered.png \
+  --width 1600 \
+  --height 1000 \
+  --view rendered \
+  --camera outputs/camera.json \
+  --state outputs/rose-rendered-state.json
+```
+
+### Acceptance Criteria
+
+- CLI can produce a PNG of a fixed-size viewport.
+- CLI can use a saved camera state.
+- CLI can output a state report alongside the PNG.
+- `just verify` can include at least one deterministic screenshot check.
+
+## Phase 5: Batch Scenario Runner
+
+### Goal
+
+Add a CLI command that runs a scripted sequence of operations and emits screenshots/reports at each important stage.
+
+### CLI Command
+
+```bash
+meshmend scenario tests/scenarios/rose-stem-cut.json --output-dir outputs/rose-stem-cut
+```
+
+### Scenario Format
+
+Use JSON first because the command schema can share serde structures. TOML can be added later if useful.
+
+Example:
+
+```json
+{
+  "name": "rose stem cut",
+  "input": "rose/raw.stl",
+  "viewport": {
+    "width": 1600,
+    "height": 1000
+  },
+  "steps": [
+    {
+      "type": "fit-camera"
+    },
+    {
+      "type": "set-view-mode",
+      "mode": "rendered"
+    },
+    {
+      "type": "screenshot",
+      "path": "01-loaded.png"
+    },
+    {
+      "type": "set-tool",
+      "tool": "cut"
+    },
+    {
+      "type": "set-cut-options",
+      "capDensity": "automatic",
+      "smoothCap": false
+    },
+    {
+      "type": "preview-view-line-cut",
+      "start": [360, 650],
+      "end": [860, 535]
+    },
+    {
+      "type": "screenshot",
+      "path": "02-cut-preview.png"
+    },
+    {
+      "type": "apply-cut"
+    },
+    {
+      "type": "state-report",
+      "path": "03-cut-applied.json"
+    },
+    {
+      "type": "screenshot",
+      "path": "03-cut-applied.png"
+    },
+    {
+      "type": "select-object",
+      "index": 0
+    },
+    {
+      "type": "delete-selected-object"
+    },
+    {
+      "type": "screenshot",
+      "path": "04-after-delete.png"
+    },
+    {
+      "type": "export-visible",
+      "path": "rose-stem-removed.stl"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "object-count-at-least",
+      "count": 2
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "03-cut-applied.png"
+    },
+    {
+      "type": "export-reloads",
+      "path": "rose-stem-removed.stl"
+    }
+  ]
+}
+```
+
+### Scenario Output Directory
+
+Each run should write:
+
+```text
+outputs/rose-stem-cut/
+  scenario-input.json
+  run-report.json
+  01-loaded.png
+  02-cut-preview.png
+  03-cut-applied.json
+  03-cut-applied.png
+  04-after-delete.png
+  rose-stem-removed.stl
+```
+
+### Assertions
+
+Start with practical assertions:
+
+- screenshot exists,
+- screenshot is nonblank,
+- object count equals or exceeds expected count,
+- selected object exists,
+- triangle count changed,
+- exported STL reloads,
+- exported STL has no open boundary loops where expected,
+- command result status is success.
+
+Do not start with exact image matching. Use image stats first.
+
+### Acceptance Criteria
+
+- A scenario can reproduce a basic cut workflow.
+- A scenario can produce before/preview/after screenshots.
+- A scenario can export an STL and validate it reloads.
+- A scenario failure identifies the failed step and prints the state snapshot.
+
+## Phase 6: UI Parity Migration
+
+### Goal
+
+Change UI event handlers so all meaningful actions call `AppCommand`.
+
+### Migration Order
+
+1. View commands:
+   - `SetViewMode`
+   - `FitCamera`
+   - `ResetCamera`
+2. Tool commands:
+   - `SetTool`
+   - `SetSelectionElement`
+   - `SetSelectionDepth`
+3. Cut commands:
+   - `SetCutOptions`
+   - `PreviewViewLineCut`
+   - `ApplyCut`
+   - `CancelCut`
+4. Object commands:
+   - `SelectObject`
+   - `SelectObjectAt`
+   - `HideSelectedObject`
+   - `DeleteSelectedObject`
+   - `KeepOnlySelectedObject`
+   - `ShowAllObjects`
+5. Export commands:
+   - `ExportVisible`
+   - `ExportObject`
+   - `ExportAllObjects`
+
+### UI Rule
+
+The UI can still own layout, mouse input interpretation, and shortcuts. It should not own core operation semantics.
+
+For example:
+
+```text
+Mouse drag in Cut tool
+  -> UI converts drag to start/end screen coordinates
+  -> AppCommand::PreviewViewLineCut
+```
+
+```text
+Apply Cut button
+  -> AppCommand::ApplyCut
+```
+
+```text
+Object dropdown changed
+  -> AppCommand::SelectObject
+```
+
+### Acceptance Criteria
+
+- UI behavior stays the same or improves.
+- The same command used by a UI button can also be used in a scenario.
+- New commands include unit tests.
+- No command requires egui types.
+
+## Phase 7: Live Local Control Socket
+
+### Goal
+
+Allow a running app instance to receive commands from a separate process. This enables interactive debugging and external automation while preserving the desktop app experience.
+
+### Launch Mode
+
+Add:
+
+```bash
+meshmend rose/raw.stl --control-socket /tmp/meshmend.sock
+```
+
+or:
+
+```bash
+meshmend --control-socket auto rose/raw.stl
+```
+
+If `auto`, the app can create a socket path under:
+
+```text
+target/meshmend-control/meshmend-<pid>.sock
+```
+
+### Client Command
+
+Either add a subcommand to the same binary:
+
+```bash
+meshmend control --socket /tmp/meshmend.sock screenshot outputs/live.png
+meshmend control --socket /tmp/meshmend.sock preview-cut 360 650 860 535
+meshmend control --socket /tmp/meshmend.sock apply-cut
+meshmend control --socket /tmp/meshmend.sock state
+```
+
+or create a second binary later:
+
+```text
+meshmendctl
+```
+
+Start with a `meshmend control` subcommand to avoid extra packaging work.
+
+### Protocol
+
+Use JSON lines over a Unix domain socket:
+
+Request:
+
+```json
+{"id":1,"command":{"type":"screenshot","path":"outputs/live.png"}}
+```
+
+Response:
+
+```json
+{"id":1,"ok":true,"state":{"objectsVisible":2,"selectedObject":0}}
+```
+
+Error:
+
+```json
+{"id":1,"ok":false,"error":"no object selected"}
+```
+
+### Event Loop Integration
+
+The socket listener should run on a background thread and forward commands into the winit event loop through `EventLoopProxy`.
+
+The main app thread applies commands because it owns the renderer and window state.
+
+The response can be sent back through a oneshot channel managed by the listener. If that is too complex for the first version, the first live control mode can be fire-and-report-to-log, but the target should be request/response.
+
+### Security and Safety
+
+- Local-only Unix domain socket.
+- No TCP listener.
+- Socket disabled unless explicitly requested.
+- If the socket path already exists, refuse unless a `--replace-control-socket` flag is passed.
+- Clean up socket file on normal exit.
+- Never allow arbitrary shell commands through the protocol.
+
+### Acceptance Criteria
+
+- Launching with `--control-socket` starts the app normally and creates a local socket.
+- `meshmend control state` returns a state snapshot.
+- `meshmend control screenshot` writes a PNG.
+- `meshmend control preview-cut` and `apply-cut` work on the running app.
+- The app remains responsive while the socket is active.
+
+## Phase 8: Visual Regression Harness
+
+### Goal
+
+Use the scenario runner to produce repeatable screenshots and structured reports that can catch regressions.
+
+### Test Strategy
+
+Start with image statistics and semantic state checks:
+
+- non-background pixel coverage,
+- selected object overlay coverage,
+- cut preview overlay coverage,
+- object count,
+- visible object count,
+- triangle count,
+- export reload success,
+- analysis defect count.
+
+Avoid exact pixel comparison until the renderer stabilizes more.
+
+### Example Regression Scenarios
+
+Create scenarios under:
+
+```text
+tests/scenarios/
+```
+
+Initial scenarios:
+
+```text
+tests/scenarios/cube-view-modes.json
+tests/scenarios/cube-view-line-cut.json
+tests/scenarios/cube-two-cuts.json
+tests/scenarios/cube-delete-object.json
+tests/scenarios/rose-load-render.json
+```
+
+The rose scenario should be optional because `rose/raw.stl` is ignored by Git. It can be used by `just verify-rose`.
+
+### Just Recipes
+
+Add:
+
+```text
+scenario-smoke:
+    cargo run -p meshmend -- scenario tests/scenarios/cube-view-line-cut.json --output-dir outputs/scenario-cube-view-line-cut
+
+scenario-rose:
+    test -f rose/raw.stl
+    cargo run -p meshmend -- scenario tests/scenarios/rose-load-render.json --output-dir outputs/scenario-rose-load-render
+```
+
+Then update:
+
+```text
+verify:
+    ...
+    just scenario-smoke
+```
+
+### Acceptance Criteria
+
+- `just scenario-smoke` produces screenshots and reports.
+- Scenario output can be inspected manually.
+- CI/local verification can fail on blank screenshots or broken command results.
+- The scenario runner gives enough information to debug the failing step.
+
+## Phase 9: Repair Workflow Parity
+
+### Goal
+
+As repair tools are added, they must be added to the command layer and scenario runner immediately.
+
+### Required Future Commands
+
+For brush repair:
+
+- `SetBrushRadius`
+- `PaintRepairBoundary`
+- `ClearRepairBoundary`
+- `PreviewLocalWrap`
+- `ApplyLocalWrap`
+- `ExportRepairPatch`
+
+For cavity workflows:
+
+- `AnalyzeInternalCavities`
+- `ShowCavity`
+- `SelectCavity`
+- `SealCavityFromBoundary`
+- `RemoveHiddenInteriorShells`
+
+For remeshing:
+
+- `SetModelScale`
+- `SetTargetPrinterResolution`
+- `PreviewRemesh`
+- `ApplyRemesh`
+
+Each command should support:
+
+- state report output,
+- screenshot output,
+- undo where appropriate,
+- export/reload validation.
+
+### Acceptance Criteria
+
+- No new major repair UI feature is merged without at least one scenario.
+- Scenario output proves before/preview/after states.
+- CLI can reproduce the workflow without manual UI interaction.
+
+## Phase 10: Documentation
+
+### User Documentation
+
+Document:
+
+- `meshmend render`
+- `meshmend scenario`
+- `meshmend control`
+- screenshot outputs,
+- state report schema,
+- scenario examples,
+- common debugging workflows.
+
+### Developer Documentation
+
+Document rules for adding new commands:
+
+1. Add the command enum variant.
+2. Add command execution.
+3. Add UI wiring.
+4. Add scenario parsing.
+5. Add state report fields if needed.
+6. Add tests.
+7. Add one scenario if it is user-visible.
+
+### Acceptance Criteria
+
+- A future agent can add a new tool without guessing the command architecture.
+- The repo explains how to run scripted visual tests.
+
+## Proposed File Structure
+
+The final structure can evolve, but the target should be close to:
+
+```text
+apps/meshmend/src/
+  main.rs
+  app.rs
+  icons.rs
+  input.rs
+  session.rs
+  commands.rs
+  scenario.rs
+  control.rs
+  render_script.rs
+
+tests/scenarios/
+  cube-view-line-cut.json
+  cube-two-cuts.json
+  cube-delete-object.json
+  rose-load-render.json
+
+outputs/
+  scenario-.../
+```
+
+If `session.rs` becomes too large:
+
+```text
+apps/meshmend/src/session/
+  mod.rs
+  document.rs
+  executor.rs
+  snapshot.rs
+```
+
+## Implementation Order
+
+1. Add command and snapshot types without changing UI behavior.
+2. Extract mesh document operations into `MeshSession`.
+3. Add deterministic render CLI with fixed camera/view/viewport.
+4. Add scenario runner for load/view/screenshot.
+5. Add cut preview/apply to scenario runner.
+6. Add object select/hide/delete/keep/export to scenario runner.
+7. Move UI actions to call shared commands.
+8. Add scenario smoke tests to `just verify`.
+9. Add optional live local control socket.
+10. Expand scenario coverage as repair tools are added.
+
+This order matters because batch scenarios will give most of the testing value before the live socket exists.
+
+## Success Criteria
+
+This work is complete when:
+
+- Any major UI action has a matching command.
+- A scripted scenario can load an STL, position the camera, preview a cut, apply it, select an object, delete or keep it, export the result, and save screenshots at each stage.
+- The same command executor is used by UI and scenarios.
+- A hidden renderer can rasterize the same viewport state into a PNG.
+- `just verify` includes at least one scenario smoke test.
+- Optional live control can drive a running app through a local Unix socket.
+
+## Practical First Scenario
+
+The first scenario should be cube-based because it is tracked and deterministic:
+
+```json
+{
+  "name": "cube view line cut",
+  "input": "fixtures/stl/cube_binary.stl",
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  },
+  "steps": [
+    {
+      "type": "fit-camera"
+    },
+    {
+      "type": "set-view-mode",
+      "mode": "surface-wire"
+    },
+    {
+      "type": "screenshot",
+      "path": "01-loaded.png"
+    },
+    {
+      "type": "set-tool",
+      "tool": "cut"
+    },
+    {
+      "type": "preview-view-line-cut",
+      "start": [500, 120],
+      "end": [780, 680]
+    },
+    {
+      "type": "screenshot",
+      "path": "02-preview.png"
+    },
+    {
+      "type": "apply-cut"
+    },
+    {
+      "type": "state-report",
+      "path": "03-state.json"
+    },
+    {
+      "type": "screenshot",
+      "path": "03-applied.png"
+    },
+    {
+      "type": "select-object",
+      "index": 0
+    },
+    {
+      "type": "delete-selected-object"
+    },
+    {
+      "type": "export-visible",
+      "path": "cube-cut-visible.stl"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "object-count-at-least",
+      "count": 2
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "02-preview.png"
+    },
+    {
+      "type": "export-reloads",
+      "path": "cube-cut-visible.stl"
+    }
+  ]
+}
+```
+
+## Notes on Existing App Patterns
+
+The current app already proves that this direction is realistic:
+
+- The renderer can run hidden and create screenshots.
+- The CLI already runs geometry operations.
+- `just repair-smoke` already validates exported STL files.
+- Cut operations already return structured counts such as loops and cap triangles.
+
+The main work is not inventing new geometry. The main work is separating command semantics from UI event handling and making the renderer scriptable.
