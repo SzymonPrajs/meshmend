@@ -21,10 +21,11 @@ about 10 local detail units on the current model. Local repair should use that
 stored radius as the first ROI expansion distance before choosing voxel or
 shrink-wrap resolution.
 
-The first implementation target is a local shrink-wrap or voxel-wrap prototype
-that eliminates the internal cavity without changing the full model. Global
-repair, full-model remeshing, and printable slicing remain out of scope for this
-native viewer path.
+The first implemented local shrink-wrap path is the OpenVDB `local_sdf_wrap`
+worker operation. It rebuilds a mesh through a local-detail voxel surface
+extraction, and the next refinement is to constrain that operation to painted
+healthy, target, and exclude regions instead of running on the whole mesh file.
 
-The archived Python pipeline may be used as reference material for diagnostics
-and experiments, but it should not be revived as active product code.
+Diagnostics, ROI concepts, voxel concepts, and CLI semantics from the old
+Python experiments have been ported or superseded. Do not recreate a Python
+repair pipeline.

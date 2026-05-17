@@ -24,15 +24,9 @@ docs/meshmend-master-plan.md
 
 Follow that plan phase by phase. Do not create separate plan files.
 
-Do not revive the old Python repair pipeline as active product code. It is
-archived at:
-
-```text
-archive/python-resinmesh/
-```
-
-You may reuse archived code as reference material only, especially for mesh
-statistics, rendering experiments, and diagnostic report ideas.
+The old Python repair pipeline has been deleted after its useful diagnostics,
+ROI, voxel, and CLI ideas were ported into the native Rust/C++ implementation.
+Do not recreate it as active product code.
 
 ## Assets
 
@@ -56,7 +50,7 @@ planning files, not raw model data.
   code.
 - Keep C++ geometry work isolated in process workers where the master plan calls
   for CGAL or OpenVDB.
-- Do not use the old Python repair pipeline as active product code.
+- Do not use or recreate the old Python repair pipeline as active product code.
 - Keep source assets and generated app artifacts separate.
 - Keep generated build outputs, Rust `target`, large STL outputs, and local
   raw model files ignored.

@@ -3,15 +3,9 @@
 This workspace is focused on MeshMend, a native Rust STL inspection app for
 AI-generated 3D model meshes.
 
-The previous Python mesh-repair toolchain has been moved out of the active
-source tree:
-
-```text
-archive/python-resinmesh/
-```
-
-Keep it only as a reference for scripts, rendering ideas, and diagnostics. Do
-not treat it as the active product direction.
+The previous Python mesh-repair toolchain has been removed from the source
+tree. Its useful diagnostics, ROI, voxel, and CLI ideas now live in the native
+Rust/C++ implementation.
 
 ## Current Assets
 

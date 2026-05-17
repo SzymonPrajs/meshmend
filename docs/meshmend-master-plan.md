@@ -42,8 +42,8 @@ The primary rose-class failure cases are:
 - Native Rust remains the shell, renderer, project system, and orchestration
   layer. Heavy geometry repair can use isolated C++ workers when the libraries
   are better there.
-- The archived Python repair pipeline is reference material only until each
-  useful behavior is ported. It must not remain active product code.
+- The old Python repair pipeline has been deleted after its useful behavior was
+  ported or superseded. It must not be recreated as active product code.
 
 ## Current UI Problems To Fix
 
@@ -510,32 +510,27 @@ workflow is working.
 
 ## Archive Cleanup Plan
 
-The archive must be removed from active source control after useful behavior is
-ported.
+The archive cleanup is part of the implementation, not a parallel plan.
 
-Inventory:
+Ported behavior:
 
-- `archive/python-resinmesh/src/resinmesh/diagnostics.py`: port useful mesh
-  metrics, report ideas, and screenshot/contact-sheet concepts.
-- `archive/python-resinmesh/src/resinmesh/voxel.py`: replace with OpenVDB/local
-  SDF worker implementation.
-- `archive/python-resinmesh/src/resinmesh/roi.py`: replace with native
-  selection, BVH, and repair ROI extraction.
-- `archive/python-resinmesh/src/resinmesh/roi_ui.py` and `roi_3d_ui.py`: delete
-  after native UI tools exist.
-- `archive/python-resinmesh/src/resinmesh/cli.py`: port useful command
-  semantics into Rust CLI operations.
-- `archive/python-resinmesh/tests`: convert relevant tests into Rust fixtures,
-  synthetic meshes, and worker golden tests.
+- diagnostics and report ideas: Rust `meshmend-analysis`, export validation,
+  performance reports, and Markdown/JSON reports
+- voxel concepts: OpenVDB `local_sdf_wrap`
+- ROI concepts: Rust indexed mesh, topology, BVH, x-ray hit stacks, and brush
+  operation inputs
+- UI concepts: native tool palette, x-ray inspection, repair brush, measure,
+  remesh, cut, and export panels
+- CLI semantics: Rust `inspect`, `analyze`, `hole-fill`, `local-wrap`, `cut`,
+  `remesh`, `export`, `perf`, `worker-smoke`, and project validation commands
+- tests: Rust synthetic fixtures and repair smoke checks
 
-Cleanup stages:
+Cleanup gate:
 
-1. Extract an inventory checklist into this master plan implementation tracking.
-2. Port each useful behavior into Rust or C++ workers.
-3. Add equivalent tests before deleting the Python reference.
-4. Delete `archive/python-resinmesh`, Python requirements, and archive README
-   references.
-5. Verify no Python repair code remains in active product paths.
+1. Delete the old Python repair tree and dependency files.
+2. Remove README/AGENTS/docs references that describe it as available reference
+   code.
+3. Verify no Python repair code remains in active product paths.
 
 ## Detailed Research And Implementation Design
 
@@ -1114,8 +1109,8 @@ Report:
 
 ### Phase 13 Research: Archive Deletion
 
-Delete the archive after porting useful behavior. Do not keep Python as a
-parallel implementation.
+Delete the old Python repair tree after porting useful behavior. Do not keep it
+as a parallel implementation.
 
 Port mapping:
 
@@ -1128,11 +1123,11 @@ Port mapping:
 
 Deletion gate:
 
-- No current command references the Python archive.
+- No current command references the deleted repair tree.
 - Useful tests are ported.
-- Replacement repair worker can run at least one real operation.
-- README/AGENTS/docs no longer describe archive code as a future source of
-  product behavior.
+- Replacement repair workers can run real operations.
+- README/AGENTS/docs no longer describe the old repair code as a future source
+  of product behavior.
 
 ### Phase 14 Research: Packaging And Performance
 
@@ -1481,7 +1476,7 @@ Build:
 - Port ROI concepts into Rust selection and ROI extraction.
 - Port useful CLI semantics into Rust CLI commands.
 - Convert useful tests into Rust fixtures and worker golden tests.
-- Delete `archive/python-resinmesh`, Python requirements, and archive-specific
+- Delete the old Python repair tree, dependency files, and archive-specific
   docs.
 - Remove all references that describe Python as product code.
 
