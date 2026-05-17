@@ -4,8 +4,9 @@ use meshmend_core::{CrossSectionAxis, CrossSectionState, TriangleId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueKind {
+    #[default]
     InternalGap,
     TunnelOrCavity,
     OpenBoundary,
@@ -39,21 +40,10 @@ impl IssueKind {
     }
 }
 
-impl Default for IssueKind {
-    fn default() -> Self {
-        Self::InternalGap
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueStatus {
+    #[default]
     Open,
-}
-
-impl Default for IssueStatus {
-    fn default() -> Self {
-        Self::Open
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

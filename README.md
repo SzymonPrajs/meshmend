@@ -35,14 +35,6 @@ The active implementation is now the native viewer:
 - mesh stats, cross-section inspection, issue marking, selection, screenshots,
   and performance metrics
 
-## Current Plan
-
-The next active product step is cross-section inspection:
-
-```text
-docs/cross-section-inspection-plan.md
-```
-
 ## App Location
 
 The native app crate is under:
@@ -67,6 +59,8 @@ cargo run -p meshmend
 cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --cross-section-screenshot fixtures/stl/cube_binary.stl outputs/cube-cross-section.png
 cargo run -p meshmend -- --screenshot fixtures/stl/cube_binary.stl outputs/cube.png
 cargo run -p meshmend -- perf fixtures/stl/cube_binary.stl --output outputs/perf-cube.json
 ```

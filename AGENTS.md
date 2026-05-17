@@ -2,7 +2,8 @@
 
 This workspace has pivoted away from the failed global mesh-repair experiments.
 The active direction is MeshMend, a native Rust STL inspection app for viewing,
-annotating, and later repairing AI-generated mesh files.
+cross-section inspection, issue marking, and later repairing AI-generated mesh
+files.
 
 ## Current Boundary
 
@@ -43,17 +44,17 @@ planning files, not raw model data.
   camera math, picking, issue marking, screenshots, and performance metrics.
 - Do not reintroduce the Three.js/Vite/Tauri webview viewer as active product
   code.
-- Keep the native viewer focused on inspection. The next active feature is the
-  cross-section inspection plan in `docs/cross-section-inspection-plan.md`.
+- Keep the native viewer focused on inspection. Cross-section inspection and
+  manual issue marking are active product features.
 - Do not build repair, mesh simplification, printable slicing/layer export, ROI
   tools, or automatic defect classification yet.
 - Keep source assets and generated app artifacts separate.
 - Keep generated build outputs, Rust `target`, large STL outputs, and local
   raw model files ignored.
 
-## Next Milestone Definition
+## Current Milestone Definition
 
-The cross-section inspection milestone is complete when:
+The current inspection milestone is complete when:
 
 - a native Rust app launches locally
 - the app accepts an STL file selected from disk
@@ -73,4 +74,5 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
 ```

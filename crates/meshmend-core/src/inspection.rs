@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::MeshBounds;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrossSectionAxis {
     X,
     Y,
+    #[default]
     Z,
 }
 
@@ -47,12 +48,6 @@ impl CrossSectionAxis {
             Self::Y => [0.35, 0.82, 0.36, 0.95],
             Self::Z => [0.32, 0.55, 1.0, 0.95],
         }
-    }
-}
-
-impl Default for CrossSectionAxis {
-    fn default() -> Self {
-        Self::Z
     }
 }
 
