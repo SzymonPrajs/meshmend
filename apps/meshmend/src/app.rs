@@ -4,6 +4,7 @@ use anyhow::Result;
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::MeshStats;
+use meshmend_notes::NoteSession;
 use meshmend_render::{DisplaySettings, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
@@ -25,12 +26,17 @@ struct ModelInfo {
     parse_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UiAction {
     None,
     LoadStl,
     Fit,
     Reset,
+    AddNote,
+    SaveNotes,
+    LoadNotes,
+    FrameNote(usize),
+    DeleteNote(usize),
 }
 
 pub fn run_native(
@@ -68,6 +74,9 @@ pub fn run_native(
         .as_ref()
         .map(|model| format!("Loaded {}", model.file_name))
         .unwrap_or_else(|| "Ready".to_string());
+    let mut note_session = model_info
+        .as_ref()
+        .map(|model| NoteSession::new(model.file_name.clone(), model.stats.source_bytes));
 
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
@@ -111,6 +120,7 @@ pub fn run_native(
                                 renderer.info(),
                                 model_info.as_ref(),
                                 selected_pick,
+                                &mut note_session,
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut display_settings,
@@ -129,6 +139,8 @@ pub fn run_native(
                             &mut renderer,
                             redraw_window,
                             &mut model_info,
+                            &mut note_session,
+                            &mut selected_pick,
                             &mut status,
                             &mut needs_redraw,
                         );
@@ -180,10 +192,16 @@ pub fn run_native(
                     }
                     WindowEvent::DroppedFile(path) => {
                         match load_model(&path, &mut renderer, redraw_window) {
-                            Ok(info) => {
-                                status = format!("Loaded {}", info.file_name);
-                                model_info = Some(info);
-                            }
+                                Ok(info) => {
+                                    status = format!("Loaded {}", info.file_name);
+                                    note_session = Some(NoteSession::new(
+                                        info.file_name.clone(),
+                                        info.stats.source_bytes,
+                                    ));
+                                    model_info = Some(info);
+                                    selected_pick = None;
+                                    renderer.set_note_markers(&[]);
+                                }
                             Err(err) => {
                                 status = format!("Load failed: {err}");
                                 tracing::error!(error = %err, "failed to load dropped STL");
@@ -289,6 +307,8 @@ fn handle_ui_action(
     renderer: &mut WgpuRenderer<'_>,
     window: &Window,
     model_info: &mut Option<ModelInfo>,
+    note_session: &mut Option<NoteSession>,
+    selected_pick: &mut Option<PickResult>,
     status: &mut String,
     needs_redraw: &mut bool,
 ) {
@@ -299,7 +319,14 @@ fn handle_ui_action(
                 match load_model(&path, renderer, window) {
                     Ok(info) => {
                         *status = format!("Loaded {}", info.file_name);
+                        *note_session = Some(NoteSession::new(
+                            info.file_name.clone(),
+                            info.stats.source_bytes,
+                        ));
                         *model_info = Some(info);
+                        *selected_pick = None;
+                        renderer.set_selection_marker(None);
+                        renderer.set_note_markers(&[]);
                     }
                     Err(err) => {
                         *status = format!("Load failed: {err}");
@@ -316,6 +343,75 @@ fn handle_ui_action(
         UiAction::Reset => {
             reset_camera(renderer);
             *needs_redraw = true;
+        }
+        UiAction::AddNote => {
+            if let (Some(session), Some(pick)) = (note_session.as_mut(), *selected_pick) {
+                session.add_note(pick.triangle_id, pick.position.to_array());
+                update_note_markers(renderer, session);
+                *status = "Added note".to_string();
+                *needs_redraw = true;
+            }
+        }
+        UiAction::SaveNotes => {
+            if let Some(session) = note_session.as_ref() {
+                let default_name = format!("{}.notes.json", session.model_file_name);
+                if let Some(path) = meshmend_io::pick_note_session_to_save(&default_name) {
+                    match session.save_to_path(&path) {
+                        Ok(()) => {
+                            *status = format!("Saved notes to {}", path.display());
+                        }
+                        Err(err) => {
+                            *status = format!("Save failed: {err}");
+                            tracing::error!(error = %err, "failed to save notes");
+                        }
+                    }
+                    *needs_redraw = true;
+                }
+            }
+        }
+        UiAction::LoadNotes => {
+            if let Some(path) = meshmend_io::pick_note_session_to_load() {
+                match NoteSession::load_from_path(&path) {
+                    Ok(session) => {
+                        update_note_markers(renderer, &session);
+                        *status = format!("Loaded notes from {}", path.display());
+                        *note_session = Some(session);
+                    }
+                    Err(err) => {
+                        *status = format!("Load notes failed: {err}");
+                        tracing::error!(error = %err, "failed to load notes");
+                    }
+                }
+                *needs_redraw = true;
+            }
+        }
+        UiAction::FrameNote(index) => {
+            if let Some(note) = note_session
+                .as_ref()
+                .and_then(|session| session.notes.get(index))
+            {
+                let position = glam::Vec3::from_array(note.position);
+                *selected_pick = Some(PickResult {
+                    triangle_id: note.triangle,
+                    position,
+                });
+                renderer.set_selection_marker(Some(position));
+                *status = format!(
+                    "Framed note {}:{}",
+                    note.triangle.chunk, note.triangle.local_index
+                );
+                *needs_redraw = true;
+            }
+        }
+        UiAction::DeleteNote(index) => {
+            if let Some(session) = note_session.as_mut() {
+                if index < session.notes.len() {
+                    session.notes.remove(index);
+                    update_note_markers(renderer, session);
+                    *status = "Deleted note".to_string();
+                    *needs_redraw = true;
+                }
+            }
         }
     }
 }
@@ -375,11 +471,21 @@ fn upload_parsed_mesh(renderer: &mut WgpuRenderer<'_>, parsed: &ParsedStl) {
     );
 }
 
+fn update_note_markers(renderer: &mut WgpuRenderer<'_>, session: &NoteSession) {
+    let positions = session
+        .notes
+        .iter()
+        .map(|note| glam::Vec3::from_array(note.position))
+        .collect::<Vec<_>>();
+    renderer.set_note_markers(&positions);
+}
+
 fn draw_ui(
     ctx: &egui::Context,
     renderer_info: &RendererInfo,
     model_info: Option<&ModelInfo>,
     selected_pick: Option<PickResult>,
+    note_session: &mut Option<NoteSession>,
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
@@ -448,6 +554,54 @@ fn draw_ui(
             }
             ui.label(format!("GPU: {}", renderer_info.adapter_name));
             ui.label(format!("Backend: {:?}", renderer_info.backend));
+        });
+
+    egui::SidePanel::right("notes_panel")
+        .resizable(false)
+        .default_width(300.0)
+        .show(ctx, |ui| {
+            ui.heading("Notes");
+            ui.horizontal(|ui| {
+                if ui.button("Add").clicked() {
+                    *action = UiAction::AddNote;
+                }
+                if ui.button("Save").clicked() {
+                    *action = UiAction::SaveNotes;
+                }
+                if ui.button("Load").clicked() {
+                    *action = UiAction::LoadNotes;
+                }
+            });
+
+            if let Some(pick) = selected_pick {
+                ui.label(format!(
+                    "Selected {}:{}",
+                    pick.triangle_id.chunk, pick.triangle_id.local_index
+                ));
+            }
+
+            ui.separator();
+            if let Some(session) = note_session.as_mut() {
+                for (index, note) in session.notes.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button("Frame").clicked() {
+                            *action = UiAction::FrameNote(index);
+                        }
+                        ui.text_edit_singleline(&mut note.label);
+                        if ui.button("Delete").clicked() {
+                            *action = UiAction::DeleteNote(index);
+                        }
+                    });
+                    ui.small(format!(
+                        "{}:{}  {:.3}, {:.3}, {:.3}",
+                        note.triangle.chunk,
+                        note.triangle.local_index,
+                        note.position[0],
+                        note.position[1],
+                        note.position[2]
+                    ));
+                }
+            }
         });
 
     egui::TopBottomPanel::bottom("status").show(ctx, |ui| {

@@ -64,6 +64,7 @@ pub struct WgpuRenderer<'window> {
     scene_lines: Option<SceneLines>,
     mesh_bounds: Option<MeshBounds>,
     selection_marker: Option<SceneLines>,
+    note_markers: Option<SceneLines>,
     display_settings: DisplaySettings,
     info: RendererInfo,
 }
@@ -243,6 +244,7 @@ impl<'window> WgpuRenderer<'window> {
             scene_lines: None,
             mesh_bounds: None,
             selection_marker: None,
+            note_markers: None,
             display_settings: DisplaySettings::default(),
             info,
         })
@@ -308,6 +310,7 @@ impl<'window> WgpuRenderer<'window> {
         self.mesh_bounds = Some(bounds);
         self.scene_lines = Some(SceneLines::new(&self.device, bounds));
         self.selection_marker = None;
+        self.note_markers = None;
 
         for chunk in chunks {
             if chunk.triangles.is_empty() {
@@ -472,6 +475,12 @@ impl<'window> WgpuRenderer<'window> {
                 pass.set_vertex_buffer(0, marker.buffer.slice(..));
                 pass.draw(0..marker.grid_vertex_count, 0..1);
             }
+            if let Some(markers) = &self.note_markers {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, markers.buffer.slice(..));
+                pass.draw(0..markers.grid_vertex_count, 0..1);
+            }
             let mesh_pipeline = if self.display_settings.show_backfaces {
                 &self.mesh_pipeline
             } else {
@@ -606,27 +615,45 @@ impl<'window> WgpuRenderer<'window> {
         self.picking_target.readback.unmap();
 
         let Some(triangle_id) = TriangleId::decode_picking_id(pick_id) else {
-            self.selection_marker = None;
+            self.set_selection_marker(None);
             return Ok(None);
         };
         let Some(triangle) = self.triangle(triangle_id) else {
-            self.selection_marker = None;
+            self.set_selection_marker(None);
             return Ok(None);
         };
         let ray = self.pick_ray(screen_position);
         let position = intersect_triangle(ray, triangle).unwrap_or_else(|| {
             (triangle.vertices[0] + triangle.vertices[1] + triangle.vertices[2]) / 3.0
         });
-        self.selection_marker = Some(SceneLines::marker(
-            &self.device,
-            position,
-            self.marker_radius(),
-        ));
+        self.set_selection_marker(Some(position));
 
         Ok(Some(PickResult {
             triangle_id,
             position,
         }))
+    }
+
+    pub fn set_selection_marker(&mut self, position: Option<Vec3>) {
+        self.selection_marker = position.map(|position| {
+            SceneLines::marker(
+                &self.device,
+                position,
+                self.marker_radius(),
+                [1.0, 0.72, 0.16, 1.0],
+            )
+        });
+    }
+
+    pub fn set_note_markers(&mut self, positions: &[Vec3]) {
+        self.note_markers = (!positions.is_empty()).then(|| {
+            SceneLines::markers(
+                &self.device,
+                positions,
+                self.marker_radius() * 0.8,
+                [0.45, 0.82, 1.0, 0.95],
+            )
+        });
     }
 
     fn triangle(&self, triangle_id: TriangleId) -> Option<Triangle> {
@@ -880,37 +907,43 @@ impl SceneLines {
         }
     }
 
-    fn marker(device: &wgpu::Device, position: Vec3, radius: f32) -> Self {
-        let color = [1.0, 0.72, 0.16, 1.0];
-        let vertices = [
-            LineVertex {
-                position: (position + Vec3::new(-radius, 0.0, 0.0)).to_array(),
-                color,
-            },
-            LineVertex {
-                position: (position + Vec3::new(radius, 0.0, 0.0)).to_array(),
-                color,
-            },
-            LineVertex {
-                position: (position + Vec3::new(0.0, -radius, 0.0)).to_array(),
-                color,
-            },
-            LineVertex {
-                position: (position + Vec3::new(0.0, radius, 0.0)).to_array(),
-                color,
-            },
-            LineVertex {
-                position: (position + Vec3::new(0.0, 0.0, -radius)).to_array(),
-                color,
-            },
-            LineVertex {
-                position: (position + Vec3::new(0.0, 0.0, radius)).to_array(),
-                color,
-            },
-        ];
+    fn marker(device: &wgpu::Device, position: Vec3, radius: f32, color: [f32; 4]) -> Self {
+        Self::markers(device, &[position], radius, color)
+    }
+
+    fn markers(device: &wgpu::Device, positions: &[Vec3], radius: f32, color: [f32; 4]) -> Self {
+        let mut vertices = Vec::with_capacity(positions.len() * 6);
+        for position in positions {
+            vertices.extend_from_slice(&[
+                LineVertex {
+                    position: (*position + Vec3::new(-radius, 0.0, 0.0)).to_array(),
+                    color,
+                },
+                LineVertex {
+                    position: (*position + Vec3::new(radius, 0.0, 0.0)).to_array(),
+                    color,
+                },
+                LineVertex {
+                    position: (*position + Vec3::new(0.0, -radius, 0.0)).to_array(),
+                    color,
+                },
+                LineVertex {
+                    position: (*position + Vec3::new(0.0, radius, 0.0)).to_array(),
+                    color,
+                },
+                LineVertex {
+                    position: (*position + Vec3::new(0.0, 0.0, -radius)).to_array(),
+                    color,
+                },
+                LineVertex {
+                    position: (*position + Vec3::new(0.0, 0.0, radius)).to_array(),
+                    color,
+                },
+            ]);
+        }
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MeshMend selection marker buffer"),
-            contents: bytemuck::cast_slice(&vertices),
+            label: Some("MeshMend marker buffer"),
+            contents: bytemuck::cast_slice(vertices.as_slice()),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
