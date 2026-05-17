@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -376,6 +376,8 @@ pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
     upload_parsed_mesh(&mut renderer, &parsed);
     let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
     let time_to_interactive_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+    let frame_stats = measure_frame_stats(&mut renderer)?;
+    let cpu_rss_mb = current_rss_mb().unwrap_or(0.0);
     let result: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
     let result_writer = Arc::clone(&result);
     let mut needs_redraw = true;
@@ -417,15 +419,15 @@ pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
                                 "screenshot": screenshot_ms,
                             },
                             "frame_stats": {
-                                "idle_fps_avg": 0.0,
-                                "orbit_fps_avg": 0.0,
-                                "pan_fps_avg": 0.0,
-                                "zoom_fps_avg": 0.0,
-                                "p95_frame_ms": 0.0,
-                                "p99_frame_ms": 0.0,
+                                "idle_fps_avg": frame_stats.idle_fps_avg,
+                                "orbit_fps_avg": frame_stats.orbit_fps_avg,
+                                "pan_fps_avg": frame_stats.pan_fps_avg,
+                                "zoom_fps_avg": frame_stats.zoom_fps_avg,
+                                "p95_frame_ms": frame_stats.p95_frame_ms,
+                                "p99_frame_ms": frame_stats.p99_frame_ms,
                             },
                             "memory": {
-                                "cpu_rss_mb": 0.0,
+                                "cpu_rss_mb": cpu_rss_mb,
                                 "gpu_buffer_mb": renderer.gpu_buffer_bytes() as f64 / (1024.0 * 1024.0),
                                 "chunk_count": parsed.chunks.len(),
                             },
@@ -441,11 +443,12 @@ pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
                         }
                         fs::write(&output, serde_json::to_string_pretty(&report)?)?;
                         println!(
-                            "perf wrote {} parse_ms={:.3} upload_ms={:.3} screenshot_ms={:.3} coverage={:.4}",
+                            "perf wrote {} parse_ms={:.3} upload_ms={:.3} screenshot_ms={:.3} orbit_fps={:.1} coverage={:.4}",
                             output.display(),
                             parsed.timings.parse.as_secs_f64() * 1000.0,
                             upload_ms,
                             screenshot_ms,
+                            frame_stats.orbit_fps_avg,
                             stats.coverage
                         );
                         Ok(())
@@ -465,6 +468,122 @@ pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
     guard
         .take()
         .unwrap_or_else(|| Err(anyhow!("performance capture did not run")))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameStats {
+    idle_fps_avg: f64,
+    orbit_fps_avg: f64,
+    pan_fps_avg: f64,
+    zoom_fps_avg: f64,
+    p95_frame_ms: f64,
+    p99_frame_ms: f64,
+}
+
+const PERF_FRAMES_PER_MODE: usize = 24;
+
+fn measure_frame_stats(renderer: &mut WgpuRenderer<'_>) -> Result<FrameStats> {
+    let original_camera = renderer.camera();
+    let mut all_frame_ms = Vec::with_capacity(PERF_FRAMES_PER_MODE * 4);
+
+    let idle = measure_mode(renderer, PERF_FRAMES_PER_MODE, |_| {}, &mut all_frame_ms)?;
+    let orbit = measure_mode(
+        renderer,
+        PERF_FRAMES_PER_MODE,
+        |renderer| {
+            let mut camera = renderer.camera();
+            camera.orbit(glam::Vec2::new(8.0, 2.5));
+            renderer.set_camera(camera);
+        },
+        &mut all_frame_ms,
+    )?;
+    let pan = measure_mode(
+        renderer,
+        PERF_FRAMES_PER_MODE,
+        |renderer| {
+            let mut camera = renderer.camera();
+            camera.pan(glam::Vec2::new(4.0, -2.0), renderer.size().height as f32);
+            renderer.set_camera(camera);
+        },
+        &mut all_frame_ms,
+    )?;
+    let zoom = measure_mode(
+        renderer,
+        PERF_FRAMES_PER_MODE,
+        |renderer| {
+            let mut camera = renderer.camera();
+            camera.zoom(0.15, renderer.mesh_bounds());
+            renderer.set_camera(camera);
+        },
+        &mut all_frame_ms,
+    )?;
+
+    renderer.set_camera(original_camera);
+    all_frame_ms.sort_by(f64::total_cmp);
+
+    Ok(FrameStats {
+        idle_fps_avg: fps_from_duration(idle),
+        orbit_fps_avg: fps_from_duration(orbit),
+        pan_fps_avg: fps_from_duration(pan),
+        zoom_fps_avg: fps_from_duration(zoom),
+        p95_frame_ms: percentile(&all_frame_ms, 0.95),
+        p99_frame_ms: percentile(&all_frame_ms, 0.99),
+    })
+}
+
+fn measure_mode(
+    renderer: &mut WgpuRenderer<'_>,
+    frames: usize,
+    mut apply: impl FnMut(&mut WgpuRenderer<'_>),
+    all_frame_ms: &mut Vec<f64>,
+) -> Result<Duration> {
+    let started = Instant::now();
+    for _ in 0..frames {
+        apply(renderer);
+        let frame_started = Instant::now();
+        renderer.render()?;
+        all_frame_ms.push(frame_started.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok(started.elapsed())
+}
+
+fn fps_from_duration(duration: Duration) -> f64 {
+    if duration.is_zero() {
+        0.0
+    } else {
+        PERF_FRAMES_PER_MODE as f64 / duration.as_secs_f64()
+    }
+}
+
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    if sorted_values.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted_values.len() - 1) as f64 * percentile).round() as usize;
+    sorted_values[index]
+}
+
+fn current_rss_mb() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let rss_kb = String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()?;
+        Some(rss_kb / 1024.0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

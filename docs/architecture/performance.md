@@ -18,11 +18,8 @@ The JSON report records:
 - GPU upload time
 - first-frame/screenshot readback time
 - time to interactive
+- scripted idle/orbit/pan/zoom FPS samples
+- p95/p99 frame time across the scripted samples
+- CPU RSS on Unix platforms where `ps` is available
 - GPU buffer allocation totals from MeshMend-owned buffers
 - render nonblank coverage
-
-Current gaps:
-
-- live orbit/pan/zoom FPS sampling is represented in the JSON schema but still
-  reports zero until an automated interaction harness is added
-- CPU RSS is currently zero until a platform memory sampler is added
