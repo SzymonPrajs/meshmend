@@ -38,6 +38,16 @@ verify:
     cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
     cargo run -p meshmend -- --verify-view-modes fixtures/stl/cube_binary.stl
     cargo run -p meshmend -- --verify-hit-stack fixtures/stl/cube_binary.stl
+    just scenario-smoke
+
+scenario-smoke:
+    cargo run -p meshmend -- scenario tests/scenarios/cube-view-line-cut.json --output-dir outputs/scenario-cube-view-line-cut
+    cargo run -p meshmend -- scenario tests/scenarios/cube-two-cuts.json --output-dir outputs/scenario-cube-two-cuts
+    cargo run -p meshmend -- scenario tests/scenarios/cube-selection-camera.json --output-dir outputs/scenario-cube-selection-camera
+
+scenario-rose:
+    test -f rose/raw.stl
+    cargo run -p meshmend -- render rose/raw.stl --output outputs/scenario-rose-load-render/rose-loaded.png --state outputs/scenario-rose-load-render/state.json --width 1600 --height 1000 --view rendered
 
 smoke:
     cargo run -p meshmend -- --smoke-window

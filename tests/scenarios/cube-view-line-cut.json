@@ -1,0 +1,86 @@
+{
+  "name": "cube view line cut",
+  "input": "fixtures/stl/cube_binary.stl",
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  },
+  "steps": [
+    {
+      "type": "fit-camera"
+    },
+    {
+      "type": "set-view-mode",
+      "mode": "surface-wire"
+    },
+    {
+      "type": "screenshot",
+      "path": "01-loaded.png"
+    },
+    {
+      "type": "set-tool",
+      "tool": "cut"
+    },
+    {
+      "type": "set-cut-options",
+      "capDensity": "automatic",
+      "smoothCap": false
+    },
+    {
+      "type": "preview-view-line-cut",
+      "start": [500, 120],
+      "end": [780, 680]
+    },
+    {
+      "type": "screenshot",
+      "path": "02-preview.png"
+    },
+    {
+      "type": "apply-cut"
+    },
+    {
+      "type": "state-report",
+      "path": "03-state.json"
+    },
+    {
+      "type": "screenshot",
+      "path": "03-applied.png"
+    },
+    {
+      "type": "select-object",
+      "index": 0
+    },
+    {
+      "type": "export-visible",
+      "path": "cube-cut-visible.stl"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "object-count-at-least",
+      "count": 2
+    },
+    {
+      "type": "selected-object-exists"
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "01-loaded.png"
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "02-preview.png"
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "03-applied.png"
+    },
+    {
+      "type": "export-reloads",
+      "path": "cube-cut-visible.stl"
+    },
+    {
+      "type": "camera-changed"
+    }
+  ]
+}

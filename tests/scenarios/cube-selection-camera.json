@@ -1,0 +1,86 @@
+{
+  "name": "cube selection and camera controls",
+  "input": "fixtures/stl/cube_binary.stl",
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  },
+  "steps": [
+    {
+      "type": "fit-camera"
+    },
+    {
+      "type": "orbit-camera",
+      "delta": [80, 20]
+    },
+    {
+      "type": "pan-camera",
+      "delta": [40, -20]
+    },
+    {
+      "type": "zoom-camera",
+      "delta": 0.75
+    },
+    {
+      "type": "set-view-mode",
+      "mode": "surface-wire"
+    },
+    {
+      "type": "wait-for-selection-acceleration"
+    },
+    {
+      "type": "set-selection-element",
+      "element": "face"
+    },
+    {
+      "type": "set-selection-depth",
+      "depth": "front"
+    },
+    {
+      "type": "select-at",
+      "position": [640, 400]
+    },
+    {
+      "type": "screenshot",
+      "path": "01-face-selection.png"
+    },
+    {
+      "type": "set-selection-element",
+      "element": "vertex"
+    },
+    {
+      "type": "set-selection-depth",
+      "depth": "through"
+    },
+    {
+      "type": "brush-select",
+      "center": [640, 400],
+      "radius": 56
+    },
+    {
+      "type": "screenshot",
+      "path": "02-brush-selection.png"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "face-selection-count-at-least",
+      "count": 1
+    },
+    {
+      "type": "selection-count-at-least",
+      "count": 1
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "01-face-selection.png"
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "02-brush-selection.png"
+    },
+    {
+      "type": "camera-changed"
+    }
+  ]
+}

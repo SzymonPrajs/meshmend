@@ -1,0 +1,92 @@
+{
+  "name": "cube two view-line cuts",
+  "input": "fixtures/stl/cube_binary.stl",
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  },
+  "steps": [
+    {
+      "type": "fit-camera"
+    },
+    {
+      "type": "set-view-mode",
+      "mode": "rendered"
+    },
+    {
+      "type": "set-tool",
+      "tool": "cut"
+    },
+    {
+      "type": "preview-view-line-cut",
+      "start": [500, 120],
+      "end": [780, 680]
+    },
+    {
+      "type": "apply-cut"
+    },
+    {
+      "type": "screenshot",
+      "path": "01-first-cut.png"
+    },
+    {
+      "type": "keep-only-selected-object"
+    },
+    {
+      "type": "preview-view-line-cut",
+      "start": [360, 420],
+      "end": [920, 350]
+    },
+    {
+      "type": "screenshot",
+      "path": "02-second-preview.png"
+    },
+    {
+      "type": "apply-cut"
+    },
+    {
+      "type": "state-report",
+      "path": "03-two-cuts.json"
+    },
+    {
+      "type": "screenshot",
+      "path": "03-two-cuts.png"
+    },
+    {
+      "type": "select-object",
+      "index": 0
+    },
+    {
+      "type": "delete-selected-object"
+    },
+    {
+      "type": "export-visible",
+      "path": "cube-two-cuts-visible.stl"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "object-count-at-least",
+      "count": 2
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "01-first-cut.png"
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "02-second-preview.png"
+    },
+    {
+      "type": "screenshot-nonblank",
+      "path": "03-two-cuts.png"
+    },
+    {
+      "type": "export-reloads",
+      "path": "cube-two-cuts-visible.stl"
+    },
+    {
+      "type": "triangle-count-changed"
+    }
+  ]
+}

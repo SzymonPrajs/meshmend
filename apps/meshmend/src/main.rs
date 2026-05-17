@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::commands::ViewModeName;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use glam::Vec3;
@@ -12,8 +13,12 @@ use meshmend_worker_api::{discover_worker_binary, WorkerOperation, WorkerRequest
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
+mod commands;
 mod icons;
 mod input;
+mod render_script;
+mod scenario;
+mod session;
 
 #[derive(Debug, Parser)]
 #[command(name = "meshmend")]
@@ -121,6 +126,28 @@ enum Command {
         report_json: Option<PathBuf>,
         #[arg(long, value_name = "MD")]
         report_md: Option<PathBuf>,
+    },
+    Render {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "PNG")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        #[arg(long, default_value_t = 800)]
+        height: u32,
+        #[arg(long, value_enum, default_value = "rendered")]
+        view: ViewModeName,
+        #[arg(long, value_name = "JSON")]
+        camera: Option<PathBuf>,
+        #[arg(long, value_name = "JSON")]
+        state: Option<PathBuf>,
+    },
+    Scenario {
+        #[arg(value_name = "SCENARIO_JSON")]
+        path: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
     },
     Perf {
         #[arg(value_name = "STL")]
@@ -531,6 +558,20 @@ fn main() -> Result<()> {
             report_md,
         }) => {
             export_mesh_with_reports(&path, &output, report_json.as_deref(), report_md.as_deref())?;
+        }
+        Some(Command::Render {
+            path,
+            output,
+            width,
+            height,
+            view,
+            camera,
+            state,
+        }) => {
+            render_script::run_render_command(path, output, width, height, view, camera, state)?;
+        }
+        Some(Command::Scenario { path, output_dir }) => {
+            render_script::run_scenario(path, output_dir)?;
         }
         Some(Command::Perf { path, output }) => {
             app::run_perf(path, output)?;
