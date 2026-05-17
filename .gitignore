@@ -59,6 +59,11 @@ screenshots/
 *.igs
 *.off
 
+# Tiny parser fixtures are intentionally committed.
+!fixtures/
+!fixtures/stl/
+!fixtures/stl/*.stl
+
 # Raster/video/reference media
 *.png
 *.jpg

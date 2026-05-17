@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use meshmend_stl::{load_binary_stl_with_options, LoadOptions};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
@@ -31,8 +32,38 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Inspect { path, parallel }) => {
-            let mode = if parallel { "parallel" } else { "serial" };
-            println!("MeshMend inspect placeholder ({mode}): {}", path.display());
+            let parsed = load_binary_stl_with_options(
+                &path,
+                &LoadOptions {
+                    parallel,
+                    ..LoadOptions::default()
+                },
+            )?;
+            println!("file: {}", parsed.source_path.display());
+            println!("triangles: {}", parsed.stats.triangle_count);
+            println!("vertices: {}", parsed.stats.vertex_position_count);
+            println!("source bytes: {}", parsed.stats.source_bytes);
+            println!("chunks: {}", parsed.chunks.len());
+            println!(
+                "bounds min: {:.6}, {:.6}, {:.6}",
+                parsed.stats.bounds.min.x, parsed.stats.bounds.min.y, parsed.stats.bounds.min.z
+            );
+            println!(
+                "bounds max: {:.6}, {:.6}, {:.6}",
+                parsed.stats.bounds.max.x, parsed.stats.bounds.max.y, parsed.stats.bounds.max.z
+            );
+            println!(
+                "map ms: {:.3}",
+                parsed.timings.map_file.as_secs_f64() * 1000.0
+            );
+            println!(
+                "validate ms: {:.3}",
+                parsed.timings.validate.as_secs_f64() * 1000.0
+            );
+            println!(
+                "parse ms: {:.3}",
+                parsed.timings.parse.as_secs_f64() * 1000.0
+            );
         }
         None => {
             if let Some(path) = cli.input {
