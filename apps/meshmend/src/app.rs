@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -9,7 +10,7 @@ use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_analysis::AnalysisReport;
-use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
+use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats, TriangleId};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_project::{
     now_unix_ms, project_directory_from_selection, ExportKind, MeshMendProject, OperationKind,
@@ -20,7 +21,9 @@ use meshmend_render::{
     SelectionSummary, WgpuRenderer,
 };
 use meshmend_stl::{load_binary_stl, ParsedStl};
-use meshmend_worker_api::{discover_worker_binary, WorkerOperation, WorkerRequest, WorkerRunner};
+use meshmend_worker_api::{
+    discover_worker_binary, WorkerOperation, WorkerRequest, WorkerRunner, WorkerStroke,
+};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
@@ -191,6 +194,7 @@ struct BrushToolState {
     kind: BrushLabelKind,
     size_units: f32,
     min_screen_spacing: f32,
+    max_faces_per_dab: usize,
     active_stroke_index: Option<usize>,
     last_sample_screen: Option<glam::Vec2>,
 }
@@ -212,6 +216,13 @@ struct MeasureToolState {
 #[derive(Debug, Clone)]
 struct RemeshToolState {
     target_edge_length: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BrushSelectionPayload {
+    selected_faces: Vec<u64>,
+    strokes: Vec<WorkerStroke>,
+    selection: Vec<SelectionReference>,
 }
 
 impl Default for RemeshToolState {
@@ -258,8 +269,9 @@ impl Default for BrushToolState {
         Self {
             enabled: false,
             kind: BrushLabelKind::default(),
-            size_units: 40.0,
-            min_screen_spacing: 10.0,
+            size_units: 14.0,
+            min_screen_spacing: 6.0,
+            max_faces_per_dab: 750,
             active_stroke_index: None,
             last_sample_screen: None,
         }
@@ -1573,7 +1585,7 @@ fn handle_ui_action(
                 session.remove_label_stroke(index);
                 update_label_strokes(renderer, session);
                 brush_tool.finish_stroke();
-                *status = "Deleted brush label".to_string();
+                *status = "Deleted repair region".to_string();
                 *needs_redraw = true;
             }
         }
@@ -1644,6 +1656,9 @@ fn handle_ui_action(
                 "hole-fill",
                 None,
                 serde_json::json!({}),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 renderer,
                 window,
                 model_info,
@@ -1662,6 +1677,12 @@ fn handle_ui_action(
             let target_edge_length = model_info
                 .as_ref()
                 .map(|model| f64::from(model.brush_unit.max(f32::EPSILON)) * 4.0);
+            let brush_payload = brush_selection_payload(issue_session.as_ref());
+            if brush_payload.selected_faces.is_empty() {
+                *status = "Paint a surface ring before applying local wrap".to_string();
+                *needs_redraw = true;
+                return;
+            }
             apply_worker_mesh_revision(
                 "meshmend-openvdb-worker",
                 WorkerOperation::LocalSdfWrap,
@@ -1669,11 +1690,13 @@ fn handle_ui_action(
                 "local-wrap",
                 target_edge_length,
                 serde_json::json!({
-                    "brush_strokes": issue_session
-                        .as_ref()
-                        .map(|session| session.label_strokes.len())
-                        .unwrap_or(0),
+                    "brush_strokes": brush_payload.strokes.len(),
+                    "selected_faces": brush_payload.selected_faces.len(),
+                    "repair_input": "painted_surface_ring",
                 }),
+                brush_payload.selection,
+                brush_payload.selected_faces,
+                brush_payload.strokes,
                 renderer,
                 window,
                 model_info,
@@ -1703,6 +1726,9 @@ fn handle_ui_action(
                     "plane_offset": cross_section.offset,
                     "keep": keep,
                 }),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 renderer,
                 window,
                 model_info,
@@ -1727,6 +1753,9 @@ fn handle_ui_action(
                 serde_json::json!({
                     "target_edge_length": remesh_tool.target_edge_length,
                 }),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 renderer,
                 window,
                 model_info,
@@ -1763,6 +1792,9 @@ fn apply_worker_mesh_revision(
     label: &str,
     target_edge_length: Option<f64>,
     options: serde_json::Value,
+    selection: Vec<SelectionReference>,
+    selected_faces: Vec<u64>,
+    worker_strokes: Vec<WorkerStroke>,
     renderer: &mut WgpuRenderer<'_>,
     window: &Window,
     model_info: &mut Option<ModelInfo>,
@@ -1808,7 +1840,7 @@ fn apply_worker_mesh_revision(
             "target_edge_length": target_edge_length,
             "options": options.clone(),
         }),
-        Vec::new(),
+        selection,
     );
 
     let result = run_worker_mesh_operation(
@@ -1818,6 +1850,8 @@ fn apply_worker_mesh_revision(
         &output_mesh,
         target_edge_length,
         options,
+        selected_faces,
+        worker_strokes,
         label,
     )
     .and_then(|()| load_model(&output_mesh, renderer, window));
@@ -1867,6 +1901,7 @@ fn apply_worker_mesh_revision(
     *needs_redraw = true;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker_mesh_operation(
     worker_binary_name: &str,
     worker_operation: WorkerOperation,
@@ -1874,6 +1909,8 @@ fn run_worker_mesh_operation(
     output_mesh: &Path,
     target_edge_length: Option<f64>,
     options: serde_json::Value,
+    selected_faces: Vec<u64>,
+    worker_strokes: Vec<WorkerStroke>,
     label: &str,
 ) -> Result<()> {
     let binary = discover_worker_binary(worker_binary_name).ok_or_else(|| {
@@ -1887,6 +1924,8 @@ fn run_worker_mesh_operation(
     request.output_mesh = Some(output_mesh.to_path_buf());
     request.preview = false;
     request.target_edge_length = target_edge_length;
+    request.selected_faces = selected_faces;
+    request.strokes = worker_strokes;
     request.options = options;
     let result = WorkerRunner::new(binary).run(&request, &request_path)?;
     if !result.response.success {
@@ -2110,6 +2149,68 @@ fn selection_reference_from_pick(pick: PickResult) -> SelectionReference {
     }
 }
 
+fn brush_selection_payload(session: Option<&IssueSession>) -> BrushSelectionPayload {
+    let Some(session) = session else {
+        return BrushSelectionPayload::default();
+    };
+
+    let mut seen_faces = HashSet::new();
+    let mut selected_faces = Vec::new();
+    let mut selection = Vec::new();
+    let mut strokes = Vec::new();
+
+    for stroke in session
+        .label_strokes
+        .iter()
+        .filter(|stroke| !stroke.samples.is_empty())
+    {
+        let points = stroke
+            .samples
+            .iter()
+            .map(|sample| {
+                if seen_faces.insert(sample.triangle) {
+                    selected_faces.push(worker_face_id(sample.triangle));
+                    selection.push(SelectionReference {
+                        triangle_chunk: sample.triangle.chunk,
+                        triangle_local_index: sample.triangle.local_index,
+                        position: sample.position,
+                    });
+                }
+                sample.position
+            })
+            .collect();
+
+        strokes.push(WorkerStroke {
+            kind: stroke.kind.label().to_string(),
+            radius: stroke.radius,
+            points,
+        });
+    }
+
+    BrushSelectionPayload {
+        selected_faces,
+        strokes,
+        selection,
+    }
+}
+
+fn brush_region_counts(session: Option<&IssueSession>) -> (usize, usize) {
+    let Some(session) = session else {
+        return (0, 0);
+    };
+    let mut faces = HashSet::new();
+    for stroke in &session.label_strokes {
+        for sample in &stroke.samples {
+            faces.insert(sample.triangle);
+        }
+    }
+    (session.label_strokes.len(), faces.len())
+}
+
+fn worker_face_id(triangle: TriangleId) -> u64 {
+    (u64::from(triangle.chunk) << 32) | u64::from(triangle.local_index)
+}
+
 fn hash_file_fnv1a64(path: &Path) -> Result<String> {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -2239,11 +2340,38 @@ fn sample_label_brush(
 
     match renderer.pick(screen_position) {
         Ok(Some(pick)) => {
-            session.add_label_sample(stroke_index, pick.triangle_id, pick.position.to_array());
+            let region = renderer.surface_brush_region(pick, brush_radius, brush.max_faces_per_dab);
+            let existing = session
+                .label_strokes
+                .get(stroke_index)
+                .map(|stroke| {
+                    stroke
+                        .samples
+                        .iter()
+                        .map(|sample| sample.triangle)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let mut seen = existing;
+            let mut added = 0_usize;
+            for face in &region {
+                if seen.insert(face.triangle_id) {
+                    session.add_label_sample(
+                        stroke_index,
+                        face.triangle_id,
+                        face.position.to_array(),
+                    );
+                    added += 1;
+                }
+            }
             brush.last_sample_screen = Some(screen_position);
             *selected_pick = Some(pick);
             update_label_strokes(renderer, session);
-            *status = format!("Painted {}", brush.kind.label());
+            *status = format!(
+                "Selected {} surface triangles ({})",
+                added,
+                brush.kind.label()
+            );
             *needs_redraw = true;
         }
         Ok(None) => {}
@@ -2328,10 +2456,10 @@ fn draw_ui(
 ) {
     egui::SidePanel::left("tool_palette")
         .resizable(false)
-        .exact_width(56.0)
+        .exact_width(154.0)
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.add_space(6.0);
                 for mode in ToolMode::ALL {
                     if tool_button(ui, mode, *tool_mode == mode).clicked() {
                         set_tool_mode(tool_mode, brush_tool, mode);
@@ -2402,7 +2530,7 @@ fn draw_ui(
 
     egui::SidePanel::right("repair_panel")
         .resizable(false)
-        .default_width(340.0)
+        .default_width(310.0)
         .show(ctx, |ui| {
             draw_repair_panel(
                 ui,
@@ -2418,7 +2546,6 @@ fn draw_ui(
                 measure_tool,
                 remesh_tool,
                 *tool_mode,
-                *view_mode,
                 gpu_buffer_bytes,
                 action,
             );
@@ -2436,7 +2563,7 @@ fn draw_ui(
 }
 
 fn tool_button(ui: &mut egui::Ui, mode: ToolMode, selected: bool) -> egui::Response {
-    let size = egui::vec2(40.0, 40.0);
+    let size = egui::vec2((ui.available_width() - 8.0).max(120.0), 38.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let hovered = response.hovered();
     let visuals = ui.visuals();
@@ -2459,7 +2586,25 @@ fn tool_button(ui: &mut egui::Ui, mode: ToolMode, selected: bool) -> egui::Respo
         egui::Rounding::same(6.0),
         egui::Stroke::new(1.0, stroke_color),
     );
-    draw_tool_icon(painter, rect.shrink(8.0), mode, stroke_color);
+    let icon_rect = egui::Rect::from_min_size(
+        rect.left_center() + egui::vec2(10.0, -11.0),
+        egui::vec2(22.0, 22.0),
+    );
+    draw_tool_icon(painter, icon_rect, mode, stroke_color);
+    painter.text(
+        rect.left_center() + egui::vec2(42.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        mode.label(),
+        egui::FontId::proportional(13.0),
+        stroke_color,
+    );
+    painter.text(
+        rect.right_center() + egui::vec2(-10.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        mode.shortcut(),
+        egui::FontId::monospace(11.0),
+        stroke_color.gamma_multiply(0.72),
+    );
     response.on_hover_text(mode.tooltip())
 }
 
@@ -2556,14 +2701,13 @@ fn draw_repair_panel(
     measure_tool: &mut MeasureToolState,
     remesh_tool: &mut RemeshToolState,
     tool_mode: ToolMode,
-    view_mode: ViewMode,
     gpu_buffer_bytes: u64,
     action: &mut UiAction,
 ) {
-    ui.heading("Repair");
-    ui.label(format!("Tool: {}", tool_mode.label()));
-    ui.label(format!("View: {}", view_mode.label()));
-    draw_project_controls(ui, project, action);
+    ui.heading(tool_mode.label());
+    egui::CollapsingHeader::new("Project")
+        .default_open(false)
+        .show(ui, |ui| draw_project_controls(ui, project, action));
 
     let Some(model) = model_info else {
         ui.separator();
@@ -2596,7 +2740,8 @@ fn draw_repair_panel(
         ToolMode::Measure => draw_measure_tools(ui, selected_pick, project, measure_tool, action),
         ToolMode::Remesh => draw_remesh_tools(ui, project, remesh_tool, action),
         ToolMode::Export => draw_export_tools(ui, project, action),
-        ToolMode::Select | ToolMode::Navigate | ToolMode::XrayInspect => {
+        ToolMode::Select | ToolMode::Navigate => draw_selection_tools(ui, selected_pick),
+        ToolMode::XrayInspect => {
             draw_cross_section_tools(ui, model, cross_section, action);
             ui.separator();
             draw_defect_tools(
@@ -2611,7 +2756,11 @@ fn draw_repair_panel(
     }
 
     ui.separator();
-    draw_operation_history(ui, issue_session, project, action);
+    egui::CollapsingHeader::new("Operations")
+        .default_open(false)
+        .show(ui, |ui| {
+            draw_operation_history(ui, issue_session, project, action)
+        });
 }
 
 fn draw_model_summary(
@@ -2716,6 +2865,22 @@ fn draw_project_controls(
     }
 }
 
+fn draw_selection_tools(ui: &mut egui::Ui, selected_pick: Option<PickResult>) {
+    ui.heading("Selection");
+    if let Some(pick) = selected_pick {
+        ui.label(format!(
+            "Triangle {}:{}",
+            pick.triangle_id.chunk, pick.triangle_id.local_index
+        ));
+        ui.monospace(format!(
+            "{:.4}, {:.4}, {:.4}",
+            pick.position.x, pick.position.y, pick.position.z
+        ));
+    } else {
+        ui.label("No surface selected");
+    }
+}
+
 fn draw_cross_section_tools(
     ui: &mut egui::Ui,
     model: &ModelInfo,
@@ -2761,9 +2926,10 @@ fn draw_repair_brush_tools(
     brush_tool: &mut BrushToolState,
     action: &mut UiAction,
 ) {
-    ui.heading("Repair Brush");
-    ui.label("Paint regions that feed repair operations.");
-    egui::ComboBox::from_label("Region")
+    ui.heading("Surface Ring Brush");
+    let (stroke_count, selected_face_count) = brush_region_counts(issue_session.as_ref());
+
+    egui::ComboBox::from_label("Paint")
         .selected_text(brush_tool.kind.label())
         .show_ui(ui, |ui| {
             for kind in BrushLabelKind::ALL {
@@ -2771,15 +2937,24 @@ fn draw_repair_brush_tools(
             }
         });
 
-    ui.add(egui::Slider::new(&mut brush_tool.size_units, 1.0..=200.0).text("Brush radius"));
-    ui.label(format!(
-        "World radius: {:.5}",
-        brush_tool.world_radius(model)
-    ));
+    ui.add(egui::Slider::new(&mut brush_tool.size_units, 1.0..=220.0).text("Brush size"));
+    ui.add(
+        egui::Slider::new(&mut brush_tool.max_faces_per_dab, 20..=5_000).text("Max faces / dab"),
+    );
     ui.add(egui::Slider::new(&mut brush_tool.min_screen_spacing, 2.0..=32.0).text("Spacing"));
+    ui.small(format!(
+        "World radius {:.5} | {} strokes | {} selected faces",
+        brush_tool.world_radius(model),
+        stroke_count,
+        selected_face_count
+    ));
 
     ui.horizontal(|ui| {
-        if ui.button("Apply Local Wrap").clicked() {
+        let can_apply = selected_face_count > 0;
+        if ui
+            .add_enabled(can_apply, egui::Button::new("Cap / Wrap Opening"))
+            .clicked()
+        {
             *action = UiAction::ApplyLocalWrap;
         }
         if ui.button("Clear Regions").clicked() {
@@ -2790,12 +2965,12 @@ fn draw_repair_brush_tools(
     if let Some(session) = issue_session.as_mut() {
         if !session.label_strokes.is_empty() {
             ui.separator();
-            ui.label("Repair regions");
+            ui.label("Painted surface rings");
         }
         for (index, stroke) in session.label_strokes.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!(
-                    "{}: {} samples",
+                    "{}: {} faces",
                     stroke.kind.label(),
                     stroke.samples.len()
                 ));
@@ -2939,7 +3114,6 @@ fn draw_operation_history(
     project: Option<&MeshMendProject>,
     action: &mut UiAction,
 ) {
-    ui.heading("Operations");
     if let Some(project) = project {
         if project.operations.is_empty() {
             ui.label("No project operations recorded");

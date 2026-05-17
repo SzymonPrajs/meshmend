@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+};
 
 use glam::Vec3;
 use meshmend_core::{CrossSectionPlane, MeshBounds, Triangle, TriangleId};
@@ -79,6 +82,7 @@ pub struct IndexedFace {
 #[derive(Debug, Clone)]
 pub struct MeshConnectivity {
     pub edges: Vec<EdgeRecord>,
+    pub face_edges: Vec<[u32; 3]>,
     pub boundary_edges: Vec<u32>,
     pub non_manifold_edges: Vec<u32>,
     pub boundary_loops: Vec<BoundaryLoop>,
@@ -90,10 +94,11 @@ impl MeshConnectivity {
     fn build(faces: &[IndexedFace]) -> Self {
         let mut edge_lookup = HashMap::<EdgeKey, usize>::new();
         let mut edges = Vec::<EdgeRecord>::new();
+        let mut face_edges = vec![[0_u32; 3]; faces.len()];
         let mut union = UnionFind::new(faces.len());
 
         for (face_index, face) in faces.iter().enumerate() {
-            for [a, b] in face_edges(face.indices) {
+            for (edge_slot, [a, b]) in face_index_edges(face.indices).into_iter().enumerate() {
                 let key = EdgeKey::new(a, b);
                 let edge_index = *edge_lookup.entry(key).or_insert_with(|| {
                     let index = edges.len();
@@ -103,6 +108,7 @@ impl MeshConnectivity {
                     });
                     index
                 });
+                face_edges[face_index][edge_slot] = edge_index as u32;
                 edges[edge_index].faces.push(face_index as u32);
             }
         }
@@ -138,6 +144,7 @@ impl MeshConnectivity {
 
         Self {
             edges,
+            face_edges,
             boundary_edges,
             non_manifold_edges,
             boundary_loops,
@@ -164,6 +171,7 @@ pub struct BoundaryLoop {
 pub struct SelectionMesh {
     pub mesh: IndexedMesh,
     bvh: Bvh,
+    source_faces: HashMap<TriangleId, u32>,
 }
 
 impl SelectionMesh {
@@ -173,7 +181,17 @@ impl SelectionMesh {
     ) -> Self {
         let mesh = IndexedMesh::from_triangles(triangles, weld_tolerance);
         let bvh = Bvh::build(&mesh);
-        Self { mesh, bvh }
+        let source_faces = mesh
+            .faces
+            .iter()
+            .enumerate()
+            .map(|(index, face)| (face.source_id, index as u32))
+            .collect();
+        Self {
+            mesh,
+            bvh,
+            source_faces,
+        }
     }
 
     pub fn hit_stack(
@@ -199,6 +217,64 @@ impl SelectionMesh {
         });
         hits
     }
+
+    pub fn surface_faces_within_radius(
+        &self,
+        source_id: TriangleId,
+        center: Vec3,
+        radius: f32,
+        max_faces: usize,
+    ) -> Vec<SurfaceBrushFace> {
+        let Some(&start_face) = self.source_faces.get(&source_id) else {
+            return Vec::new();
+        };
+        let radius = radius.max(f32::EPSILON);
+        let expansion_radius = radius * 1.75;
+        let mut visited = vec![false; self.mesh.faces.len()];
+        let mut queue = VecDeque::from([start_face]);
+        let mut selected = Vec::new();
+
+        while let Some(face_index) = queue.pop_front() {
+            let face_slot = face_index as usize;
+            if visited[face_slot] {
+                continue;
+            }
+            visited[face_slot] = true;
+
+            let face = self.mesh.faces[face_slot];
+            let centroid = face_centroid(&self.mesh, face);
+            let distance = centroid.distance(center);
+            if face_index == start_face || distance <= radius {
+                selected.push(SurfaceBrushFace {
+                    source_id: face.source_id,
+                    center: centroid,
+                    component_id: self.mesh.connectivity.component_ids[face_slot],
+                    distance,
+                });
+                if selected.len() >= max_faces {
+                    break;
+                }
+            }
+            if distance > expansion_radius {
+                continue;
+            }
+
+            for edge_index in self.mesh.connectivity.face_edges[face_slot] {
+                for &neighbor in &self.mesh.connectivity.edges[edge_index as usize].faces {
+                    if !visited[neighbor as usize] {
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        selected.sort_by(|left, right| {
+            left.distance
+                .partial_cmp(&right.distance)
+                .unwrap_or(Ordering::Equal)
+        });
+        selected
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -210,6 +286,14 @@ pub struct IntersectionHit {
     pub position: Vec3,
     pub normal: Vec3,
     pub front_face: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceBrushFace {
+    pub source_id: TriangleId,
+    pub center: Vec3,
+    pub component_id: u32,
+    pub distance: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -451,12 +535,17 @@ impl EdgeKey {
     }
 }
 
-fn face_edges(indices: [u32; 3]) -> [[u32; 2]; 3] {
+fn face_index_edges(indices: [u32; 3]) -> [[u32; 2]; 3] {
     [
         [indices[0], indices[1]],
         [indices[1], indices[2]],
         [indices[2], indices[0]],
     ]
+}
+
+fn face_centroid(mesh: &IndexedMesh, face: IndexedFace) -> Vec3 {
+    let [a, b, c] = face.indices.map(|index| mesh.vertices[index as usize]);
+    (a + b + c) / 3.0
 }
 
 fn trace_boundary_loops(edges: &[EdgeRecord], boundary_edges: &[u32]) -> Vec<BoundaryLoop> {
@@ -775,6 +864,36 @@ mod tests {
 
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|hit| hit.position.z >= 0.0));
+    }
+
+    #[test]
+    fn brush_radius_selects_neighboring_surface_faces() {
+        let selection = SelectionMesh::from_triangles(
+            vec![
+                (
+                    id(0),
+                    tri(
+                        Vec3::new(0.0, 0.0, 0.0),
+                        Vec3::new(1.0, 0.0, 0.0),
+                        Vec3::new(1.0, 1.0, 0.0),
+                    ),
+                ),
+                (
+                    id(1),
+                    tri(
+                        Vec3::new(0.0, 0.0, 0.0),
+                        Vec3::new(1.0, 1.0, 0.0),
+                        Vec3::new(0.0, 1.0, 0.0),
+                    ),
+                ),
+            ],
+            1.0e-6,
+        );
+
+        let faces = selection.surface_faces_within_radius(id(0), Vec3::new(0.5, 0.5, 0.0), 0.8, 8);
+
+        assert_eq!(faces.len(), 2);
+        assert!(faces.iter().any(|face| face.source_id == id(1)));
     }
 
     fn id(local_index: u32) -> TriangleId {

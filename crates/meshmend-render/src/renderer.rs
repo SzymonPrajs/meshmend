@@ -916,6 +916,27 @@ impl<'window> WgpuRenderer<'window> {
             .collect())
     }
 
+    pub fn surface_brush_region(
+        &self,
+        seed: PickResult,
+        radius: f32,
+        max_faces: usize,
+    ) -> Vec<PickResult> {
+        self.selection_mesh
+            .as_ref()
+            .map(|selection_mesh| {
+                selection_mesh
+                    .surface_faces_within_radius(seed.triangle_id, seed.position, radius, max_faces)
+                    .into_iter()
+                    .map(|face| PickResult {
+                        triangle_id: face.source_id,
+                        position: face.center,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![seed])
+    }
+
     pub fn set_selection_marker(&mut self, position: Option<Vec3>) {
         self.selection_marker = position.map(|position| {
             SceneLines::marker(
@@ -1349,20 +1370,23 @@ impl SceneLines {
     fn label_strokes(device: &wgpu::Device, strokes: &[LabelStrokeOverlay]) -> Self {
         let mut vertices = Vec::new();
         for stroke in strokes {
-            for segment in stroke.points.windows(2) {
-                vertices.push(LineVertex {
-                    position: segment[0].to_array(),
-                    color: stroke.color,
-                });
-                vertices.push(LineVertex {
-                    position: segment[1].to_array(),
-                    color: stroke.color,
-                });
+            if stroke.points.len() <= 64 {
+                for segment in stroke.points.windows(2) {
+                    vertices.push(LineVertex {
+                        position: segment[0].to_array(),
+                        color: stroke.color,
+                    });
+                    vertices.push(LineVertex {
+                        position: segment[1].to_array(),
+                        color: stroke.color,
+                    });
+                }
             }
 
             let radius = stroke.radius.max(0.001);
+            let ring_step = (stroke.points.len() / 96).max(1);
             for (index, point) in stroke.points.iter().enumerate() {
-                if index % 2 == 0 || index + 1 == stroke.points.len() {
+                if index % ring_step == 0 || index + 1 == stroke.points.len() {
                     Self::push_ring(
                         &mut vertices,
                         *point,

@@ -59,16 +59,16 @@ impl BrushLabelKind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::HealthyBoundary => "Healthy boundary",
-            Self::RepairTarget => "Repair target",
-            Self::Exclude => "Exclude",
+            Self::HealthyBoundary => "Keep ring",
+            Self::RepairTarget => "Fill target",
+            Self::Exclude => "Protect",
         }
     }
 
     pub fn color(self) -> [f32; 4] {
         match self {
-            Self::HealthyBoundary => [0.26, 0.92, 0.55, 1.0],
-            Self::RepairTarget => [1.0, 0.45, 0.28, 1.0],
+            Self::HealthyBoundary => [1.0, 0.84, 0.12, 1.0],
+            Self::RepairTarget => [1.0, 0.25, 0.16, 1.0],
             Self::Exclude => [0.55, 0.66, 1.0, 1.0],
         }
     }
