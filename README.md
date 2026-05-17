@@ -1,4 +1,4 @@
-# 3D Modelling
+# MeshMend
 
 This workspace is now focused on MeshMend, a clean Tauri STL viewer prototype
 for inspecting and later repairing AI-generated mesh files.
