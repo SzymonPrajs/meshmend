@@ -54,35 +54,34 @@ The intended stack is:
 Current implementation commands:
 
 ```bash
-npm run dev
-cargo run -p meshmend
-cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
-cargo run -p meshmend -- fixtures/stl/cube_binary.stl
-cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
-cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
-cargo run -p meshmend -- --cross-section-screenshot fixtures/stl/cube_binary.stl outputs/cube-cross-section.png
-cargo run -p meshmend -- --screenshot fixtures/stl/cube_binary.stl outputs/cube.png
-cargo run -p meshmend -- perf fixtures/stl/cube_binary.stl --output outputs/perf-cube.json
+just run
+just run-file fixtures/stl/cube_binary.stl
+just build
+just release
+just test
+just lint
+just verify
+just smoke
+just verify-rose
+just perf fixtures/stl/cube_binary.stl
 ```
 
-The Codex app run action can use the root `npm run dev` script. It starts the
+The Codex app run action uses the root `just run` recipe. It starts the
 native viewer with `rose/raw.stl` when that ignored local asset is present, and
 otherwise opens the viewer without an initial STL.
 
 Verification:
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --workspace --release
+just lint
+just test
+just release
+just verify
 ```
 
 Local large-model checks use the ignored file:
 
 ```bash
-cargo run -p meshmend -- inspect rose/raw.stl --parallel
-cargo run -p meshmend -- rose/raw.stl
-cargo run -p meshmend -- --verify-render rose/raw.stl
-cargo run -p meshmend -- perf rose/raw.stl --output outputs/perf-rose.json
+just verify-rose
+just perf rose/raw.stl
 ```

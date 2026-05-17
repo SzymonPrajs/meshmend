@@ -1,9 +1,9 @@
 # Agent Notes
 
 This workspace has pivoted away from the failed global mesh-repair experiments.
-The active direction is MeshMend, a native Rust STL inspection app for viewing,
-cross-section inspection, issue marking, and later repairing AI-generated mesh
-files.
+The active direction is MeshMend, a native Rust STL repair workstation for
+viewing, inspecting, repairing, remeshing, validating, and exporting
+AI-generated mesh files for resin printing.
 
 ## Current Boundary
 
@@ -12,8 +12,17 @@ Build toward:
 - a local native desktop app
 - STL input only
 - orbit, pan, and zoom viewing
-- a clean foundation for cross-section inspection, brush labels, issue marking,
-  validation, and later repair tools
+- cross-section and x-ray inspection
+- repair-first tools for holes, local cavities, cuts, physical scale, remeshing,
+  validation, and export
+
+The single source of truth is:
+
+```text
+docs/meshmend-master-plan.md
+```
+
+Follow that plan phase by phase. Do not create separate plan files.
 
 Do not revive the old Python repair pipeline as active product code. It is
 archived at:
@@ -41,16 +50,13 @@ planning files, not raw model data.
 - Put the app under `apps/meshmend/`.
 - Use a Rust workspace with `winit`, native `wgpu`, and `egui`.
 - Keep the hot path in Rust: STL parsing, validation, chunking, GPU upload,
-  camera math, picking, brush labels, issue marking, screenshots, and
-  performance metrics.
+  camera math, indexed mesh storage, topology, BVH picking, project state,
+  screenshots, and performance metrics.
 - Do not reintroduce the Three.js/Vite/Tauri webview viewer as active product
   code.
-- Keep the native viewer focused on inspection. Cross-section inspection, brush
-  labels, and manual issue marking are active product features.
-- Local repair should start from brush labels as described in
-  `docs/architecture/local-heal.md`.
-- Do not build global repair, mesh simplification, printable slicing/layer
-  export, ROI tools, or automatic defect classification yet.
+- Keep C++ geometry work isolated in process workers where the master plan calls
+  for CGAL or OpenVDB.
+- Do not use the old Python repair pipeline as active product code.
 - Keep source assets and generated app artifacts separate.
 - Keep generated build outputs, Rust `target`, large STL outputs, and local
   raw model files ignored.
@@ -68,15 +74,15 @@ The current inspection milestone is complete when:
 - basic selection, issue marking, screenshots, and performance metrics work
 - a cross-section plane can inspect hidden internal geometry along X, Y, or Z
 - brush labels can mark healthy boundary and repair target regions
+- the app follows the current master plan phase being implemented
 
-Anything beyond that belongs to a later milestone.
+The master plan supersedes this historical inspection milestone when the two
+conflict.
 
 Use these checks after native viewer changes:
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
-cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
+just lint
+just test
+just verify
 ```
