@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use meshmend_stl::{load_binary_stl_with_options, LoadOptions};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod app;
+
 #[derive(Debug, Parser)]
 #[command(name = "meshmend")]
 #[command(about = "Native MeshMend STL inspection app")]
@@ -14,6 +16,9 @@ struct Cli {
 
     #[arg(value_name = "STL")]
     input: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    smoke_window: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,11 +71,7 @@ fn main() -> Result<()> {
             );
         }
         None => {
-            if let Some(path) = cli.input {
-                println!("MeshMend native app placeholder: {}", path.display());
-            } else {
-                println!("MeshMend native app placeholder");
-            }
+            app::run_native(cli.input, cli.smoke_window)?;
         }
     }
 

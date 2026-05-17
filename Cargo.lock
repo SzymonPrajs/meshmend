@@ -1595,6 +1595,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "winit",
 ]
 
 [[package]]
