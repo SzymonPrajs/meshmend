@@ -1,8 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    Open,
-    Save,
-    Export,
     Rendered,
     Wireframe,
     SurfaceWire,
@@ -13,7 +10,6 @@ pub enum Icon {
     Headlight,
     Fit,
     Reset,
-    Keyboard,
 }
 
 pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui::Color32) {
@@ -33,25 +29,6 @@ pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: e
     };
 
     match icon {
-        Icon::Open => {
-            painter.rect_stroke(r(3.0, 8.0, 21.0, 19.0), egui::Rounding::same(2.0), stroke);
-            line(p(4.0, 8.0), p(9.0, 5.0), stroke);
-            line(p(9.0, 5.0), p(13.0, 8.0), stroke);
-            line(p(13.0, 8.0), p(20.0, 8.0), stroke);
-        }
-        Icon::Save => {
-            painter.rect_stroke(r(5.0, 4.0, 19.0, 20.0), egui::Rounding::same(2.0), stroke);
-            painter.rect_stroke(r(8.0, 5.5, 16.0, 10.0), egui::Rounding::same(1.0), soft);
-            painter.rect_stroke(r(8.0, 14.0, 16.0, 20.0), egui::Rounding::same(1.0), soft);
-            line(p(16.0, 5.0), p(19.0, 8.0), stroke);
-        }
-        Icon::Export => {
-            painter.rect_stroke(r(5.0, 8.0, 19.0, 20.0), egui::Rounding::same(2.0), stroke);
-            line(p(12.0, 4.0), p(12.0, 15.0), stroke);
-            line(p(12.0, 4.0), p(8.0, 8.0), stroke);
-            line(p(12.0, 4.0), p(16.0, 8.0), stroke);
-            line(p(8.0, 15.0), p(16.0, 15.0), stroke);
-        }
         Icon::Rendered => {
             cube(p, painter, stroke, soft);
             line(p(12.0, 3.0), p(12.0, 12.0), soft);
@@ -116,13 +93,6 @@ pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: e
             line(p(7.0, 8.0), p(7.0, 4.0), stroke);
             line(p(7.0, 4.0), p(11.0, 4.0), stroke);
             line(p(7.0, 4.0), p(9.0, 7.0), stroke);
-        }
-        Icon::Keyboard => {
-            painter.rect_stroke(r(4.0, 7.0, 20.0, 17.0), egui::Rounding::same(2.0), stroke);
-            for x in [7.0, 10.5, 14.0, 17.5] {
-                painter.circle_filled(p(x, 10.0), rect.width() * 0.025, color);
-            }
-            line(p(7.0, 14.0), p(17.0, 14.0), soft);
         }
     }
 }

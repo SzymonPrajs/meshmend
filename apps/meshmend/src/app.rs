@@ -15,7 +15,7 @@ use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowBuilder},
 };
@@ -26,6 +26,16 @@ use crate::{
 };
 
 const FPS_DISPLAY_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+enum AppEvent {
+    Menu(muda::MenuEvent),
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Clone)]
+enum AppEvent {}
 
 #[derive(Debug, Clone)]
 struct ModelInfo {
@@ -45,7 +55,301 @@ enum UiAction {
     Fit,
     Reset,
     Quit,
+    ShowShortcuts,
     SetView(ViewMode),
+}
+
+#[cfg(target_os = "macos")]
+struct NativeAppMenu {
+    _menu: muda::Menu,
+    save: muda::MenuItem,
+    save_as: muda::MenuItem,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeAppMenu {
+    fn install(event_loop: &EventLoop<AppEvent>) -> Result<Self> {
+        use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+        let proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
+        let menu_proxy = Arc::clone(&proxy);
+        muda::MenuEvent::set_event_handler(Some(move |event| {
+            if let Ok(proxy) = menu_proxy.lock() {
+                let _ = proxy.send_event(AppEvent::Menu(event));
+            }
+        }));
+
+        let app_about = PredefinedMenuItem::about(None, None);
+        let app_services = PredefinedMenuItem::services(None);
+        let app_hide = PredefinedMenuItem::hide(None);
+        let app_hide_others = PredefinedMenuItem::hide_others(None);
+        let app_show_all = PredefinedMenuItem::show_all(None);
+        let app_quit = MenuItem::with_id(
+            NativeMenuCommand::Quit.id(),
+            "Quit MeshMend",
+            true,
+            Some(accelerator("cmd+q")?),
+        );
+        let app_menu = Submenu::with_items(
+            "MeshMend",
+            true,
+            &[
+                &app_about,
+                &PredefinedMenuItem::separator(),
+                &app_services,
+                &PredefinedMenuItem::separator(),
+                &app_hide,
+                &app_hide_others,
+                &app_show_all,
+                &PredefinedMenuItem::separator(),
+                &app_quit,
+            ],
+        )?;
+
+        let open = MenuItem::with_id(
+            NativeMenuCommand::OpenStl.id(),
+            "Open STL...",
+            true,
+            Some(accelerator("cmd+o")?),
+        );
+        let save = MenuItem::with_id(
+            NativeMenuCommand::Save.id(),
+            "Save",
+            false,
+            Some(accelerator("cmd+s")?),
+        );
+        let save_as = MenuItem::with_id(
+            NativeMenuCommand::SaveAs.id(),
+            "Save As / Export STL...",
+            false,
+            Some(accelerator("cmd+shift+s")?),
+        );
+        let file_menu = Submenu::with_items(
+            "File",
+            true,
+            &[
+                &open,
+                &PredefinedMenuItem::separator(),
+                &save,
+                &save_as,
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::close_window(None),
+            ],
+        )?;
+
+        let rendered = view_menu_item(NativeMenuCommand::ViewRendered, "Rendered", "1")?;
+        let wireframe = view_menu_item(NativeMenuCommand::ViewWireframe, "Wireframe", "2")?;
+        let surface_wire = view_menu_item(NativeMenuCommand::ViewSurfaceWire, "Surface Wire", "3")?;
+        let xray_wire = view_menu_item(NativeMenuCommand::ViewXrayWire, "X-Ray Wire", "4")?;
+        let transparent = view_menu_item(NativeMenuCommand::ViewTransparent, "Transparent", "5")?;
+        let normals = view_menu_item(NativeMenuCommand::ViewNormals, "Normals", "n")?;
+        let studio = view_menu_item(NativeMenuCommand::ViewStudio, "Studio", "6")?;
+        let headlight = view_menu_item(NativeMenuCommand::ViewHeadlight, "Headlight", "7")?;
+        let frame = MenuItem::with_id(
+            NativeMenuCommand::Fit.id(),
+            "Frame Mesh",
+            true,
+            Some(accelerator("f")?),
+        );
+        let reset = MenuItem::with_id(
+            NativeMenuCommand::Reset.id(),
+            "Reset View",
+            true,
+            Some(accelerator("home")?),
+        );
+        let view_menu = Submenu::with_items(
+            "View",
+            true,
+            &[
+                &rendered,
+                &wireframe,
+                &surface_wire,
+                &xray_wire,
+                &transparent,
+                &normals,
+                &studio,
+                &headlight,
+                &PredefinedMenuItem::separator(),
+                &frame,
+                &reset,
+            ],
+        )?;
+
+        let show_shortcuts = MenuItem::with_id(
+            NativeMenuCommand::ShowShortcuts.id(),
+            "Show Shortcuts",
+            true,
+            Some(accelerator("z")?),
+        );
+        let shortcuts_menu = Submenu::with_items("Shortcuts", true, &[&show_shortcuts])?;
+
+        let minimize = PredefinedMenuItem::minimize(None);
+        let zoom = PredefinedMenuItem::maximize(Some("Zoom"));
+        let bring_all_to_front = PredefinedMenuItem::bring_all_to_front(None);
+        let window_menu = Submenu::with_items(
+            "Window",
+            true,
+            &[
+                &minimize,
+                &zoom,
+                &PredefinedMenuItem::separator(),
+                &bring_all_to_front,
+            ],
+        )?;
+
+        let menu = Menu::with_items(&[
+            &app_menu,
+            &file_menu,
+            &view_menu,
+            &shortcuts_menu,
+            &window_menu,
+        ])?;
+        menu.init_for_nsapp();
+        window_menu.set_as_windows_menu_for_nsapp();
+
+        Ok(Self {
+            _menu: menu,
+            save,
+            save_as,
+        })
+    }
+
+    fn set_model_loaded(&self, loaded: bool) {
+        self.save.set_enabled(loaded);
+        self.save_as.set_enabled(loaded);
+    }
+
+    fn action_for_event(&self, event: &muda::MenuEvent) -> Option<UiAction> {
+        NativeMenuCommand::from_id(event.id().as_ref()).map(NativeMenuCommand::action)
+    }
+
+    fn next_action(&self) -> Option<UiAction> {
+        muda::MenuEvent::receiver()
+            .try_iter()
+            .find_map(|event| self.action_for_event(&event))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+struct NativeAppMenu;
+
+#[cfg(not(target_os = "macos"))]
+impl NativeAppMenu {
+    fn install(_event_loop: &EventLoop<AppEvent>) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn set_model_loaded(&self, _loaded: bool) {}
+
+    fn next_action(&self) -> Option<UiAction> {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeMenuCommand {
+    OpenStl,
+    Save,
+    SaveAs,
+    Fit,
+    Reset,
+    Quit,
+    ShowShortcuts,
+    ViewRendered,
+    ViewWireframe,
+    ViewSurfaceWire,
+    ViewXrayWire,
+    ViewTransparent,
+    ViewNormals,
+    ViewStudio,
+    ViewHeadlight,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeMenuCommand {
+    fn id(self) -> &'static str {
+        match self {
+            Self::OpenStl => "meshmend.open-stl",
+            Self::Save => "meshmend.save",
+            Self::SaveAs => "meshmend.save-as",
+            Self::Fit => "meshmend.fit",
+            Self::Reset => "meshmend.reset",
+            Self::Quit => "meshmend.quit",
+            Self::ShowShortcuts => "meshmend.show-shortcuts",
+            Self::ViewRendered => "meshmend.view.rendered",
+            Self::ViewWireframe => "meshmend.view.wireframe",
+            Self::ViewSurfaceWire => "meshmend.view.surface-wire",
+            Self::ViewXrayWire => "meshmend.view.xray-wire",
+            Self::ViewTransparent => "meshmend.view.transparent",
+            Self::ViewNormals => "meshmend.view.normals",
+            Self::ViewStudio => "meshmend.view.studio",
+            Self::ViewHeadlight => "meshmend.view.headlight",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "meshmend.open-stl" => Self::OpenStl,
+            "meshmend.save" => Self::Save,
+            "meshmend.save-as" => Self::SaveAs,
+            "meshmend.fit" => Self::Fit,
+            "meshmend.reset" => Self::Reset,
+            "meshmend.quit" => Self::Quit,
+            "meshmend.show-shortcuts" => Self::ShowShortcuts,
+            "meshmend.view.rendered" => Self::ViewRendered,
+            "meshmend.view.wireframe" => Self::ViewWireframe,
+            "meshmend.view.surface-wire" => Self::ViewSurfaceWire,
+            "meshmend.view.xray-wire" => Self::ViewXrayWire,
+            "meshmend.view.transparent" => Self::ViewTransparent,
+            "meshmend.view.normals" => Self::ViewNormals,
+            "meshmend.view.studio" => Self::ViewStudio,
+            "meshmend.view.headlight" => Self::ViewHeadlight,
+            _ => return None,
+        })
+    }
+
+    fn action(self) -> UiAction {
+        match self {
+            Self::OpenStl => UiAction::OpenStl,
+            Self::Save => UiAction::Save,
+            Self::SaveAs => UiAction::SaveAs,
+            Self::Fit => UiAction::Fit,
+            Self::Reset => UiAction::Reset,
+            Self::Quit => UiAction::Quit,
+            Self::ShowShortcuts => UiAction::ShowShortcuts,
+            Self::ViewRendered => UiAction::SetView(ViewMode::Rendered),
+            Self::ViewWireframe => UiAction::SetView(ViewMode::Wireframe),
+            Self::ViewSurfaceWire => UiAction::SetView(ViewMode::SurfaceWire),
+            Self::ViewXrayWire => UiAction::SetView(ViewMode::XrayWire),
+            Self::ViewTransparent => UiAction::SetView(ViewMode::Transparent),
+            Self::ViewNormals => UiAction::SetView(ViewMode::Normals),
+            Self::ViewStudio => UiAction::SetView(ViewMode::Studio),
+            Self::ViewHeadlight => UiAction::SetView(ViewMode::Headlight),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn accelerator(input: &str) -> Result<muda::accelerator::Accelerator> {
+    input
+        .parse()
+        .map_err(|err| anyhow!("invalid menu accelerator {input}: {err}"))
+}
+
+#[cfg(target_os = "macos")]
+fn view_menu_item(
+    command: NativeMenuCommand,
+    label: &str,
+    accelerator_text: &str,
+) -> Result<muda::MenuItem> {
+    Ok(muda::MenuItem::with_id(
+        command.id(),
+        label,
+        true,
+        Some(accelerator(accelerator_text)?),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +572,8 @@ pub fn run_native(
     smoke_window: bool,
     smoke_pick_center: bool,
 ) -> Result<()> {
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build()?;
+    let native_menu = NativeAppMenu::install(&event_loop)?;
     let title = initial_file
         .as_ref()
         .and_then(|path| path.file_name())
@@ -294,6 +599,7 @@ pub fn run_native(
     } else {
         None
     };
+    native_menu.set_model_loaded(model_info.is_some());
     let mut status = model_info
         .as_ref()
         .map(|model| format!("Loaded {}", model.file_name))
@@ -325,6 +631,28 @@ pub fn run_native(
         target.set_control_flow(ControlFlow::Wait);
 
         match event {
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(AppEvent::Menu(menu_event)) => {
+                if let Some(action) = native_menu.action_for_event(&menu_event) {
+                    match action {
+                        UiAction::Quit => target.exit(),
+                        UiAction::None => {}
+                        _ => {
+                            handle_ui_action(
+                                action,
+                                &mut renderer,
+                                redraw_window,
+                                &mut model_info,
+                                &mut view_mode,
+                                &mut show_shortcuts,
+                                &mut status,
+                                &mut needs_redraw,
+                            );
+                            native_menu.set_model_loaded(model_info.is_some());
+                        }
+                    }
+                }
+            }
             Event::WindowEvent {
                 window_id: event_window_id,
                 event,
@@ -386,9 +714,11 @@ pub fn run_native(
                                     redraw_window,
                                     &mut model_info,
                                     &mut view_mode,
+                                    &mut show_shortcuts,
                                     &mut status,
                                     &mut needs_redraw,
                                 );
+                                native_menu.set_model_loaded(model_info.is_some());
                             }
                         }
 
@@ -446,6 +776,7 @@ pub fn run_native(
                             &mut status,
                         );
                         needs_redraw = true;
+                        native_menu.set_model_loaded(model_info.is_some());
                     }
                     WindowEvent::MouseInput { state, button, .. } => match state {
                         ElementState::Pressed
@@ -494,9 +825,11 @@ pub fn run_native(
                                         redraw_window,
                                         &mut model_info,
                                         &mut view_mode,
+                                        &mut show_shortcuts,
                                         &mut status,
                                         &mut needs_redraw,
                                     );
+                                    native_menu.set_model_loaded(model_info.is_some());
                                 }
                                 _ => {
                                     handle_ui_action(
@@ -505,9 +838,11 @@ pub fn run_native(
                                         redraw_window,
                                         &mut model_info,
                                         &mut view_mode,
+                                        &mut show_shortcuts,
                                         &mut status,
                                         &mut needs_redraw,
                                     );
+                                    native_menu.set_model_loaded(model_info.is_some());
                                 }
                             }
                         } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ)) {
@@ -518,9 +853,30 @@ pub fn run_native(
                     _ => {}
                 }
             }
-            Event::AboutToWait if needs_redraw => {
-                redraw_window.request_redraw();
-                needs_redraw = false;
+            Event::AboutToWait => {
+                while let Some(action) = native_menu.next_action() {
+                    match action {
+                        UiAction::Quit => target.exit(),
+                        UiAction::None => {}
+                        _ => {
+                            handle_ui_action(
+                                action,
+                                &mut renderer,
+                                redraw_window,
+                                &mut model_info,
+                                &mut view_mode,
+                                &mut show_shortcuts,
+                                &mut status,
+                                &mut needs_redraw,
+                            );
+                            native_menu.set_model_loaded(model_info.is_some());
+                        }
+                    }
+                }
+                if needs_redraw {
+                    redraw_window.request_redraw();
+                    needs_redraw = false;
+                }
             }
             _ => {}
         }
@@ -914,9 +1270,7 @@ fn draw_ui(
     action: &mut UiAction,
     ui_regions: &mut UiInputRegions,
 ) {
-    let top_response = egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-        draw_menu_bar(ui, model_info, view_mode, show_shortcuts, action);
-        ui.separator();
+    let top_response = egui::TopBottomPanel::top("view_toolbar").show(ctx, |ui| {
         ui.horizontal_wrapped(|ui| {
             draw_view_toolbar(ui, view_mode, display_settings, action);
             ui.separator();
@@ -961,128 +1315,6 @@ fn draw_ui(
             ui_regions.add(rect);
         }
     }
-}
-
-fn draw_menu_bar(
-    ui: &mut egui::Ui,
-    model_info: Option<&ModelInfo>,
-    view_mode: ViewMode,
-    show_shortcuts: &mut bool,
-    action: &mut UiAction,
-) {
-    egui::menu::bar(ui, |ui| {
-        ui.menu_button("File", |ui| {
-            if menu_item(ui, Icon::Open, "Open STL", "O").clicked() {
-                *action = UiAction::OpenStl;
-                ui.close_menu();
-            }
-            let has_model = model_info.is_some();
-            if ui
-                .add_enabled_ui(has_model, |ui| menu_item(ui, Icon::Save, "Save", "Cmd+S"))
-                .inner
-                .clicked()
-            {
-                *action = UiAction::Save;
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled_ui(has_model, |ui| {
-                    menu_item(ui, Icon::Export, "Save As / Export STL", "Cmd+Shift+S")
-                })
-                .inner
-                .clicked()
-            {
-                *action = UiAction::SaveAs;
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("Quit").clicked() {
-                *action = UiAction::Quit;
-                ui.close_menu();
-            }
-        });
-
-        ui.menu_button("View", |ui| {
-            for mode in ViewMode::ALL {
-                if menu_selectable(ui, view_mode == mode, mode.label(), mode.shortcut()).clicked() {
-                    *action = UiAction::SetView(mode);
-                    ui.close_menu();
-                }
-            }
-            ui.separator();
-            if menu_item(ui, Icon::Fit, "Frame Mesh", "F").clicked() {
-                *action = UiAction::Fit;
-                ui.close_menu();
-            }
-            if menu_item(ui, Icon::Reset, "Reset View", "Home").clicked() {
-                *action = UiAction::Reset;
-                ui.close_menu();
-            }
-        });
-
-        ui.menu_button("Shortcuts", |ui| {
-            if menu_item(ui, Icon::Keyboard, "Show Shortcuts", "Z").clicked() {
-                *show_shortcuts = true;
-                ui.close_menu();
-            }
-        });
-    });
-}
-
-fn menu_item(ui: &mut egui::Ui, icon: Icon, label: &str, shortcut: &str) -> egui::Response {
-    let height = 28.0;
-    let width = ui.available_width().max(220.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-    let visuals = ui.visuals();
-    if response.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            egui::Rounding::same(4.0),
-            visuals.widgets.hovered.bg_fill,
-        );
-    }
-    let color = visuals.widgets.inactive.fg_stroke.color;
-    let icon_rect = egui::Rect::from_min_size(
-        rect.left_center() + egui::vec2(6.0, -8.0),
-        egui::vec2(16.0, 16.0),
-    );
-    draw_icon(ui.painter(), icon_rect, icon, color);
-    ui.painter().text(
-        rect.left_center() + egui::vec2(32.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(13.0),
-        color,
-    );
-    ui.painter().text(
-        rect.right_center() + egui::vec2(-8.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        shortcut,
-        egui::FontId::monospace(11.0),
-        color.gamma_multiply(0.72),
-    );
-    response
-}
-
-fn menu_selectable(
-    ui: &mut egui::Ui,
-    selected: bool,
-    label: &str,
-    shortcut: &str,
-) -> egui::Response {
-    let text = if selected {
-        format!("✓ {label}")
-    } else {
-        format!("  {label}")
-    };
-    ui.horizontal(|ui| {
-        let response = ui.selectable_label(selected, text);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.monospace(shortcut);
-        });
-        response
-    })
-    .inner
 }
 
 fn draw_view_toolbar(
@@ -1255,17 +1487,24 @@ fn draw_view_switcher(
         .map(|response| response.response.rect)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_ui_action(
     action: UiAction,
     renderer: &mut WgpuRenderer<'_>,
     window: &Window,
     model_info: &mut Option<ModelInfo>,
     view_mode: &mut ViewMode,
+    show_shortcuts: &mut bool,
     status: &mut String,
     needs_redraw: &mut bool,
 ) {
     match action {
         UiAction::None | UiAction::Quit => {}
+        UiAction::ShowShortcuts => {
+            *show_shortcuts = true;
+            *status = "Showing shortcuts".to_string();
+            *needs_redraw = true;
+        }
         UiAction::OpenStl => {
             if let Some(path) = meshmend_io::pick_stl_file() {
                 load_model_into_app(&path, renderer, window, model_info, status);

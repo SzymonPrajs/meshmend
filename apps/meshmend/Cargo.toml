@@ -25,3 +25,6 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda.workspace = true

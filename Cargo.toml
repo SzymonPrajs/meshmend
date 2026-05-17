@@ -30,6 +30,7 @@ egui-winit = "0.27"
 glam = { version = "0.28", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 memmap2 = "0.9"
+muda = "0.19.1"
 pollster = "0.3"
 rayon = "1.10"
 rfd = "0.14"
