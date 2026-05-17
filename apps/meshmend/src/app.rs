@@ -50,6 +50,117 @@ enum UiAction {
     DeleteLabelStroke(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolMode {
+    Select,
+    Navigate,
+    Analyze,
+    CrossSection,
+    XrayInspect,
+    RepairBrush,
+    HoleFill,
+    Cut,
+    Measure,
+    Remesh,
+    Export,
+}
+
+impl ToolMode {
+    const ALL: [Self; 11] = [
+        Self::Select,
+        Self::Navigate,
+        Self::Analyze,
+        Self::CrossSection,
+        Self::XrayInspect,
+        Self::RepairBrush,
+        Self::HoleFill,
+        Self::Cut,
+        Self::Measure,
+        Self::Remesh,
+        Self::Export,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Select => "Select",
+            Self::Navigate => "Navigate",
+            Self::Analyze => "Analyze",
+            Self::CrossSection => "Cross Section",
+            Self::XrayInspect => "X-Ray Inspect",
+            Self::RepairBrush => "Repair Brush",
+            Self::HoleFill => "Hole Fill",
+            Self::Cut => "Cut",
+            Self::Measure => "Measure",
+            Self::Remesh => "Remesh",
+            Self::Export => "Export",
+        }
+    }
+
+    fn shortcut(self) -> &'static str {
+        match self {
+            Self::Select => "1",
+            Self::Navigate => "2",
+            Self::Analyze => "3",
+            Self::CrossSection => "4",
+            Self::XrayInspect => "5",
+            Self::RepairBrush => "6",
+            Self::HoleFill => "7",
+            Self::Cut => "8",
+            Self::Measure => "9",
+            Self::Remesh => "0",
+            Self::Export => "E",
+        }
+    }
+
+    fn tooltip(self) -> String {
+        format!("{} ({})", self.label(), self.shortcut())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Rendered,
+    Headlight,
+    Studio,
+    Normals,
+    SurfaceWire,
+    XrayWire,
+    Transparent,
+    CrossSection,
+    DefectOverlay,
+    ThicknessOverlay,
+}
+
+impl ViewMode {
+    const ALL: [Self; 10] = [
+        Self::Rendered,
+        Self::Headlight,
+        Self::Studio,
+        Self::Normals,
+        Self::SurfaceWire,
+        Self::XrayWire,
+        Self::Transparent,
+        Self::CrossSection,
+        Self::DefectOverlay,
+        Self::ThicknessOverlay,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rendered => "Rendered",
+            Self::Headlight => "Headlight",
+            Self::Studio => "Studio",
+            Self::Normals => "Normals",
+            Self::SurfaceWire => "Surface Wire",
+            Self::XrayWire => "X-Ray Wire",
+            Self::Transparent => "Transparent",
+            Self::CrossSection => "Section",
+            Self::DefectOverlay => "Defects",
+            Self::ThicknessOverlay => "Thickness",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BrushToolState {
     enabled: bool,
@@ -128,6 +239,8 @@ pub fn run_native(
         .unwrap_or_default();
     let mut selected_issue_kind = IssueKind::default();
     let mut brush_tool = BrushToolState::default();
+    let mut tool_mode = ToolMode::Select;
+    let mut view_mode = ViewMode::Headlight;
 
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
@@ -179,6 +292,8 @@ pub fn run_native(
                                 &mut cross_section,
                                 &mut selected_issue_kind,
                                 &mut brush_tool,
+                                &mut tool_mode,
+                                &mut view_mode,
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut display_settings,
@@ -391,6 +506,89 @@ pub fn run_native(
                             }
                             PhysicalKey::Code(KeyCode::KeyR) => {
                                 reset_camera(&mut renderer);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit1) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Select);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit2) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Navigate);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit3) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Analyze);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit4) => {
+                                set_tool_mode(
+                                    &mut tool_mode,
+                                    &mut brush_tool,
+                                    ToolMode::CrossSection,
+                                );
+                                cross_section.enabled = true;
+                                view_mode = ViewMode::CrossSection;
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit5) => {
+                                set_tool_mode(
+                                    &mut tool_mode,
+                                    &mut brush_tool,
+                                    ToolMode::XrayInspect,
+                                );
+                                view_mode = ViewMode::XrayWire;
+                                let mut settings = renderer.display_settings();
+                                apply_view_mode(view_mode, &mut settings, &mut cross_section);
+                                renderer.set_display_settings(settings);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit6) => {
+                                set_tool_mode(
+                                    &mut tool_mode,
+                                    &mut brush_tool,
+                                    ToolMode::RepairBrush,
+                                );
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit7) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::HoleFill);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit8) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Cut);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit9) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Measure);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::Digit0) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Remesh);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::KeyE) => {
+                                set_tool_mode(&mut tool_mode, &mut brush_tool, ToolMode::Export);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::KeyN) => {
+                                view_mode = ViewMode::Normals;
+                                let mut settings = renderer.display_settings();
+                                apply_view_mode(view_mode, &mut settings, &mut cross_section);
+                                renderer.set_display_settings(settings);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::KeyW) => {
+                                view_mode = ViewMode::SurfaceWire;
+                                let mut settings = renderer.display_settings();
+                                apply_view_mode(view_mode, &mut settings, &mut cross_section);
+                                renderer.set_display_settings(settings);
+                                needs_redraw = true;
+                            }
+                            PhysicalKey::Code(KeyCode::KeyX) => {
+                                view_mode = ViewMode::XrayWire;
+                                let mut settings = renderer.display_settings();
+                                apply_view_mode(view_mode, &mut settings, &mut cross_section);
+                                renderer.set_display_settings(settings);
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -1092,6 +1290,47 @@ fn sample_label_brush(
     }
 }
 
+fn set_tool_mode(tool_mode: &mut ToolMode, brush: &mut BrushToolState, mode: ToolMode) {
+    *tool_mode = mode;
+    brush.enabled = mode == ToolMode::RepairBrush;
+    if !brush.enabled {
+        brush.finish_stroke();
+    }
+}
+
+fn apply_view_mode(
+    view_mode: ViewMode,
+    display_settings: &mut DisplaySettings,
+    cross_section: &mut CrossSectionState,
+) {
+    match view_mode {
+        ViewMode::Rendered | ViewMode::Headlight | ViewMode::Studio => {
+            display_settings.wireframe = false;
+            display_settings.normal_debug = false;
+        }
+        ViewMode::Normals => {
+            display_settings.wireframe = false;
+            display_settings.normal_debug = true;
+        }
+        ViewMode::SurfaceWire => {
+            display_settings.wireframe = true;
+            display_settings.normal_debug = false;
+        }
+        ViewMode::XrayWire | ViewMode::Transparent => {
+            display_settings.wireframe = matches!(view_mode, ViewMode::XrayWire);
+            display_settings.show_backfaces = true;
+            display_settings.normal_debug = false;
+        }
+        ViewMode::CrossSection => {
+            cross_section.enabled = true;
+            display_settings.normal_debug = false;
+        }
+        ViewMode::DefectOverlay | ViewMode::ThicknessOverlay => {
+            display_settings.normal_debug = false;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_ui(
     ctx: &egui::Context,
@@ -1102,13 +1341,41 @@ fn draw_ui(
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
+    tool_mode: &mut ToolMode,
+    view_mode: &mut ViewMode,
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
     action: &mut UiAction,
 ) {
-    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-        ui.horizontal(|ui| {
+    egui::SidePanel::left("tool_palette")
+        .resizable(false)
+        .exact_width(56.0)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(4.0);
+                for mode in ToolMode::ALL {
+                    if tool_button(ui, mode, *tool_mode == mode).clicked() {
+                        set_tool_mode(tool_mode, brush_tool, mode);
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+        });
+
+    if *tool_mode == ToolMode::CrossSection {
+        cross_section.enabled = true;
+        if *view_mode != ViewMode::CrossSection {
+            *view_mode = ViewMode::CrossSection;
+            apply_view_mode(*view_mode, display_settings, cross_section);
+        }
+    } else if *tool_mode == ToolMode::XrayInspect && *view_mode != ViewMode::XrayWire {
+        *view_mode = ViewMode::XrayWire;
+        apply_view_mode(*view_mode, display_settings, cross_section);
+    }
+
+    egui::TopBottomPanel::top("tool_options").show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Load STL").clicked() {
                 *action = UiAction::LoadStl;
             }
@@ -1119,46 +1386,290 @@ fn draw_ui(
                 *action = UiAction::Reset;
             }
             ui.separator();
-            ui.checkbox(&mut display_settings.wireframe, "Wire");
-            ui.checkbox(&mut display_settings.show_backfaces, "Backfaces");
+            ui.label("View");
+            let previous_view = *view_mode;
+            for mode in ViewMode::ALL {
+                if ui
+                    .selectable_label(*view_mode == mode, mode.label())
+                    .on_hover_text(mode.label())
+                    .clicked()
+                {
+                    *view_mode = mode;
+                }
+            }
+            if *view_mode != previous_view {
+                apply_view_mode(*view_mode, display_settings, cross_section);
+                match *view_mode {
+                    ViewMode::XrayWire => {
+                        set_tool_mode(tool_mode, brush_tool, ToolMode::XrayInspect)
+                    }
+                    ViewMode::CrossSection => {
+                        set_tool_mode(tool_mode, brush_tool, ToolMode::CrossSection)
+                    }
+                    _ => {}
+                }
+            }
+            ui.separator();
             ui.checkbox(&mut display_settings.show_grid, "Grid");
             ui.checkbox(&mut display_settings.show_axes, "Axes");
-            ui.checkbox(&mut display_settings.normal_debug, "Normals");
+            ui.checkbox(&mut display_settings.show_backfaces, "Backfaces");
         });
     });
 
-    egui::SidePanel::left("model_panel")
+    egui::SidePanel::right("repair_panel")
         .resizable(false)
-        .default_width(270.0)
+        .default_width(340.0)
         .show(ctx, |ui| {
-            ui.heading("Model");
-            if let Some(model) = model_info {
-                ui.label(model.file_name.as_str());
-                ui.separator();
-                ui.label(format!("Path: {}", model.path.display()));
-                ui.label(format!("Triangles: {}", model.stats.triangle_count));
-                ui.label(format!("Chunks: {}", model.chunk_count));
-                ui.label(format!("Bytes: {}", model.stats.source_bytes));
-                ui.label(format!("Parse: {:.2} ms", model.parse_ms));
-                ui.label(format!("Brush unit: {:.5}", model.brush_unit));
-                ui.label(format!(
-                    "GPU buffers: {:.2} MB",
-                    gpu_buffer_bytes as f64 / (1024.0 * 1024.0)
-                ));
-                ui.separator();
-                ui.label(format!(
-                    "Min: {:.4}, {:.4}, {:.4}",
-                    model.stats.bounds.min.x, model.stats.bounds.min.y, model.stats.bounds.min.z
-                ));
-                ui.label(format!(
-                    "Max: {:.4}, {:.4}, {:.4}",
-                    model.stats.bounds.max.x, model.stats.bounds.max.y, model.stats.bounds.max.z
-                ));
-            } else {
-                ui.label("No model loaded");
-            }
+            draw_repair_panel(
+                ui,
+                renderer_info,
+                model_info,
+                selected_pick,
+                issue_session,
+                cross_section,
+                selected_issue_kind,
+                brush_tool,
+                *tool_mode,
+                *view_mode,
+                gpu_buffer_bytes,
+                action,
+            );
+        });
+
+    egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Tool: {}", tool_mode.label()));
             ui.separator();
+            ui.label(format!("View: {}", view_mode.label()));
+            ui.separator();
+            ui.label(status);
+        });
+    });
+}
+
+fn tool_button(ui: &mut egui::Ui, mode: ToolMode, selected: bool) -> egui::Response {
+    let size = egui::vec2(40.0, 40.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = response.hovered();
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill
+    } else if hovered {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        visuals.widgets.inactive.bg_fill
+    };
+    let stroke_color = if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.widgets.inactive.fg_stroke.color
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::Rounding::same(6.0), fill);
+    painter.rect_stroke(
+        rect,
+        egui::Rounding::same(6.0),
+        egui::Stroke::new(1.0, stroke_color),
+    );
+    draw_tool_icon(painter, rect.shrink(8.0), mode, stroke_color);
+    response.on_hover_text(mode.tooltip())
+}
+
+fn draw_tool_icon(painter: &egui::Painter, rect: egui::Rect, mode: ToolMode, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.8, color);
+    let p = |x: f32, y: f32| {
+        egui::pos2(
+            rect.left() + rect.width() * x,
+            rect.top() + rect.height() * y,
+        )
+    };
+    let center = rect.center();
+    match mode {
+        ToolMode::Select => {
+            painter.line_segment([p(0.22, 0.12), p(0.78, 0.48)], stroke);
+            painter.line_segment([p(0.22, 0.12), p(0.42, 0.82)], stroke);
+            painter.line_segment([p(0.42, 0.82), p(0.53, 0.55)], stroke);
+        }
+        ToolMode::Navigate => {
+            painter.circle_stroke(center, rect.width() * 0.28, stroke);
+            painter.line_segment([p(0.18, 0.50), p(0.82, 0.50)], stroke);
+            painter.line_segment([p(0.50, 0.18), p(0.50, 0.82)], stroke);
+        }
+        ToolMode::Analyze => {
+            painter.circle_stroke(p(0.42, 0.42), rect.width() * 0.20, stroke);
+            painter.line_segment([p(0.58, 0.58), p(0.82, 0.82)], stroke);
+            painter.line_segment([p(0.42, 0.30), p(0.42, 0.54)], stroke);
+            painter.line_segment([p(0.30, 0.42), p(0.54, 0.42)], stroke);
+        }
+        ToolMode::CrossSection => {
+            painter.rect_stroke(rect.shrink(2.0), egui::Rounding::same(2.0), stroke);
+            painter.line_segment([p(0.50, 0.10), p(0.50, 0.90)], stroke);
+        }
+        ToolMode::XrayInspect => {
+            painter.line_segment([p(0.10, 0.50), p(0.32, 0.28)], stroke);
+            painter.line_segment([p(0.32, 0.28), p(0.68, 0.28)], stroke);
+            painter.line_segment([p(0.68, 0.28), p(0.90, 0.50)], stroke);
+            painter.line_segment([p(0.90, 0.50), p(0.68, 0.72)], stroke);
+            painter.line_segment([p(0.68, 0.72), p(0.32, 0.72)], stroke);
+            painter.line_segment([p(0.32, 0.72), p(0.10, 0.50)], stroke);
+            painter.circle_stroke(center, rect.width() * 0.12, stroke);
+        }
+        ToolMode::RepairBrush => {
+            painter.circle_stroke(p(0.62, 0.34), rect.width() * 0.18, stroke);
+            painter.line_segment([p(0.50, 0.50), p(0.20, 0.82)], stroke);
+            painter.line_segment([p(0.25, 0.76), p(0.36, 0.88)], stroke);
+        }
+        ToolMode::HoleFill => {
+            painter.circle_stroke(center, rect.width() * 0.28, stroke);
+            painter.line_segment([p(0.50, 0.34), p(0.50, 0.66)], stroke);
+            painter.line_segment([p(0.34, 0.50), p(0.66, 0.50)], stroke);
+        }
+        ToolMode::Cut => {
+            painter.line_segment([p(0.18, 0.82), p(0.82, 0.18)], stroke);
+            painter.line_segment([p(0.18, 0.18), p(0.34, 0.34)], stroke);
+            painter.line_segment([p(0.66, 0.66), p(0.82, 0.82)], stroke);
+        }
+        ToolMode::Measure => {
+            painter.line_segment([p(0.16, 0.50), p(0.84, 0.50)], stroke);
+            painter.line_segment([p(0.16, 0.34), p(0.16, 0.66)], stroke);
+            painter.line_segment([p(0.84, 0.34), p(0.84, 0.66)], stroke);
+        }
+        ToolMode::Remesh => {
+            for offset in [0.25, 0.50, 0.75] {
+                painter.line_segment([p(offset, 0.15), p(offset, 0.85)], stroke);
+                painter.line_segment([p(0.15, offset), p(0.85, offset)], stroke);
+            }
+        }
+        ToolMode::Export => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(0.22, 0.48), p(0.78, 0.84)),
+                egui::Rounding::same(2.0),
+                stroke,
+            );
+            painter.line_segment([p(0.50, 0.14), p(0.50, 0.62)], stroke);
+            painter.line_segment([p(0.32, 0.32), p(0.50, 0.14)], stroke);
+            painter.line_segment([p(0.68, 0.32), p(0.50, 0.14)], stroke);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_repair_panel(
+    ui: &mut egui::Ui,
+    renderer_info: &RendererInfo,
+    model_info: Option<&ModelInfo>,
+    selected_pick: Option<PickResult>,
+    issue_session: &mut Option<IssueSession>,
+    cross_section: &mut CrossSectionState,
+    selected_issue_kind: &mut IssueKind,
+    brush_tool: &mut BrushToolState,
+    tool_mode: ToolMode,
+    view_mode: ViewMode,
+    gpu_buffer_bytes: u64,
+    action: &mut UiAction,
+) {
+    ui.heading("Repair");
+    ui.label(format!("Tool: {}", tool_mode.label()));
+    ui.label(format!("View: {}", view_mode.label()));
+
+    let Some(model) = model_info else {
+        ui.separator();
+        ui.label("Load an STL to begin repair.");
+        if ui.button("Load STL").clicked() {
+            *action = UiAction::LoadStl;
+        }
+        return;
+    };
+
+    cross_section.clamp_to_bounds(model.stats.bounds);
+    draw_model_summary(ui, renderer_info, model, selected_pick, gpu_buffer_bytes);
+    ui.separator();
+
+    match tool_mode {
+        ToolMode::Analyze => draw_defect_tools(
+            ui,
+            selected_pick,
+            issue_session,
+            selected_issue_kind,
+            action,
+        ),
+        ToolMode::CrossSection => draw_cross_section_tools(ui, model, cross_section, action),
+        ToolMode::RepairBrush => {
+            draw_repair_brush_tools(ui, model, issue_session, brush_tool, action)
+        }
+        ToolMode::HoleFill => draw_operation_stub(
+            ui,
+            "Hole Fill",
+            "Select an open boundary loop, preview a refined cap, then apply the repair.",
+        ),
+        ToolMode::Cut => draw_operation_stub(
+            ui,
+            "Cut",
+            "Draw a cut line, preview both sides, then apply a capped printable split.",
+        ),
+        ToolMode::Measure => draw_operation_stub(
+            ui,
+            "Measure",
+            "Pick two points and assign a physical distance for printer-aware remeshing.",
+        ),
+        ToolMode::Remesh => draw_operation_stub(
+            ui,
+            "Remesh",
+            "Choose a physical target resolution and preview mesh density changes.",
+        ),
+        ToolMode::Export => draw_operation_stub(
+            ui,
+            "Export",
+            "Validate the current mesh and export repaired STL plus a repair report.",
+        ),
+        ToolMode::Select | ToolMode::Navigate | ToolMode::XrayInspect => {
+            draw_cross_section_tools(ui, model, cross_section, action);
+            ui.separator();
+            draw_defect_tools(
+                ui,
+                selected_pick,
+                issue_session,
+                selected_issue_kind,
+                action,
+            );
+        }
+    }
+
+    ui.separator();
+    draw_operation_history(ui, issue_session, action);
+}
+
+fn draw_model_summary(
+    ui: &mut egui::Ui,
+    renderer_info: &RendererInfo,
+    model: &ModelInfo,
+    selected_pick: Option<PickResult>,
+    gpu_buffer_bytes: u64,
+) {
+    egui::CollapsingHeader::new("Model")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(model.file_name.as_str());
+            ui.label(format!("Path: {}", model.path.display()));
+            ui.label(format!("Triangles: {}", model.stats.triangle_count));
+            ui.label(format!("Chunks: {}", model.chunk_count));
+            ui.label(format!("Bytes: {}", model.stats.source_bytes));
+            ui.label(format!("Parse: {:.2} ms", model.parse_ms));
+            ui.label(format!("Brush unit: {:.5}", model.brush_unit));
+            ui.label(format!(
+                "GPU buffers: {:.2} MB",
+                gpu_buffer_bytes as f64 / (1024.0 * 1024.0)
+            ));
+            ui.label(format!(
+                "Min: {:.4}, {:.4}, {:.4}",
+                model.stats.bounds.min.x, model.stats.bounds.min.y, model.stats.bounds.min.z
+            ));
+            ui.label(format!(
+                "Max: {:.4}, {:.4}, {:.4}",
+                model.stats.bounds.max.x, model.stats.bounds.max.y, model.stats.bounds.max.z
+            ));
             if let Some(pick) = selected_pick {
+                ui.separator();
                 ui.label(format!(
                     "Selected: {}:{}",
                     pick.triangle_id.chunk, pick.triangle_id.local_index
@@ -1167,178 +1678,198 @@ fn draw_ui(
                     "Point: {:.4}, {:.4}, {:.4}",
                     pick.position.x, pick.position.y, pick.position.z
                 ));
-                ui.separator();
             }
+            ui.separator();
             ui.label(format!("GPU: {}", renderer_info.adapter_name));
             ui.label(format!("Backend: {:?}", renderer_info.backend));
         });
+}
 
-    egui::SidePanel::right("inspection_panel")
-        .resizable(false)
-        .default_width(330.0)
-        .show(ctx, |ui| {
-            ui.heading("Inspection");
+fn draw_cross_section_tools(
+    ui: &mut egui::Ui,
+    model: &ModelInfo,
+    cross_section: &mut CrossSectionState,
+    action: &mut UiAction,
+) {
+    ui.heading("Section");
+    ui.checkbox(&mut cross_section.enabled, "Cross Section");
+    ui.horizontal(|ui| {
+        ui.label("Axis");
+        let previous_axis = cross_section.axis;
+        for axis in CrossSectionAxis::ALL {
+            ui.selectable_value(&mut cross_section.axis, axis, axis.label());
+        }
+        if cross_section.axis != previous_axis {
+            cross_section.set_axis(cross_section.axis, model.stats.bounds);
+        }
+    });
 
-            let Some(model) = model_info else {
-                ui.label("Load an STL to inspect internal geometry.");
-                return;
-            };
+    let range = cross_section.range(model.stats.bounds);
+    ui.add(
+        egui::Slider::new(&mut cross_section.offset, range)
+            .text("Offset")
+            .show_value(false),
+    );
+    cross_section.clamp_to_bounds(model.stats.bounds);
+    ui.label(format!(
+        "{} = {:.4}",
+        cross_section.axis.label(),
+        cross_section.offset
+    ));
+    ui.checkbox(&mut cross_section.flip_side, "Flip side");
+    ui.checkbox(&mut cross_section.show_plane_guide, "Show plane guide");
+    if ui.button("Center Plane").clicked() {
+        *action = UiAction::ResetCrossSection;
+    }
+}
 
-            cross_section.clamp_to_bounds(model.stats.bounds);
-
-            ui.checkbox(&mut cross_section.enabled, "Cross Section");
-
-            ui.horizontal(|ui| {
-                ui.label("Axis");
-                let previous_axis = cross_section.axis;
-                for axis in CrossSectionAxis::ALL {
-                    ui.selectable_value(&mut cross_section.axis, axis, axis.label());
-                }
-                if cross_section.axis != previous_axis {
-                    cross_section.set_axis(cross_section.axis, model.stats.bounds);
-                }
-            });
-
-            let range = cross_section.range(model.stats.bounds);
-            ui.add(
-                egui::Slider::new(&mut cross_section.offset, range)
-                    .text("Offset")
-                    .show_value(false),
-            );
-            cross_section.clamp_to_bounds(model.stats.bounds);
-            ui.label(format!(
-                "{} = {:.4}",
-                cross_section.axis.label(),
-                cross_section.offset
-            ));
-
-            ui.checkbox(&mut cross_section.flip_side, "Flip side");
-            ui.checkbox(&mut cross_section.show_plane_guide, "Show plane guide");
-            if ui.button("Center Plane").clicked() {
-                *action = UiAction::ResetCrossSection;
+fn draw_repair_brush_tools(
+    ui: &mut egui::Ui,
+    model: &ModelInfo,
+    issue_session: &mut Option<IssueSession>,
+    brush_tool: &mut BrushToolState,
+    action: &mut UiAction,
+) {
+    ui.heading("Repair Brush");
+    ui.label("Paint regions that feed repair operations.");
+    egui::ComboBox::from_label("Region")
+        .selected_text(brush_tool.kind.label())
+        .show_ui(ui, |ui| {
+            for kind in BrushLabelKind::ALL {
+                ui.selectable_value(&mut brush_tool.kind, kind, kind.label());
             }
+        });
 
+    ui.add(egui::Slider::new(&mut brush_tool.size_units, 1.0..=200.0).text("Brush radius"));
+    ui.label(format!(
+        "World radius: {:.5}",
+        brush_tool.world_radius(model)
+    ));
+    ui.add(egui::Slider::new(&mut brush_tool.min_screen_spacing, 2.0..=32.0).text("Spacing"));
+
+    ui.horizontal(|ui| {
+        ui.add_enabled(false, egui::Button::new("Preview"));
+        ui.add_enabled(false, egui::Button::new("Apply"));
+        if ui.button("Clear Regions").clicked() {
+            *action = UiAction::ClearLabelStrokes;
+        }
+    });
+
+    if let Some(session) = issue_session.as_mut() {
+        if !session.label_strokes.is_empty() {
             ui.separator();
-            ui.heading("Labels");
-            ui.checkbox(&mut brush_tool.enabled, "Brush");
-
-            egui::ComboBox::from_label("Label")
-                .selected_text(brush_tool.kind.label())
-                .show_ui(ui, |ui| {
-                    for kind in BrushLabelKind::ALL {
-                        ui.selectable_value(&mut brush_tool.kind, kind, kind.label());
-                    }
-                });
-
-            ui.add(egui::Slider::new(&mut brush_tool.size_units, 1.0..=200.0).text("Brush radius"));
-            ui.label(format!(
-                "World radius: {:.5}",
-                brush_tool.world_radius(model)
-            ));
-            ui.add(
-                egui::Slider::new(&mut brush_tool.min_screen_spacing, 2.0..=32.0).text("Spacing"),
-            );
-
-            if ui.button("Clear Labels").clicked() {
-                *action = UiAction::ClearLabelStrokes;
-            }
-
-            if let Some(session) = issue_session.as_mut() {
-                for (index, stroke) in session.label_strokes.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{}: {} samples",
-                            stroke.kind.label(),
-                            stroke.samples.len()
-                        ));
-                        if ui.button("Delete").clicked() {
-                            *action = UiAction::DeleteLabelStroke(index);
-                        }
-                    });
-                }
-            }
-
-            ui.separator();
-            ui.heading("Issues");
-
-            egui::ComboBox::from_label("Issue kind")
-                .selected_text(selected_issue_kind.label())
-                .show_ui(ui, |ui| {
-                    for kind in IssueKind::ALL {
-                        ui.selectable_value(selected_issue_kind, kind, kind.label());
-                    }
-                });
-
-            let can_add_issue = selected_pick.is_some() && issue_session.is_some();
-            if ui
-                .add_enabled(can_add_issue, egui::Button::new("Add Issue"))
-                .clicked()
-            {
-                *action = UiAction::AddIssue;
-            }
-
+            ui.label("Repair regions");
+        }
+        for (index, stroke) in session.label_strokes.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    *action = UiAction::SaveIssues;
-                }
-                if ui.button("Load").clicked() {
-                    *action = UiAction::LoadIssues;
-                }
-            });
-
-            if let Some(pick) = selected_pick {
-                ui.small(format!(
-                    "Selected {}:{} at {:.3}, {:.3}, {:.3}",
-                    pick.triangle_id.chunk,
-                    pick.triangle_id.local_index,
-                    pick.position.x,
-                    pick.position.y,
-                    pick.position.z
+                ui.label(format!(
+                    "{}: {} samples",
+                    stroke.kind.label(),
+                    stroke.samples.len()
                 ));
-            }
+                if ui.button("Delete").clicked() {
+                    *action = UiAction::DeleteLabelStroke(index);
+                }
+            });
+        }
+    }
+}
 
+fn draw_defect_tools(
+    ui: &mut egui::Ui,
+    selected_pick: Option<PickResult>,
+    issue_session: &mut Option<IssueSession>,
+    selected_issue_kind: &mut IssueKind,
+    action: &mut UiAction,
+) {
+    ui.heading("Defects");
+    egui::ComboBox::from_label("Defect type")
+        .selected_text(selected_issue_kind.label())
+        .show_ui(ui, |ui| {
+            for kind in IssueKind::ALL {
+                ui.selectable_value(selected_issue_kind, kind, kind.label());
+            }
+        });
+
+    let can_add = selected_pick.is_some() && issue_session.is_some();
+    if ui
+        .add_enabled(can_add, egui::Button::new("Record Selected Defect"))
+        .clicked()
+    {
+        *action = UiAction::AddIssue;
+    }
+
+    ui.horizontal(|ui| {
+        if ui.button("Save Repair Data").clicked() {
+            *action = UiAction::SaveIssues;
+        }
+        if ui.button("Load Repair Data").clicked() {
+            *action = UiAction::LoadIssues;
+        }
+    });
+
+    if let Some(pick) = selected_pick {
+        ui.small(format!(
+            "Selected {}:{} at {:.3}, {:.3}, {:.3}",
+            pick.triangle_id.chunk,
+            pick.triangle_id.local_index,
+            pick.position.x,
+            pick.position.y,
+            pick.position.z
+        ));
+    }
+}
+
+fn draw_operation_history(
+    ui: &mut egui::Ui,
+    issue_session: &mut Option<IssueSession>,
+    action: &mut UiAction,
+) {
+    ui.heading("Operations");
+    if let Some(session) = issue_session.as_mut() {
+        if session.issues.is_empty() {
+            ui.label("No defect operations recorded");
+        }
+        for (index, issue) in session.issues.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.button("Frame").clicked() {
+                    *action = UiAction::FrameIssue(index);
+                }
+                if ui.button("Delete").clicked() {
+                    *action = UiAction::DeleteIssue(index);
+                }
+            });
+            ui.label(issue.kind.label());
+            ui.text_edit_singleline(&mut issue.label);
+            ui.small(format!(
+                "{}:{}  {:.3}, {:.3}, {:.3}",
+                issue.triangle.chunk,
+                issue.triangle.local_index,
+                issue.position[0],
+                issue.position[1],
+                issue.position[2]
+            ));
+            ui.small(format!(
+                "Section {} {:.3}{}",
+                issue.cross_section_axis.label(),
+                issue.cross_section_offset,
+                if issue.cross_section_flipped {
+                    " flipped"
+                } else {
+                    ""
+                }
+            ));
             ui.separator();
-            if let Some(session) = issue_session.as_mut() {
-                if session.issues.is_empty() {
-                    ui.label("No issues recorded");
-                }
-                for (index, issue) in session.issues.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button("Frame").clicked() {
-                            *action = UiAction::FrameIssue(index);
-                        }
-                        if ui.button("Delete").clicked() {
-                            *action = UiAction::DeleteIssue(index);
-                        }
-                    });
-                    ui.label(issue.kind.label());
-                    ui.text_edit_singleline(&mut issue.label);
-                    ui.small(format!(
-                        "{}:{}  {:.3}, {:.3}, {:.3}",
-                        issue.triangle.chunk,
-                        issue.triangle.local_index,
-                        issue.position[0],
-                        issue.position[1],
-                        issue.position[2]
-                    ));
-                    ui.small(format!(
-                        "Cross Section {} {:.3}{}",
-                        issue.cross_section_axis.label(),
-                        issue.cross_section_offset,
-                        if issue.cross_section_flipped {
-                            " flipped"
-                        } else {
-                            ""
-                        }
-                    ));
-                    ui.separator();
-                }
-            }
-        });
+        }
+    }
+}
 
-    egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(status);
-        });
+fn draw_operation_stub(ui: &mut egui::Ui, title: &str, description: &str) {
+    ui.heading(title);
+    ui.label(description);
+    ui.horizontal(|ui| {
+        ui.add_enabled(false, egui::Button::new("Preview"));
+        ui.add_enabled(false, egui::Button::new("Apply"));
+        ui.add_enabled(false, egui::Button::new("Cancel"));
     });
 }
