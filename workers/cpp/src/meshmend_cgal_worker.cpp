@@ -2,6 +2,7 @@
 
 #include <CGAL/boost/graph/iterator.h>
 #include <CGAL/Polygon_mesh_processing/border.h>
+#include <CGAL/Polygon_mesh_processing/remesh.h>
 #include <CGAL/Polygon_mesh_processing/triangulate_hole.h>
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/Surface_mesh.h>
@@ -192,6 +193,20 @@ std::size_t fill_all_holes(Mesh &mesh) {
   return patched_faces;
 }
 
+void isotropic_remesh_all_faces(Mesh &mesh, double target_edge_length) {
+  if (target_edge_length <= 0.0 || !std::isfinite(target_edge_length)) {
+    throw std::runtime_error("remesh requires a positive target edge length");
+  }
+  std::vector<Mesh::Face_index> faces_to_remesh;
+  faces_to_remesh.reserve(mesh.number_of_faces());
+  for (const auto face : mesh.faces()) {
+    faces_to_remesh.push_back(face);
+  }
+  PMP::isotropic_remeshing(
+      faces_to_remesh, target_edge_length, mesh,
+      CGAL::parameters::number_of_iterations(1).protect_constraints(true));
+}
+
 double signed_distance(const Vec3f &point, const std::array<double, 3> &normal, double offset) {
   return static_cast<double>(point.x) * normal[0] + static_cast<double>(point.y) * normal[1] +
          static_cast<double>(point.z) * normal[2] - offset;
@@ -313,6 +328,23 @@ int main(int argc, char **argv) {
       write_binary_stl(mesh, request.output_mesh);
       meshmend::progress(request, "progress", "cut", patched_faces, patched_faces,
                          "cut mesh capped and written");
+      meshmend::write_response(request, true, triangles, mesh.number_of_faces());
+    } else if (request.operation == "remesh") {
+      if (request.output_mesh.empty()) {
+        throw std::runtime_error("remesh requires output_mesh");
+      }
+      const auto request_json = meshmend::read_text(request_path);
+      const double target_edge_length =
+          meshmend::json_number(request_json, "target_edge_length").value_or(0.0);
+      meshmend::progress(request, "phase", "remesh", 0, triangles,
+                         "loading mesh into CGAL for isotropic remeshing");
+      auto mesh = read_binary_stl_mesh(request.input_mesh);
+      meshmend::progress(request, "progress", "remesh", 1, 3,
+                         "running isotropic remeshing");
+      isotropic_remesh_all_faces(mesh, target_edge_length);
+      write_binary_stl(mesh, request.output_mesh);
+      meshmend::progress(request, "progress", "remesh", 3, 3,
+                         "remeshed mesh written");
       meshmend::write_response(request, true, triangles, mesh.number_of_faces());
     } else {
       meshmend::progress(request, "progress", "inspect", triangles, triangles,

@@ -13,7 +13,7 @@ use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_project::{
     project_directory_from_selection, MeshMendProject, OperationKind, OperationStatus,
-    SelectionReference,
+    ScaleCalibration, SelectionReference,
 };
 use meshmend_render::{
     DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
@@ -63,6 +63,9 @@ enum UiAction {
     ResetCrossSection,
     ClearLabelStrokes,
     DeleteLabelStroke(usize),
+    SetMeasurePointA,
+    SetMeasurePointB,
+    ApplyScaleCalibration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +196,36 @@ struct HitStackState {
     index: usize,
 }
 
+#[derive(Debug, Clone)]
+struct MeasureToolState {
+    point_a: Option<[f32; 3]>,
+    point_b: Option<[f32; 3]>,
+    real_distance_mm: f64,
+}
+
+impl Default for MeasureToolState {
+    fn default() -> Self {
+        Self {
+            point_a: None,
+            point_b: None,
+            real_distance_mm: 10.0,
+        }
+    }
+}
+
+impl MeasureToolState {
+    fn model_distance(&self) -> Option<f64> {
+        let a = glam::Vec3::from_array(self.point_a?);
+        let b = glam::Vec3::from_array(self.point_b?);
+        Some(f64::from(a.distance(b)))
+    }
+
+    fn model_units_per_mm(&self) -> Option<f64> {
+        let distance = self.model_distance()?;
+        (self.real_distance_mm > 0.0).then_some(distance / self.real_distance_mm)
+    }
+}
+
 impl HitStackState {
     fn clear(&mut self) {
         self.screen_position = None;
@@ -271,6 +304,7 @@ pub fn run_native(
         .unwrap_or_default();
     let mut selected_issue_kind = IssueKind::default();
     let mut brush_tool = BrushToolState::default();
+    let mut measure_tool = MeasureToolState::default();
     let mut tool_mode = ToolMode::Select;
     let mut view_mode = ViewMode::Headlight;
 
@@ -327,6 +361,7 @@ pub fn run_native(
                                 &mut cross_section,
                                 &mut selected_issue_kind,
                                 &mut brush_tool,
+                                &mut measure_tool,
                                 &mut tool_mode,
                                 &mut view_mode,
                                 renderer.gpu_buffer_bytes(),
@@ -353,6 +388,7 @@ pub fn run_native(
                             &mut cross_section,
                             selected_issue_kind,
                             &mut brush_tool,
+                            &mut measure_tool,
                             &mut selected_pick,
                             &mut hit_stack_state,
                             &mut status,
@@ -1140,6 +1176,7 @@ fn handle_ui_action(
     cross_section: &mut CrossSectionState,
     selected_issue_kind: IssueKind,
     brush_tool: &mut BrushToolState,
+    measure_tool: &mut MeasureToolState,
     selected_pick: &mut Option<PickResult>,
     hit_stack_state: &mut HitStackState,
     status: &mut String,
@@ -1466,6 +1503,65 @@ fn handle_ui_action(
                 *status = "Deleted brush label".to_string();
                 *needs_redraw = true;
             }
+        }
+        UiAction::SetMeasurePointA => {
+            if let Some(pick) = *selected_pick {
+                measure_tool.point_a = Some(pick.position.to_array());
+                *status = "Set scale point A".to_string();
+            } else {
+                *status = "Select a mesh point before setting point A".to_string();
+            }
+            *needs_redraw = true;
+        }
+        UiAction::SetMeasurePointB => {
+            if let Some(pick) = *selected_pick {
+                measure_tool.point_b = Some(pick.position.to_array());
+                *status = "Set scale point B".to_string();
+            } else {
+                *status = "Select a mesh point before setting point B".to_string();
+            }
+            *needs_redraw = true;
+        }
+        UiAction::ApplyScaleCalibration => {
+            if project.is_none() {
+                if let Some(model) = model_info.as_ref() {
+                    *project = Some(project_from_model(model));
+                }
+            }
+            let Some(project) = project.as_mut() else {
+                *status = "Load an STL before applying scale".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            let (Some(point_a), Some(point_b), Some(model_distance), Some(model_units_per_mm)) = (
+                measure_tool.point_a,
+                measure_tool.point_b,
+                measure_tool.model_distance(),
+                measure_tool.model_units_per_mm(),
+            ) else {
+                *status = "Set two scale points and a real distance first".to_string();
+                *needs_redraw = true;
+                return;
+            };
+            project.scale = Some(ScaleCalibration {
+                model_units_per_mm,
+                reference_model_distance: model_distance,
+                reference_real_distance_mm: measure_tool.real_distance_mm,
+                point_a,
+                point_b,
+            });
+            project.record_operation(
+                OperationKind::ScaleCalibration,
+                OperationStatus::Applied,
+                serde_json::json!({
+                    "reference_model_distance": model_distance,
+                    "reference_real_distance_mm": measure_tool.real_distance_mm,
+                    "model_units_per_mm": model_units_per_mm,
+                }),
+                Vec::new(),
+            );
+            *status = format!("Applied scale: {:.6} model units/mm", model_units_per_mm);
+            *needs_redraw = true;
         }
     }
 }
@@ -1847,6 +1943,7 @@ fn draw_ui(
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
+    measure_tool: &mut MeasureToolState,
     tool_mode: &mut ToolMode,
     view_mode: &mut ViewMode,
     gpu_buffer_bytes: u64,
@@ -1943,6 +2040,7 @@ fn draw_ui(
                 cross_section,
                 selected_issue_kind,
                 brush_tool,
+                measure_tool,
                 *tool_mode,
                 *view_mode,
                 gpu_buffer_bytes,
@@ -2079,6 +2177,7 @@ fn draw_repair_panel(
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
+    measure_tool: &mut MeasureToolState,
     tool_mode: ToolMode,
     view_mode: ViewMode,
     gpu_buffer_bytes: u64,
@@ -2125,11 +2224,7 @@ fn draw_repair_panel(
             "Cut",
             "Draw a cut line, preview both sides, then apply a capped printable split.",
         ),
-        ToolMode::Measure => draw_operation_stub(
-            ui,
-            "Measure",
-            "Pick two points and assign a physical distance for printer-aware remeshing.",
-        ),
+        ToolMode::Measure => draw_measure_tools(ui, selected_pick, project, measure_tool, action),
         ToolMode::Remesh => draw_operation_stub(
             ui,
             "Remesh",
@@ -2475,6 +2570,83 @@ fn draw_operation_history(
             ui.separator();
         }
     }
+}
+
+fn draw_measure_tools(
+    ui: &mut egui::Ui,
+    selected_pick: Option<PickResult>,
+    project: Option<&MeshMendProject>,
+    measure_tool: &mut MeasureToolState,
+    action: &mut UiAction,
+) {
+    ui.heading("Measure / Scale");
+    if let Some(pick) = selected_pick {
+        ui.small(format!(
+            "Selected point {:.4}, {:.4}, {:.4}",
+            pick.position.x, pick.position.y, pick.position.z
+        ));
+        ui.horizontal(|ui| {
+            if ui.button("Set A").clicked() {
+                *action = UiAction::SetMeasurePointA;
+            }
+            if ui.button("Set B").clicked() {
+                *action = UiAction::SetMeasurePointB;
+            }
+        });
+    } else {
+        ui.label("Select two mesh points to calibrate physical scale.");
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("A");
+        ui.monospace(point_label(measure_tool.point_a));
+    });
+    ui.horizontal(|ui| {
+        ui.label("B");
+        ui.monospace(point_label(measure_tool.point_b));
+    });
+
+    ui.add(
+        egui::DragValue::new(&mut measure_tool.real_distance_mm)
+            .speed(0.1)
+            .clamp_range(0.001..=1_000_000.0)
+            .suffix(" mm"),
+    );
+
+    if let Some(distance) = measure_tool.model_distance() {
+        ui.label(format!("Model distance: {:.6}", distance));
+    }
+    if let Some(model_units_per_mm) = measure_tool.model_units_per_mm() {
+        ui.label(format!("Scale: {:.6} model units/mm", model_units_per_mm));
+    }
+
+    let can_apply = measure_tool.point_a.is_some()
+        && measure_tool.point_b.is_some()
+        && measure_tool.real_distance_mm > 0.0;
+    if ui
+        .add_enabled(can_apply, egui::Button::new("Apply Scale"))
+        .clicked()
+    {
+        *action = UiAction::ApplyScaleCalibration;
+    }
+
+    if let Some(scale) = project.and_then(|project| project.scale.as_ref()) {
+        ui.separator();
+        ui.label(format!(
+            "Project scale: {:.6} model units/mm",
+            scale.model_units_per_mm
+        ));
+        ui.small(format!(
+            "Reference: {:.6} model units = {:.3} mm",
+            scale.reference_model_distance, scale.reference_real_distance_mm
+        ));
+    }
+}
+
+fn point_label(point: Option<[f32; 3]>) -> String {
+    point
+        .map(|point| format!("{:.4}, {:.4}, {:.4}", point[0], point[1], point[2]))
+        .unwrap_or_else(|| "unset".to_string())
 }
 
 fn draw_operation_stub(ui: &mut egui::Ui, title: &str, description: &str) {

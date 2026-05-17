@@ -47,6 +47,8 @@ The active implementation is now the native viewer:
   explicit voxel/SDF surface extraction and exporting the wrapped STL
 - CGAL-backed `meshmend cut` straight bisect path that clips by a plane, caps
   the kept side, validates topology, and exports STL
+- measure/scale controls in the native app that store model-units-per-mm in the
+  project, plus CGAL-backed `meshmend remesh` for target edge-length remeshing
 
 ## App Location
 

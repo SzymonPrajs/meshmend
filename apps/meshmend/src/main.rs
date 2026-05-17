@@ -85,6 +85,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CutKeepSide::Positive)]
         keep: CutKeepSide,
     },
+    Remesh {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "STL")]
+        output: PathBuf,
+        #[arg(long, value_name = "MODEL_UNITS")]
+        target_edge_length: Option<f64>,
+        #[arg(long, value_name = "MICRONS")]
+        target_microns: Option<f64>,
+        #[arg(long, value_name = "MODEL_UNITS_PER_MM")]
+        model_units_per_mm: Option<f64>,
+    },
     Perf {
         #[arg(value_name = "STL")]
         path: PathBuf,
@@ -376,6 +388,79 @@ fn main() -> Result<()> {
             let report = app::analyze_parsed_stl(&parsed);
             println!("wrote: {}", output.display());
             println!("triangles: {}", parsed.stats.triangle_count);
+            println!("boundary loops: {}", report.topology.boundary_loop_count);
+            println!(
+                "non-manifold edges: {}",
+                report.topology.non_manifold_edge_count
+            );
+        }
+        Some(Command::Remesh {
+            path,
+            output,
+            target_edge_length,
+            target_microns,
+            model_units_per_mm,
+        }) => {
+            let target_edge_length = match (target_edge_length, target_microns, model_units_per_mm)
+            {
+                (Some(target), _, _) => target,
+                (None, Some(microns), Some(model_units_per_mm)) => {
+                    microns / 1000.0 * model_units_per_mm
+                }
+                _ => anyhow::bail!(
+                    "remesh requires --target-edge-length or both --target-microns and --model-units-per-mm"
+                ),
+            };
+            let binary = discover_worker_binary("meshmend-cgal-worker").ok_or_else(|| {
+                anyhow::anyhow!("CGAL worker was not found; run `just worker-build`")
+            })?;
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let response_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("remesh-response.json");
+            let request_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("remesh-request.json");
+            let mut request =
+                WorkerRequest::new(WorkerOperation::Remesh, path.clone(), response_path);
+            request.output_mesh = Some(output.clone());
+            request.preview = false;
+            request.target_edge_length = Some(target_edge_length);
+            request.options = serde_json::json!({
+                "target_edge_length": target_edge_length,
+                "target_microns": target_microns,
+                "model_units_per_mm": model_units_per_mm,
+            });
+            let result = WorkerRunner::new(binary).run(&request, &request_path)?;
+            if !result.response.success {
+                anyhow::bail!(
+                    "remesh worker failed: {}",
+                    result
+                        .response
+                        .error
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            let parsed = load_binary_stl_with_options(
+                &output,
+                &LoadOptions {
+                    parallel: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            let report = app::analyze_parsed_stl(&parsed);
+            println!("wrote: {}", output.display());
+            println!("target edge length: {target_edge_length:.6}");
+            println!("triangles: {}", parsed.stats.triangle_count);
+            println!(
+                "average edge length: {:.6}",
+                report.geometry.average_edge_length
+            );
             println!("boundary loops: {}", report.topology.boundary_loop_count);
             println!(
                 "non-manifold edges: {}",

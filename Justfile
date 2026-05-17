@@ -44,6 +44,8 @@ repair-smoke:
     cargo run -p meshmend -- analyze outputs/cube-local-wrap.stl --output outputs/cube-local-wrap-analysis.json
     cargo run -p meshmend -- cut fixtures/stl/cube_binary.stl --output outputs/cube-cut-x-positive.stl --normal 1 0 0 --offset 0 --keep positive
     cargo run -p meshmend -- analyze outputs/cube-cut-x-positive.stl --output outputs/cube-cut-x-positive-analysis.json
+    cargo run -p meshmend -- remesh fixtures/stl/cube_binary.stl --output outputs/cube-remesh.stl --target-edge-length 0.75
+    cargo run -p meshmend -- analyze outputs/cube-remesh.stl --output outputs/cube-remesh-analysis.json
 
 perf path:
     mkdir -p outputs
