@@ -1,5 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
@@ -360,6 +364,117 @@ pub fn run_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
     guard
         .take()
         .unwrap_or_else(|| Err(anyhow!("render verification did not run")))
+}
+
+pub fn run_perf(input: PathBuf, output: PathBuf) -> Result<()> {
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new()
+        .with_title("MeshMend performance capture")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_visible(false)
+        .build(&event_loop)?;
+    let window: &'static Window = Box::leak(Box::new(window));
+    let window_id = window.id();
+    let redraw_window = window;
+    let mut renderer = pollster::block_on(WgpuRenderer::new(window))?;
+
+    let load_started = Instant::now();
+    let parsed = load_binary_stl(&input)?;
+    let upload_started = Instant::now();
+    upload_parsed_mesh(&mut renderer, &parsed);
+    let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+    let time_to_interactive_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+    let result: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+    let result_writer = Arc::clone(&result);
+    let mut needs_redraw = true;
+    let mut captured = false;
+
+    event_loop.run(move |event, target| {
+        target.set_control_flow(ControlFlow::Wait);
+
+        match event {
+            Event::WindowEvent {
+                window_id: event_window_id,
+                event: WindowEvent::RedrawRequested,
+            } if event_window_id == window_id && !captured => {
+                captured = true;
+                let screenshot_started = Instant::now();
+                let capture = renderer
+                    .screenshot(None)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|stats| {
+                        let screenshot_ms = screenshot_started.elapsed().as_secs_f64() * 1000.0;
+                        let report = serde_json::json!({
+                            "version": 1,
+                            "app_version": env!("CARGO_PKG_VERSION"),
+                            "platform": std::env::consts::OS,
+                            "gpu_backend": format!("{:?}", renderer.info().backend),
+                            "adapter": renderer.info().adapter_name,
+                            "file": {
+                                "name": parsed.file_name.as_str(),
+                                "bytes": parsed.stats.source_bytes,
+                                "triangles": parsed.stats.triangle_count,
+                            },
+                            "timings_ms": {
+                                "file_map": parsed.timings.map_file.as_secs_f64() * 1000.0,
+                                "validate": parsed.timings.validate.as_secs_f64() * 1000.0,
+                                "parse_total": parsed.timings.parse.as_secs_f64() * 1000.0,
+                                "gpu_upload_total": upload_ms,
+                                "first_frame": screenshot_ms,
+                                "time_to_interactive": time_to_interactive_ms,
+                                "screenshot": screenshot_ms,
+                            },
+                            "frame_stats": {
+                                "idle_fps_avg": 0.0,
+                                "orbit_fps_avg": 0.0,
+                                "pan_fps_avg": 0.0,
+                                "zoom_fps_avg": 0.0,
+                                "p95_frame_ms": 0.0,
+                                "p99_frame_ms": 0.0,
+                            },
+                            "memory": {
+                                "cpu_rss_mb": 0.0,
+                                "gpu_buffer_mb": renderer.gpu_buffer_bytes() as f64 / (1024.0 * 1024.0),
+                                "chunk_count": parsed.chunks.len(),
+                            },
+                            "render_check": {
+                                "width": stats.width,
+                                "height": stats.height,
+                                "non_background_pixels": stats.non_background_pixels,
+                                "coverage": stats.coverage,
+                            }
+                        });
+                        if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::write(&output, serde_json::to_string_pretty(&report)?)?;
+                        println!(
+                            "perf wrote {} parse_ms={:.3} upload_ms={:.3} screenshot_ms={:.3} coverage={:.4}",
+                            output.display(),
+                            parsed.timings.parse.as_secs_f64() * 1000.0,
+                            upload_ms,
+                            screenshot_ms,
+                            stats.coverage
+                        );
+                        Ok(())
+                    });
+                *result_writer.lock().expect("perf result lock poisoned") = Some(capture);
+                target.exit();
+            }
+            Event::AboutToWait => {
+                if needs_redraw {
+                    redraw_window.request_redraw();
+                    needs_redraw = false;
+                }
+            }
+            _ => {}
+        }
+    })?;
+
+    let mut guard = result.lock().expect("perf result lock poisoned");
+    guard
+        .take()
+        .unwrap_or_else(|| Err(anyhow!("performance capture did not run")))
 }
 
 fn handle_ui_action(

@@ -39,6 +39,12 @@ enum Command {
         #[arg(long)]
         parallel: bool,
     },
+    Perf {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "JSON")]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -88,6 +94,9 @@ fn main() -> Result<()> {
                 "parse ms: {:.3}",
                 parsed.timings.parse.as_secs_f64() * 1000.0
             );
+        }
+        Some(Command::Perf { path, output }) => {
+            app::run_perf(path, output)?;
         }
         None => {
             app::run_native(cli.input, cli.smoke_window, cli.smoke_pick_center)?;

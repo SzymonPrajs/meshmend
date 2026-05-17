@@ -18,6 +18,7 @@ meshmend-notes = { path = "../../crates/meshmend-notes" }
 meshmend-render = { path = "../../crates/meshmend-render" }
 meshmend-stl = { path = "../../crates/meshmend-stl" }
 pollster.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
