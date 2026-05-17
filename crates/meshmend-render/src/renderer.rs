@@ -28,6 +28,7 @@ pub struct WgpuRenderer<'window> {
     camera_bind_group: wgpu::BindGroup,
     chunk_bind_group_layout: wgpu::BindGroupLayout,
     mesh_pipeline: wgpu::RenderPipeline,
+    egui_renderer: egui_wgpu::Renderer,
     mesh_chunks: Vec<GpuMeshChunk>,
     mesh_bounds: Option<MeshBounds>,
     info: RendererInfo,
@@ -67,7 +68,12 @@ impl<'window> WgpuRenderer<'window> {
             .formats
             .iter()
             .copied()
-            .find(|format| format.is_srgb())
+            .find(|format| {
+                matches!(
+                    format,
+                    wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+                )
+            })
             .unwrap_or(caps.formats[0]);
         let present_mode = caps
             .present_modes
@@ -151,6 +157,7 @@ impl<'window> WgpuRenderer<'window> {
             &camera_bind_group_layout,
             &chunk_bind_group_layout,
         );
+        let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
         let info = RendererInfo {
             adapter_name: adapter_info.name,
             backend: adapter_info.backend,
@@ -179,6 +186,7 @@ impl<'window> WgpuRenderer<'window> {
             camera_bind_group,
             chunk_bind_group_layout,
             mesh_pipeline,
+            egui_renderer,
             mesh_chunks: Vec::new(),
             mesh_bounds: None,
             info,
@@ -291,6 +299,26 @@ impl<'window> WgpuRenderer<'window> {
     }
 
     pub fn render(&mut self) -> Result<(), RenderError> {
+        self.render_internal(None)
+    }
+
+    pub fn render_with_egui(
+        &mut self,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+    ) -> Result<(), RenderError> {
+        self.render_internal(Some((paint_jobs, textures_delta, screen_descriptor)))
+    }
+
+    fn render_internal(
+        &mut self,
+        egui_data: Option<(
+            &[egui::ClippedPrimitive],
+            &egui::TexturesDelta,
+            &egui_wgpu::ScreenDescriptor,
+        )>,
+    ) -> Result<(), RenderError> {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -308,6 +336,25 @@ impl<'window> WgpuRenderer<'window> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("MeshMend render encoder"),
             });
+        let mut command_buffers = Vec::new();
+
+        if let Some((paint_jobs, textures_delta, screen_descriptor)) = egui_data {
+            for (texture_id, image_delta) in &textures_delta.set {
+                self.egui_renderer.update_texture(
+                    &self.device,
+                    &self.queue,
+                    *texture_id,
+                    image_delta,
+                );
+            }
+            command_buffers.extend(self.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                paint_jobs,
+                screen_descriptor,
+            ));
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -344,7 +391,32 @@ impl<'window> WgpuRenderer<'window> {
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
+        if let Some((paint_jobs, textures_delta, screen_descriptor)) = egui_data {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("MeshMend egui pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                self.egui_renderer
+                    .render(&mut pass, paint_jobs, screen_descriptor);
+            }
+            for texture_id in &textures_delta.free {
+                self.egui_renderer.free_texture(texture_id);
+            }
+        }
+
+        command_buffers.push(encoder.finish());
+        self.queue.submit(command_buffers);
         frame.present();
         Ok(())
     }
