@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use glam::{Vec2, Vec3, Vec4};
-use meshmend_core::{MeshBounds, Triangle, TriangleId};
+use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshBounds, Triangle, TriangleId};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -73,8 +73,10 @@ pub struct WgpuRenderer<'window> {
     mesh_chunks: Vec<GpuMeshChunk>,
     scene_lines: Option<SceneLines>,
     mesh_bounds: Option<MeshBounds>,
+    cross_section: CrossSectionState,
+    cross_section_guide: Option<SceneLines>,
     selection_marker: Option<SceneLines>,
-    note_markers: Option<SceneLines>,
+    issue_markers: Option<SceneLines>,
     display_settings: DisplaySettings,
     info: RendererInfo,
 }
@@ -146,6 +148,7 @@ impl<'window> WgpuRenderer<'window> {
                 camera,
                 aspect_from_size(size),
                 DisplaySettings::default(),
+                CrossSectionState::default(),
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -253,8 +256,10 @@ impl<'window> WgpuRenderer<'window> {
             mesh_chunks: Vec::new(),
             scene_lines: None,
             mesh_bounds: None,
+            cross_section: CrossSectionState::default(),
+            cross_section_guide: None,
             selection_marker: None,
-            note_markers: None,
+            issue_markers: None,
             display_settings: DisplaySettings::default(),
             info,
         })
@@ -300,6 +305,19 @@ impl<'window> WgpuRenderer<'window> {
         self.write_camera();
     }
 
+    pub fn cross_section(&self) -> CrossSectionState {
+        self.cross_section
+    }
+
+    pub fn set_cross_section(&mut self, mut cross_section: CrossSectionState) {
+        if let Some(bounds) = self.mesh_bounds {
+            cross_section.clamp_to_bounds(bounds);
+        }
+        self.cross_section = cross_section;
+        self.update_cross_section_guide();
+        self.write_camera();
+    }
+
     pub fn mesh_bounds(&self) -> Option<MeshBounds> {
         self.mesh_bounds
     }
@@ -319,8 +337,10 @@ impl<'window> WgpuRenderer<'window> {
         self.mesh_chunks.clear();
         self.mesh_bounds = Some(bounds);
         self.scene_lines = Some(SceneLines::new(&self.device, bounds));
+        self.cross_section = CrossSectionState::centered(bounds);
+        self.update_cross_section_guide();
         self.selection_marker = None;
-        self.note_markers = None;
+        self.issue_markers = None;
 
         for chunk in chunks {
             if chunk.triangles.is_empty() {
@@ -479,18 +499,6 @@ impl<'window> WgpuRenderer<'window> {
                     );
                 }
             }
-            if let Some(marker) = &self.selection_marker {
-                pass.set_pipeline(&self.grid_pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, marker.buffer.slice(..));
-                pass.draw(0..marker.grid_vertex_count, 0..1);
-            }
-            if let Some(markers) = &self.note_markers {
-                pass.set_pipeline(&self.grid_pipeline);
-                pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, markers.buffer.slice(..));
-                pass.draw(0..markers.grid_vertex_count, 0..1);
-            }
             let mesh_pipeline = if self.display_settings.show_backfaces {
                 &self.mesh_pipeline
             } else {
@@ -501,6 +509,24 @@ impl<'window> WgpuRenderer<'window> {
             for chunk in &self.mesh_chunks {
                 pass.set_bind_group(1, &chunk.bind_group, &[]);
                 pass.draw(0..3, 0..chunk.triangle_count);
+            }
+            if let Some(guide) = &self.cross_section_guide {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, guide.buffer.slice(..));
+                pass.draw(0..guide.grid_vertex_count, 0..1);
+            }
+            if let Some(marker) = &self.selection_marker {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, marker.buffer.slice(..));
+                pass.draw(0..marker.grid_vertex_count, 0..1);
+            }
+            if let Some(markers) = &self.issue_markers {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, markers.buffer.slice(..));
+                pass.draw(0..markers.grid_vertex_count, 0..1);
             }
         }
 
@@ -759,8 +785,8 @@ impl<'window> WgpuRenderer<'window> {
         });
     }
 
-    pub fn set_note_markers(&mut self, positions: &[Vec3]) {
-        self.note_markers = (!positions.is_empty()).then(|| {
+    pub fn set_issue_markers(&mut self, positions: &[Vec3]) {
+        self.issue_markers = (!positions.is_empty()).then(|| {
             SceneLines::markers(
                 &self.device,
                 positions,
@@ -768,6 +794,13 @@ impl<'window> WgpuRenderer<'window> {
                 [0.45, 0.82, 1.0, 0.95],
             )
         });
+    }
+
+    fn update_cross_section_guide(&mut self) {
+        self.cross_section_guide = self
+            .mesh_bounds
+            .filter(|_| self.cross_section.enabled && self.cross_section.show_plane_guide)
+            .map(|bounds| SceneLines::cross_section(&self.device, bounds, self.cross_section));
     }
 
     fn triangle(&self, triangle_id: TriangleId) -> Option<Triangle> {
@@ -854,6 +887,12 @@ impl<'window> WgpuRenderer<'window> {
             pass.set_bind_group(1, &chunk.bind_group, &[]);
             pass.draw(0..3, 0..chunk.triangle_count);
         }
+        if let Some(guide) = &self.cross_section_guide {
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, guide.buffer.slice(..));
+            pass.draw(0..guide.grid_vertex_count, 0..1);
+        }
     }
 
     fn write_camera(&self) {
@@ -864,6 +903,7 @@ impl<'window> WgpuRenderer<'window> {
                 self.camera,
                 self.aspect(),
                 self.display_settings,
+                self.cross_section,
             )),
         );
     }
@@ -892,20 +932,28 @@ struct CameraUniform {
     eye: [f32; 4],
     light_dir: [f32; 4],
     material: [f32; 4],
+    clip_plane: [f32; 4],
     settings: [u32; 4],
 }
 
 impl CameraUniform {
-    fn from_camera(camera: Camera, aspect: f32, settings: DisplaySettings) -> Self {
+    fn from_camera(
+        camera: Camera,
+        aspect: f32,
+        settings: DisplaySettings,
+        cross_section: CrossSectionState,
+    ) -> Self {
+        let plane = cross_section.plane();
         Self {
             view_proj: camera.view_projection(aspect).to_cols_array_2d(),
             eye: camera.eye().extend(1.0).to_array(),
             light_dir: Vec4::new(-0.35, -0.65, -0.62, 0.0).to_array(),
             material: Vec4::new(0.66, 0.70, 0.70, 1.0).to_array(),
+            clip_plane: plane.normal.extend(plane.offset).to_array(),
             settings: [
                 settings.wireframe as u32,
                 settings.normal_debug as u32,
-                0,
+                cross_section.enabled as u32,
                 0,
             ],
         }
@@ -1111,6 +1159,85 @@ impl SceneLines {
         }
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MeshMend marker buffer"),
+            contents: bytemuck::cast_slice(vertices.as_slice()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            buffer,
+            grid_vertex_count: vertices.len() as u32,
+            axes_vertex_count: 0,
+        }
+    }
+
+    fn cross_section(
+        device: &wgpu::Device,
+        bounds: MeshBounds,
+        cross_section: CrossSectionState,
+    ) -> Self {
+        let color = cross_section.axis.color();
+        let min = bounds.min;
+        let max = bounds.max;
+        let offset = cross_section.offset;
+        let corners = match cross_section.axis {
+            CrossSectionAxis::X => [
+                Vec3::new(offset, min.y, min.z),
+                Vec3::new(offset, max.y, min.z),
+                Vec3::new(offset, max.y, max.z),
+                Vec3::new(offset, min.y, max.z),
+            ],
+            CrossSectionAxis::Y => [
+                Vec3::new(min.x, offset, min.z),
+                Vec3::new(max.x, offset, min.z),
+                Vec3::new(max.x, offset, max.z),
+                Vec3::new(min.x, offset, max.z),
+            ],
+            CrossSectionAxis::Z => [
+                Vec3::new(min.x, min.y, offset),
+                Vec3::new(max.x, min.y, offset),
+                Vec3::new(max.x, max.y, offset),
+                Vec3::new(min.x, max.y, offset),
+            ],
+        };
+        let center = (corners[0] + corners[2]) * 0.5;
+        let mut vertices = Vec::with_capacity(12);
+        for index in 0..4 {
+            vertices.push(LineVertex {
+                position: corners[index].to_array(),
+                color,
+            });
+            vertices.push(LineVertex {
+                position: corners[(index + 1) % 4].to_array(),
+                color,
+            });
+        }
+        vertices.push(LineVertex {
+            position: corners[0].to_array(),
+            color,
+        });
+        vertices.push(LineVertex {
+            position: corners[2].to_array(),
+            color,
+        });
+        vertices.push(LineVertex {
+            position: corners[1].to_array(),
+            color,
+        });
+        vertices.push(LineVertex {
+            position: corners[3].to_array(),
+            color,
+        });
+        vertices.push(LineVertex {
+            position: center.to_array(),
+            color: [color[0], color[1], color[2], 1.0],
+        });
+        vertices.push(LineVertex {
+            position: (center + cross_section.axis.normal() * bounds.radius() * 0.08).to_array(),
+            color: [color[0], color[1], color[2], 1.0],
+        });
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend cross-section guide buffer"),
             contents: bytemuck::cast_slice(vertices.as_slice()),
             usage: wgpu::BufferUsages::VERTEX,
         });

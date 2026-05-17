@@ -159,6 +159,10 @@ pub fn run_native(
                             &mut status,
                             &mut needs_redraw,
                         );
+                        if cross_section != renderer.cross_section() {
+                            renderer.set_cross_section(cross_section);
+                            needs_redraw = true;
+                        }
 
                         let pixels_per_point = full_output.pixels_per_point;
                         let paint_jobs = egui_ctx.tessellate(full_output.shapes, pixels_per_point);
@@ -216,7 +220,7 @@ pub fn run_native(
                                     cross_section = CrossSectionState::centered(info.stats.bounds);
                                     model_info = Some(info);
                                     selected_pick = None;
-                                    renderer.set_note_markers(&[]);
+                                    renderer.set_issue_markers(&[]);
                                 }
                             Err(err) => {
                                 status = format!("Load failed: {err}");
@@ -625,7 +629,7 @@ fn handle_ui_action(
                         *model_info = Some(info);
                         *selected_pick = None;
                         renderer.set_selection_marker(None);
-                        renderer.set_note_markers(&[]);
+                        renderer.set_issue_markers(&[]);
                     }
                     Err(err) => {
                         *status = format!("Load failed: {err}");
@@ -793,7 +797,7 @@ fn update_issue_markers(renderer: &mut WgpuRenderer<'_>, session: &IssueSession)
         .iter()
         .map(|issue| glam::Vec3::from_array(issue.position))
         .collect::<Vec<_>>();
-    renderer.set_note_markers(&positions);
+    renderer.set_issue_markers(&positions);
 }
 
 #[allow(clippy::too_many_arguments)]

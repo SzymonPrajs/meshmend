@@ -3,6 +3,7 @@ struct Camera {
     eye: vec4<f32>,
     light_dir: vec4<f32>,
     material: vec4<f32>,
+    clip_plane: vec4<f32>,
     settings: vec4<u32>,
 };
 
@@ -61,6 +62,10 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    if (camera.settings.z == 1u && dot(in.world_position, camera.clip_plane.xyz) < camera.clip_plane.w) {
+        discard;
+    }
+
     let normal = normalize(in.normal);
     if (camera.settings.y == 1u) {
         return vec4<f32>(normal * 0.5 + vec3<f32>(0.5), 1.0);
