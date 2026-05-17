@@ -4,7 +4,7 @@ use anyhow::Result;
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::MeshStats;
-use meshmend_render::{DisplaySettings, MeshChunkUpload, RendererInfo, WgpuRenderer};
+use meshmend_render::{DisplaySettings, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
     dpi::LogicalSize,
@@ -33,7 +33,11 @@ enum UiAction {
     Reset,
 }
 
-pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<()> {
+pub fn run_native(
+    initial_file: Option<PathBuf>,
+    smoke_window: bool,
+    smoke_pick_center: bool,
+) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let title = initial_file
         .as_ref()
@@ -76,6 +80,7 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
     );
     let mut camera_input = CameraInput::default();
     let mut needs_redraw = true;
+    let mut selected_pick: Option<PickResult> = None;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
@@ -105,6 +110,7 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                                 ctx,
                                 renderer.info(),
                                 model_info.as_ref(),
+                                selected_pick,
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut display_settings,
@@ -142,6 +148,32 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                             tracing::error!(error = %err, "render failed");
                             target.exit();
                         }
+                        if smoke_pick_center {
+                            let center = glam::Vec2::new(
+                                renderer.size().width as f32 * 0.5,
+                                renderer.size().height as f32 * 0.5,
+                            );
+                            match renderer.pick(center) {
+                                Ok(Some(pick)) => {
+                                    println!(
+                                        "picked triangle {}:{} at {:.6},{:.6},{:.6}",
+                                        pick.triangle_id.chunk,
+                                        pick.triangle_id.local_index,
+                                        pick.position.x,
+                                        pick.position.y,
+                                        pick.position.z
+                                    );
+                                }
+                                Ok(None) => {
+                                    println!("picked none");
+                                }
+                                Err(err) => {
+                                    eprintln!("pick failed: {err}");
+                                    target.exit();
+                                }
+                            }
+                            target.exit();
+                        }
                         if smoke_window {
                             target.exit();
                         }
@@ -166,7 +198,28 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                             camera_input.press(button);
                         }
                         ElementState::Released => {
-                            camera_input.release(button);
+                            if let Some(position) = camera_input.release(button) {
+                                if button == MouseButton::Left && !egui_response.consumed {
+                                    match renderer.pick(position) {
+                                        Ok(pick) => {
+                                            selected_pick = pick;
+                                            if let Some(pick) = selected_pick {
+                                                status = format!(
+                                                    "Selected triangle {}:{}",
+                                                    pick.triangle_id.chunk,
+                                                    pick.triangle_id.local_index
+                                                );
+                                            }
+                                            needs_redraw = true;
+                                        }
+                                        Err(err) => {
+                                            status = format!("Pick failed: {err}");
+                                            tracing::error!(error = %err, "failed to pick triangle");
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     },
@@ -326,6 +379,7 @@ fn draw_ui(
     ctx: &egui::Context,
     renderer_info: &RendererInfo,
     model_info: Option<&ModelInfo>,
+    selected_pick: Option<PickResult>,
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
@@ -381,6 +435,17 @@ fn draw_ui(
                 ui.label("No model loaded");
             }
             ui.separator();
+            if let Some(pick) = selected_pick {
+                ui.label(format!(
+                    "Selected: {}:{}",
+                    pick.triangle_id.chunk, pick.triangle_id.local_index
+                ));
+                ui.label(format!(
+                    "Point: {:.4}, {:.4}, {:.4}",
+                    pick.position.x, pick.position.y, pick.position.z
+                ));
+                ui.separator();
+            }
             ui.label(format!("GPU: {}", renderer_info.adapter_name));
             ui.label(format!("Backend: {:?}", renderer_info.backend));
         });

@@ -4,4 +4,4 @@ pub mod renderer;
 
 pub use buffers::{GpuTriangle, MeshChunkUpload};
 pub use camera::Camera;
-pub use renderer::{DisplaySettings, RendererInfo, WgpuRenderer};
+pub use renderer::{DisplaySettings, PickResult, RendererInfo, WgpuRenderer};

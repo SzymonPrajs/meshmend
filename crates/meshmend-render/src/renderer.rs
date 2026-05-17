@@ -1,5 +1,5 @@
-use glam::Vec4;
-use meshmend_core::MeshBounds;
+use glam::{Vec2, Vec3, Vec4};
+use meshmend_core::{MeshBounds, Triangle, TriangleId};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -37,6 +37,12 @@ impl Default for DisplaySettings {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PickResult {
+    pub triangle_id: TriangleId,
+    pub position: Vec3,
+}
+
 pub struct WgpuRenderer<'window> {
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
@@ -51,10 +57,13 @@ pub struct WgpuRenderer<'window> {
     mesh_pipeline: wgpu::RenderPipeline,
     mesh_culled_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    picking_pipeline: wgpu::RenderPipeline,
+    picking_target: PickingTarget,
     egui_renderer: egui_wgpu::Renderer,
     mesh_chunks: Vec<GpuMeshChunk>,
     scene_lines: Option<SceneLines>,
     mesh_bounds: Option<MeshBounds>,
+    selection_marker: Option<SceneLines>,
     display_settings: DisplaySettings,
     info: RendererInfo,
 }
@@ -193,6 +202,9 @@ impl<'window> WgpuRenderer<'window> {
         );
         let grid_pipeline =
             create_grid_pipeline(&device, surface_format, &camera_bind_group_layout);
+        let picking_pipeline =
+            create_picking_pipeline(&device, &camera_bind_group_layout, &chunk_bind_group_layout);
+        let picking_target = PickingTarget::new(&device, config.width, config.height);
         let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
         let info = RendererInfo {
             adapter_name: adapter_info.name,
@@ -224,10 +236,13 @@ impl<'window> WgpuRenderer<'window> {
             mesh_pipeline,
             mesh_culled_pipeline,
             grid_pipeline,
+            picking_pipeline,
+            picking_target,
             egui_renderer,
             mesh_chunks: Vec::new(),
             scene_lines: None,
             mesh_bounds: None,
+            selection_marker: None,
             display_settings: DisplaySettings::default(),
             info,
         })
@@ -250,6 +265,8 @@ impl<'window> WgpuRenderer<'window> {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth = DepthTexture::new(&self.device, self.config.width, self.config.height);
+        self.picking_target =
+            PickingTarget::new(&self.device, self.config.width, self.config.height);
         self.write_camera();
     }
 
@@ -290,6 +307,7 @@ impl<'window> WgpuRenderer<'window> {
         self.mesh_chunks.clear();
         self.mesh_bounds = Some(bounds);
         self.scene_lines = Some(SceneLines::new(&self.device, bounds));
+        self.selection_marker = None;
 
         for chunk in chunks {
             if chunk.triangles.is_empty() {
@@ -339,6 +357,7 @@ impl<'window> WgpuRenderer<'window> {
                 start_triangle: chunk.start_triangle,
                 bounds: chunk.bounds,
                 triangle_count: triangles.len() as u32,
+                cpu_triangles: chunk.triangles.to_vec(),
                 triangle_buffer,
                 chunk_buffer,
                 bind_group,
@@ -447,6 +466,12 @@ impl<'window> WgpuRenderer<'window> {
                     );
                 }
             }
+            if let Some(marker) = &self.selection_marker {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, marker.buffer.slice(..));
+                pass.draw(0..marker.grid_vertex_count, 0..1);
+            }
             let mesh_pipeline = if self.display_settings.show_backfaces {
                 &self.mesh_pipeline
             } else {
@@ -500,6 +525,142 @@ impl<'window> WgpuRenderer<'window> {
             .sum()
     }
 
+    pub fn pick(&mut self, screen_position: Vec2) -> Result<Option<PickResult>, RenderError> {
+        if self.mesh_chunks.is_empty() || self.size.width == 0 || self.size.height == 0 {
+            return Ok(None);
+        }
+
+        let x = screen_position.x.clamp(0.0, self.size.width as f32 - 1.0) as u32;
+        let y = screen_position.y.clamp(0.0, self.size.height as f32 - 1.0) as u32;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("MeshMend picking encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MeshMend picking pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.picking_target.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.picking_target.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.picking_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for chunk in &self.mesh_chunks {
+                pass.set_bind_group(1, &chunk.bind_group, &[]);
+                pass.draw(0..3, 0..chunk.triangle_count);
+            }
+        }
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.picking_target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.picking_target.readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(PickingTarget::READBACK_BYTES_PER_ROW),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.picking_target.readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|_| RenderError::PickReadbackClosed)??;
+        let data = slice.get_mapped_range();
+        let pick_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        drop(data);
+        self.picking_target.readback.unmap();
+
+        let Some(triangle_id) = TriangleId::decode_picking_id(pick_id) else {
+            self.selection_marker = None;
+            return Ok(None);
+        };
+        let Some(triangle) = self.triangle(triangle_id) else {
+            self.selection_marker = None;
+            return Ok(None);
+        };
+        let ray = self.pick_ray(screen_position);
+        let position = intersect_triangle(ray, triangle).unwrap_or_else(|| {
+            (triangle.vertices[0] + triangle.vertices[1] + triangle.vertices[2]) / 3.0
+        });
+        self.selection_marker = Some(SceneLines::marker(
+            &self.device,
+            position,
+            self.marker_radius(),
+        ));
+
+        Ok(Some(PickResult {
+            triangle_id,
+            position,
+        }))
+    }
+
+    fn triangle(&self, triangle_id: TriangleId) -> Option<Triangle> {
+        let chunk = self
+            .mesh_chunks
+            .iter()
+            .find(|chunk| chunk.chunk_index == triangle_id.chunk)?;
+        chunk
+            .cpu_triangles
+            .get(triangle_id.local_index as usize)
+            .copied()
+    }
+
+    fn pick_ray(&self, screen_position: Vec2) -> Ray {
+        let width = self.size.width.max(1) as f32;
+        let height = self.size.height.max(1) as f32;
+        let ndc_x = screen_position.x / width * 2.0 - 1.0;
+        let ndc_y = 1.0 - screen_position.y / height * 2.0;
+        let inverse = self.camera.view_projection(self.aspect()).inverse();
+        let near = inverse.project_point3(Vec3::new(ndc_x, ndc_y, -1.0));
+        let far = inverse.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+        Ray {
+            origin: near,
+            direction: (far - near).normalize_or_zero(),
+        }
+    }
+
+    fn marker_radius(&self) -> f32 {
+        self.mesh_bounds
+            .map(|bounds| bounds.radius() * 0.018)
+            .unwrap_or(0.05)
+            .max(0.002)
+    }
+
     fn write_camera(&self) {
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -523,6 +684,7 @@ struct GpuMeshChunk {
     start_triangle: u64,
     bounds: MeshBounds,
     triangle_count: u32,
+    cpu_triangles: Vec<Triangle>,
     triangle_buffer: wgpu::Buffer,
     chunk_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -717,6 +879,47 @@ impl SceneLines {
             axes_vertex_count,
         }
     }
+
+    fn marker(device: &wgpu::Device, position: Vec3, radius: f32) -> Self {
+        let color = [1.0, 0.72, 0.16, 1.0];
+        let vertices = [
+            LineVertex {
+                position: (position + Vec3::new(-radius, 0.0, 0.0)).to_array(),
+                color,
+            },
+            LineVertex {
+                position: (position + Vec3::new(radius, 0.0, 0.0)).to_array(),
+                color,
+            },
+            LineVertex {
+                position: (position + Vec3::new(0.0, -radius, 0.0)).to_array(),
+                color,
+            },
+            LineVertex {
+                position: (position + Vec3::new(0.0, radius, 0.0)).to_array(),
+                color,
+            },
+            LineVertex {
+                position: (position + Vec3::new(0.0, 0.0, -radius)).to_array(),
+                color,
+            },
+            LineVertex {
+                position: (position + Vec3::new(0.0, 0.0, radius)).to_array(),
+                color,
+            },
+        ];
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend selection marker buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            buffer,
+            grid_vertex_count: vertices.len() as u32,
+            axes_vertex_count: 0,
+        }
+    }
 }
 
 fn create_grid_pipeline(
@@ -772,6 +975,135 @@ fn create_grid_pipeline(
     })
 }
 
+fn create_picking_pipeline(
+    device: &wgpu::Device,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+    chunk_bind_group_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("MeshMend picking shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/picking.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("MeshMend picking pipeline layout"),
+        bind_group_layouts: &[camera_bind_group_layout, chunk_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("MeshMend picking pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: PickingTarget::FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DepthTexture::FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    })
+}
+
+struct PickingTarget {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    depth: DepthTexture,
+    readback: wgpu::Buffer,
+}
+
+impl PickingTarget {
+    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+    const READBACK_BYTES_PER_ROW: u32 = 256;
+
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MeshMend picking texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MeshMend picking readback"),
+            size: Self::READBACK_BYTES_PER_ROW as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            texture,
+            view,
+            depth: DepthTexture::new(device, width, height),
+            readback,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Ray {
+    origin: Vec3,
+    direction: Vec3,
+}
+
+fn intersect_triangle(ray: Ray, triangle: Triangle) -> Option<Vec3> {
+    let epsilon = 1.0e-7;
+    let edge1 = triangle.vertices[1] - triangle.vertices[0];
+    let edge2 = triangle.vertices[2] - triangle.vertices[0];
+    let h = ray.direction.cross(edge2);
+    let a = edge1.dot(h);
+    if a.abs() < epsilon {
+        return None;
+    }
+
+    let f = 1.0 / a;
+    let s = ray.origin - triangle.vertices[0];
+    let u = f * s.dot(h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+
+    let q = s.cross(edge1);
+    let v = f * ray.direction.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+
+    let t = f * edge2.dot(q);
+    (t > epsilon).then(|| ray.origin + ray.direction * t)
+}
+
 fn aspect_from_size(size: PhysicalSize<u32>) -> f32 {
     size.width.max(1) as f32 / size.height.max(1) as f32
 }
@@ -825,6 +1157,10 @@ pub enum RenderError {
     NoAdapter,
     #[error("GPU surface is out of memory")]
     SurfaceOutOfMemory,
+    #[error("GPU picking readback channel closed")]
+    PickReadbackClosed,
+    #[error(transparent)]
+    PickReadback(#[from] wgpu::BufferAsyncError),
     #[error(transparent)]
     CreateSurface(#[from] wgpu::CreateSurfaceError),
     #[error(transparent)]

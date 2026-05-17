@@ -20,6 +20,9 @@ struct Cli {
 
     #[arg(long, hide = true)]
     smoke_window: bool,
+
+    #[arg(long, hide = true)]
+    smoke_pick_center: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,7 +75,7 @@ fn main() -> Result<()> {
             );
         }
         None => {
-            app::run_native(cli.input, cli.smoke_window)?;
+            app::run_native(cli.input, cli.smoke_window, cli.smoke_pick_center)?;
         }
     }
 
