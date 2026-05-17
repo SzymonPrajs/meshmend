@@ -110,7 +110,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let edge = min(min(in.barycentric.x, in.barycentric.y), in.barycentric.z);
         let width = max(fwidth(edge) * select(1.35, 1.9, camera.view.y == 1u), 0.0001);
         let wire = 1.0 - smoothstep(0.0, width, edge);
-        let wire_color = select(vec3<f32>(0.05, 0.07, 0.08), vec3<f32>(0.18, 0.92, 1.0), camera.view.y == 1u);
+        let wire_color = select(vec3<f32>(0.86, 0.89, 0.90), vec3<f32>(0.96, 0.98, 1.0), camera.view.y == 1u);
         clay = mix(clay, wire_color, wire);
         if (camera.view.y == 1u) {
             alpha = max(alpha, wire * 0.86);
