@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use meshmend_render::WgpuRenderer;
+use meshmend_render::{MeshChunkUpload, WgpuRenderer};
+use meshmend_stl::load_binary_stl;
 use winit::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -30,6 +31,25 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
         backend = ?renderer.info().backend,
         "native renderer ready"
     );
+    if let Some(path) = initial_file.as_ref() {
+        let parsed = load_binary_stl(path)?;
+        renderer.upload_mesh(
+            parsed.chunks.iter().map(|chunk| MeshChunkUpload {
+                chunk_index: chunk.chunk_index,
+                start_triangle: chunk.start_triangle,
+                bounds: chunk.bounds,
+                triangles: &chunk.triangles,
+            }),
+            parsed.stats.bounds,
+        );
+        tracing::info!(
+            file = %parsed.source_path.display(),
+            triangles = parsed.stats.triangle_count,
+            chunks = parsed.chunks.len(),
+            gpu_buffer_mb = renderer.gpu_buffer_bytes() as f64 / (1024.0 * 1024.0),
+            "loaded STL mesh"
+        );
+    }
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);

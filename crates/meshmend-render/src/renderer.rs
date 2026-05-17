@@ -1,4 +1,12 @@
+use glam::Vec4;
+use meshmend_core::MeshBounds;
+use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
+
+use crate::{
+    buffers::{GpuTriangle, MeshChunkUpload},
+    Camera,
+};
 
 #[derive(Debug, Clone)]
 pub struct RendererInfo {
@@ -15,6 +23,13 @@ pub struct WgpuRenderer<'window> {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     depth: DepthTexture,
+    camera: Camera,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    chunk_bind_group_layout: wgpu::BindGroupLayout,
+    mesh_pipeline: wgpu::RenderPipeline,
+    mesh_chunks: Vec<GpuMeshChunk>,
+    mesh_bounds: Option<MeshBounds>,
     info: RendererInfo,
 }
 
@@ -73,6 +88,69 @@ impl<'window> WgpuRenderer<'window> {
         };
         surface.configure(&device, &config);
         let depth = DepthTexture::new(&device, config.width, config.height);
+        let camera = Camera::default();
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend camera uniform"),
+            contents: bytemuck::bytes_of(&CameraUniform::from_camera(
+                camera,
+                aspect_from_size(size),
+            )),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("MeshMend camera bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MeshMend camera bind group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let chunk_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("MeshMend triangle chunk bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let mesh_pipeline = create_mesh_pipeline(
+            &device,
+            surface_format,
+            &camera_bind_group_layout,
+            &chunk_bind_group_layout,
+        );
         let info = RendererInfo {
             adapter_name: adapter_info.name,
             backend: adapter_info.backend,
@@ -96,6 +174,13 @@ impl<'window> WgpuRenderer<'window> {
             config,
             size,
             depth,
+            camera,
+            camera_buffer,
+            camera_bind_group,
+            chunk_bind_group_layout,
+            mesh_pipeline,
+            mesh_chunks: Vec::new(),
+            mesh_bounds: None,
             info,
         })
     }
@@ -117,6 +202,92 @@ impl<'window> WgpuRenderer<'window> {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth = DepthTexture::new(&self.device, self.config.width, self.config.height);
+        self.write_camera();
+    }
+
+    pub fn camera(&self) -> Camera {
+        self.camera
+    }
+
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.camera = camera;
+        self.write_camera();
+    }
+
+    pub fn mesh_bounds(&self) -> Option<MeshBounds> {
+        self.mesh_bounds
+    }
+
+    pub fn fit_camera_to_mesh(&mut self) {
+        if let Some(bounds) = self.mesh_bounds {
+            self.camera.fit_to_bounds(bounds, self.aspect());
+            self.write_camera();
+        }
+    }
+
+    pub fn upload_mesh<'a>(
+        &mut self,
+        chunks: impl IntoIterator<Item = MeshChunkUpload<'a>>,
+        bounds: MeshBounds,
+    ) {
+        self.mesh_chunks.clear();
+        self.mesh_bounds = Some(bounds);
+
+        for chunk in chunks {
+            if chunk.triangles.is_empty() {
+                continue;
+            }
+            let triangles = chunk
+                .triangles
+                .iter()
+                .copied()
+                .map(GpuTriangle::from)
+                .collect::<Vec<_>>();
+            let triangle_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("MeshMend triangle chunk"),
+                        contents: bytemuck::cast_slice(&triangles),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+            let chunk_uniform = ChunkUniform {
+                chunk_index: chunk.chunk_index,
+                _pad: [0; 3],
+            };
+            let chunk_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("MeshMend chunk uniform"),
+                    contents: bytemuck::bytes_of(&chunk_uniform),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("MeshMend triangle chunk bind group"),
+                layout: &self.chunk_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: triangle_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: chunk_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            self.mesh_chunks.push(GpuMeshChunk {
+                chunk_index: chunk.chunk_index,
+                start_triangle: chunk.start_triangle,
+                bounds: chunk.bounds,
+                triangle_count: triangles.len() as u32,
+                triangle_buffer,
+                chunk_buffer,
+                bind_group,
+            });
+        }
+
+        self.fit_camera_to_mesh();
     }
 
     pub fn render(&mut self) -> Result<(), RenderError> {
@@ -139,7 +310,7 @@ impl<'window> WgpuRenderer<'window> {
             });
 
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MeshMend clear pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -165,12 +336,136 @@ impl<'window> WgpuRenderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            pass.set_pipeline(&self.mesh_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for chunk in &self.mesh_chunks {
+                pass.set_bind_group(1, &chunk.bind_group, &[]);
+                pass.draw(0..3, 0..chunk.triangle_count);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
     }
+
+    pub fn gpu_buffer_bytes(&self) -> u64 {
+        self.mesh_chunks
+            .iter()
+            .map(|chunk| {
+                u64::from(chunk.triangle_count) * std::mem::size_of::<GpuTriangle>() as u64
+                    + std::mem::size_of::<ChunkUniform>() as u64
+            })
+            .sum()
+    }
+
+    fn write_camera(&self) {
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::bytes_of(&CameraUniform::from_camera(self.camera, self.aspect())),
+        );
+    }
+
+    fn aspect(&self) -> f32 {
+        self.config.width as f32 / self.config.height.max(1) as f32
+    }
+}
+
+#[allow(dead_code)]
+struct GpuMeshChunk {
+    chunk_index: u32,
+    start_triangle: u64,
+    bounds: MeshBounds,
+    triangle_count: u32,
+    triangle_buffer: wgpu::Buffer,
+    chunk_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    light_dir: [f32; 4],
+    material: [f32; 4],
+}
+
+impl CameraUniform {
+    fn from_camera(camera: Camera, aspect: f32) -> Self {
+        Self {
+            view_proj: camera.view_projection(aspect).to_cols_array_2d(),
+            eye: camera.eye().extend(1.0).to_array(),
+            light_dir: Vec4::new(-0.35, -0.65, -0.62, 0.0).to_array(),
+            material: Vec4::new(0.66, 0.70, 0.70, 1.0).to_array(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChunkUniform {
+    chunk_index: u32,
+    _pad: [u32; 3],
+}
+
+fn create_mesh_pipeline(
+    device: &wgpu::Device,
+    surface_format: wgpu::TextureFormat,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+    chunk_bind_group_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("MeshMend mesh shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("MeshMend mesh pipeline layout"),
+        bind_group_layouts: &[camera_bind_group_layout, chunk_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("MeshMend mesh pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DepthTexture::FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    })
+}
+
+fn aspect_from_size(size: PhysicalSize<u32>) -> f32 {
+    size.width.max(1) as f32 / size.height.max(1) as f32
 }
 
 struct DepthTexture {
