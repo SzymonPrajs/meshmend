@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -8,9 +9,13 @@ use std::{
 use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
+use glam::{Vec2, Vec3};
 use meshmend_analysis::AnalysisReport;
-use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
-use meshmend_render::{DisplaySettings, LightingMode, MeshChunkUpload, RendererInfo, WgpuRenderer};
+use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats, TriangleId};
+use meshmend_render::{
+    DisplaySettings, LightingMode, MeshChunkUpload, PickResult, RendererInfo, SelectionOverlay,
+    WgpuRenderer,
+};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
     dpi::LogicalSize,
@@ -26,6 +31,7 @@ use crate::{
 };
 
 const FPS_DISPLAY_INTERVAL: Duration = Duration::from_secs(1);
+const SELECTION_UNDO_LIMIT: usize = 64;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
@@ -52,6 +58,7 @@ enum UiAction {
     OpenStl,
     Save,
     SaveAs,
+    ClearSelection,
     Fit,
     Reset,
     Quit,
@@ -416,6 +423,275 @@ impl ViewMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionElement {
+    Vertex,
+    Edge,
+    Face,
+}
+
+impl SelectionElement {
+    const ALL: [Self; 3] = [Self::Vertex, Self::Edge, Self::Face];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vertex => "Vertex",
+            Self::Edge => "Edge",
+            Self::Face => "Face",
+        }
+    }
+
+    fn shortcut(self) -> &'static str {
+        match self {
+            Self::Vertex => "A",
+            Self::Edge => "S",
+            Self::Face => "D",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Vertex => Icon::VertexSelect,
+            Self::Edge => Icon::EdgeSelect,
+            Self::Face => Icon::FaceSelect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionTool {
+    Point,
+    Brush,
+    Line,
+}
+
+impl SelectionTool {
+    const ALL: [Self; 3] = [Self::Point, Self::Brush, Self::Line];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Point => "Point",
+            Self::Brush => "Brush",
+            Self::Line => "Line",
+        }
+    }
+
+    fn shortcut(self) -> &'static str {
+        match self {
+            Self::Point => "Q",
+            Self::Brush => "W",
+            Self::Line => "E",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Point => Icon::PointSelect,
+            Self::Brush => Icon::BrushSelect,
+            Self::Line => Icon::LineSelect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionDepth {
+    Front,
+    Through,
+}
+
+impl SelectionDepth {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Front => "Front",
+            Self::Through => "Through",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Front => Self::Through,
+            Self::Through => Self::Front,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FaceKey {
+    chunk: u32,
+    local_index: u32,
+}
+
+impl From<TriangleId> for FaceKey {
+    fn from(value: TriangleId) -> Self {
+        Self {
+            chunk: value.chunk,
+            local_index: value.local_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct VertexKey(i64, i64, i64);
+
+impl VertexKey {
+    fn from_position(position: Vec3) -> Self {
+        const SCALE: f32 = 1_000_000.0;
+        Self(
+            (position.x * SCALE).round() as i64,
+            (position.y * SCALE).round() as i64,
+            (position.z * SCALE).round() as i64,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EdgeKey(VertexKey, VertexKey);
+
+impl EdgeKey {
+    fn new(start: Vec3, end: Vec3) -> Self {
+        let a = VertexKey::from_position(start);
+        let b = VertexKey::from_position(end);
+        if a <= b {
+            Self(a, b)
+        } else {
+            Self(b, a)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SelectedElements {
+    vertices: BTreeMap<VertexKey, Vec3>,
+    edges: BTreeMap<EdgeKey, [Vec3; 2]>,
+    faces: BTreeMap<FaceKey, [Vec3; 3]>,
+}
+
+impl SelectedElements {
+    fn clear(&mut self) {
+        self.vertices.clear();
+        self.edges.clear();
+        self.faces.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.vertices.is_empty() && self.edges.is_empty() && self.faces.is_empty()
+    }
+
+    fn add_vertex(&mut self, position: Vec3) -> bool {
+        self.vertices
+            .insert(VertexKey::from_position(position), position)
+            .is_none()
+    }
+
+    fn add_edge(&mut self, start: Vec3, end: Vec3) -> bool {
+        self.edges
+            .insert(EdgeKey::new(start, end), [start, end])
+            .is_none()
+    }
+
+    fn add_face(&mut self, triangle_id: TriangleId, vertices: [Vec3; 3]) -> bool {
+        self.faces
+            .insert(FaceKey::from(triangle_id), vertices)
+            .is_none()
+    }
+
+    fn overlay_for(&self, element: SelectionElement) -> SelectionOverlay {
+        match element {
+            SelectionElement::Vertex => SelectionOverlay {
+                vertices: self.vertices.values().copied().collect(),
+                edges: Vec::new(),
+                faces: Vec::new(),
+            },
+            SelectionElement::Edge => SelectionOverlay {
+                vertices: Vec::new(),
+                edges: self.edges.values().copied().collect(),
+                faces: Vec::new(),
+            },
+            SelectionElement::Face => SelectionOverlay {
+                vertices: Vec::new(),
+                edges: Vec::new(),
+                faces: self.faces.values().copied().collect(),
+            },
+        }
+    }
+
+    fn summary_for(&self, element: SelectionElement) -> String {
+        match element {
+            SelectionElement::Vertex => format!("{} vertices selected", self.vertices.len()),
+            SelectionElement::Edge => format!("{} edges selected", self.edges.len()),
+            SelectionElement::Face => format!("{} faces selected", self.faces.len()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SelectionState {
+    element: SelectionElement,
+    tool: SelectionTool,
+    depth: SelectionDepth,
+    brush_radius_px: f32,
+    brush_active: bool,
+    last_brush_position: Option<Vec2>,
+    cursor_position: Option<Vec2>,
+    line_start: Option<Vec2>,
+    selected: SelectedElements,
+    undo_stack: VecDeque<SelectedElements>,
+    brush_undo_snapshot: Option<SelectedElements>,
+}
+
+impl Default for SelectionState {
+    fn default() -> Self {
+        Self {
+            element: SelectionElement::Face,
+            tool: SelectionTool::Point,
+            depth: SelectionDepth::Front,
+            brush_radius_px: 44.0,
+            brush_active: false,
+            last_brush_position: None,
+            cursor_position: None,
+            line_start: None,
+            selected: SelectedElements::default(),
+            undo_stack: VecDeque::new(),
+            brush_undo_snapshot: None,
+        }
+    }
+}
+
+impl SelectionState {
+    fn summary(&self) -> String {
+        self.selected.summary_for(self.element)
+    }
+
+    fn push_undo_snapshot(&mut self, snapshot: SelectedElements) {
+        self.undo_stack.push_back(snapshot);
+        while self.undo_stack.len() > SELECTION_UNDO_LIMIT {
+            self.undo_stack.pop_front();
+        }
+    }
+
+    fn undo_last_selection(&mut self) -> bool {
+        let Some(snapshot) = self.undo_stack.pop_back() else {
+            return false;
+        };
+        self.selected = snapshot;
+        self.cancel_active_gesture();
+        true
+    }
+
+    fn cancel_active_gesture(&mut self) {
+        self.line_start = None;
+        self.last_brush_position = None;
+        self.brush_active = false;
+        self.brush_undo_snapshot = None;
+    }
+
+    fn reset_for_model_change(&mut self) {
+        self.selected.clear();
+        self.undo_stack.clear();
+        self.cancel_active_gesture();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FrameMeter {
     last_frame: Instant,
@@ -563,6 +839,414 @@ fn apply_camera_zoom(renderer: &mut WgpuRenderer<'_>, wheel_delta: f32, needs_re
     *needs_redraw = true;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionStrokeKind {
+    Point,
+    Brush,
+    Line,
+}
+
+fn apply_selection_at_screen(
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    screen_position: Vec2,
+    stroke_kind: SelectionStrokeKind,
+    seen_faces: Option<&mut HashSet<TriangleId>>,
+) -> Result<bool> {
+    let hits = pick_results_for_depth(renderer, screen_position, selection.depth)?;
+    let mut changed = false;
+    let mut seen_faces = seen_faces;
+    for hit in hits {
+        if let Some(seen_faces) = seen_faces.as_mut() {
+            if !seen_faces.insert(hit.triangle_id) {
+                continue;
+            }
+        }
+        changed |= add_hit_to_selection(renderer, selection, hit, screen_position, stroke_kind);
+    }
+    Ok(changed)
+}
+
+fn apply_brush_selection(
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    center: Vec2,
+) -> Result<bool> {
+    let mut changed = false;
+    let mut seen_faces = HashSet::new();
+    for point in brush_sample_points(center, selection.brush_radius_px) {
+        changed |= apply_selection_at_screen(
+            renderer,
+            selection,
+            point,
+            SelectionStrokeKind::Brush,
+            Some(&mut seen_faces),
+        )?;
+    }
+    if changed {
+        sync_selection_overlay(renderer, selection);
+    }
+    Ok(changed)
+}
+
+fn apply_line_selection(
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    start: Vec2,
+    end: Vec2,
+) -> Result<bool> {
+    let mut changed = false;
+    let mut seen_faces = HashSet::new();
+    for point in line_sample_points(start, end) {
+        changed |= apply_selection_at_screen(
+            renderer,
+            selection,
+            point,
+            SelectionStrokeKind::Line,
+            Some(&mut seen_faces),
+        )?;
+    }
+    if changed {
+        sync_selection_overlay(renderer, selection);
+    }
+    Ok(changed)
+}
+
+fn pick_results_for_depth(
+    renderer: &mut WgpuRenderer<'_>,
+    screen_position: Vec2,
+    depth: SelectionDepth,
+) -> Result<Vec<PickResult>> {
+    if !renderer.selection_acceleration_ready() {
+        return Err(anyhow!("Selection acceleration is still preparing"));
+    }
+    renderer
+        .pick_selection_hits(screen_position, depth == SelectionDepth::Through)
+        .map_err(Into::into)
+}
+
+fn add_hit_to_selection(
+    renderer: &WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    hit: PickResult,
+    screen_position: Vec2,
+    stroke_kind: SelectionStrokeKind,
+) -> bool {
+    let Some(vertices) = renderer.triangle_vertices(hit.triangle_id) else {
+        return false;
+    };
+
+    match selection.element {
+        SelectionElement::Face => selection.selected.add_face(hit.triangle_id, vertices),
+        SelectionElement::Edge if stroke_kind == SelectionStrokeKind::Brush => {
+            selection.selected.add_edge(vertices[0], vertices[1])
+                | selection.selected.add_edge(vertices[1], vertices[2])
+                | selection.selected.add_edge(vertices[2], vertices[0])
+        }
+        SelectionElement::Edge => {
+            let [start, end] = nearest_screen_edge(renderer, vertices, screen_position);
+            selection.selected.add_edge(start, end)
+        }
+        SelectionElement::Vertex if stroke_kind == SelectionStrokeKind::Brush => {
+            selection.selected.add_vertex(vertices[0])
+                | selection.selected.add_vertex(vertices[1])
+                | selection.selected.add_vertex(vertices[2])
+        }
+        SelectionElement::Vertex if stroke_kind == SelectionStrokeKind::Line => {
+            let [start, end] = nearest_screen_edge(renderer, vertices, screen_position);
+            selection.selected.add_vertex(start) | selection.selected.add_vertex(end)
+        }
+        SelectionElement::Vertex => {
+            let vertex = nearest_screen_vertex(renderer, vertices, screen_position);
+            selection.selected.add_vertex(vertex)
+        }
+    }
+}
+
+fn sync_selection_overlay(renderer: &mut WgpuRenderer<'_>, selection: &SelectionState) {
+    renderer.set_selection_overlay(&selection.selected.overlay_for(selection.element));
+}
+
+fn clear_selection(
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    record_history: bool,
+) -> bool {
+    let had_selection = !selection.selected.is_empty();
+    let had_gesture = selection.line_start.is_some() || selection.brush_active;
+
+    if record_history && had_selection {
+        selection.push_undo_snapshot(selection.selected.clone());
+    }
+    selection.selected.clear();
+    selection.cancel_active_gesture();
+    renderer.set_selection_overlay(&SelectionOverlay::default());
+    had_selection || had_gesture
+}
+
+fn undo_selection(renderer: &mut WgpuRenderer<'_>, selection: &mut SelectionState) -> bool {
+    if !selection.undo_last_selection() {
+        return false;
+    }
+    sync_selection_overlay(renderer, selection);
+    true
+}
+
+fn brush_sample_points(center: Vec2, radius: f32) -> Vec<Vec2> {
+    let radius = radius.clamp(8.0, 180.0);
+    let step = (radius / 4.0).clamp(6.0, 14.0);
+    let rings = (radius / step).ceil() as i32;
+    let mut points = Vec::new();
+    points.push(center);
+    for y in -rings..=rings {
+        for x in -rings..=rings {
+            if x == 0 && y == 0 {
+                continue;
+            }
+            let offset = Vec2::new(x as f32 * step, y as f32 * step);
+            if offset.length_squared() <= radius * radius {
+                points.push(center + offset);
+            }
+        }
+    }
+    points
+}
+
+fn line_sample_points(start: Vec2, end: Vec2) -> Vec<Vec2> {
+    let length = (end - start).length();
+    if length <= 0.5 {
+        return vec![start];
+    }
+    let steps = (length / 6.0).ceil().clamp(1.0, 1024.0) as usize;
+    (0..=steps)
+        .map(|index| {
+            let t = index as f32 / steps as f32;
+            start.lerp(end, t)
+        })
+        .collect()
+}
+
+fn nearest_screen_vertex(
+    renderer: &WgpuRenderer<'_>,
+    vertices: [Vec3; 3],
+    screen_position: Vec2,
+) -> Vec3 {
+    vertices
+        .into_iter()
+        .min_by(|a, b| {
+            let da = renderer
+                .world_to_screen(*a)
+                .map(|point| point.distance_squared(screen_position))
+                .unwrap_or(f32::MAX);
+            let db = renderer
+                .world_to_screen(*b)
+                .map(|point| point.distance_squared(screen_position))
+                .unwrap_or(f32::MAX);
+            da.total_cmp(&db)
+        })
+        .unwrap_or(vertices[0])
+}
+
+fn nearest_screen_edge(
+    renderer: &WgpuRenderer<'_>,
+    vertices: [Vec3; 3],
+    screen_position: Vec2,
+) -> [Vec3; 2] {
+    let edges = [
+        [vertices[0], vertices[1]],
+        [vertices[1], vertices[2]],
+        [vertices[2], vertices[0]],
+    ];
+    edges
+        .into_iter()
+        .min_by(|a, b| {
+            let da = screen_edge_distance_squared(renderer, *a, screen_position);
+            let db = screen_edge_distance_squared(renderer, *b, screen_position);
+            da.total_cmp(&db)
+        })
+        .unwrap_or(edges[0])
+}
+
+fn screen_edge_distance_squared(
+    renderer: &WgpuRenderer<'_>,
+    edge: [Vec3; 2],
+    screen_position: Vec2,
+) -> f32 {
+    let Some(start) = renderer.world_to_screen(edge[0]) else {
+        return f32::MAX;
+    };
+    let Some(end) = renderer.world_to_screen(edge[1]) else {
+        return f32::MAX;
+    };
+    point_segment_distance_squared(screen_position, start, end)
+}
+
+fn point_segment_distance_squared(point: Vec2, start: Vec2, end: Vec2) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.length_squared();
+    if length_squared <= f32::EPSILON {
+        return point.distance_squared(start);
+    }
+    let t = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
+    point.distance_squared(start + segment * t)
+}
+
+fn handle_selection_click(
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    screen_position: Vec2,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let snapshot = selection.selected.clone();
+    let result = match selection.tool {
+        SelectionTool::Point => apply_selection_at_screen(
+            renderer,
+            selection,
+            screen_position,
+            SelectionStrokeKind::Point,
+            None,
+        ),
+        SelectionTool::Brush => apply_brush_selection(renderer, selection, screen_position),
+        SelectionTool::Line => {
+            if let Some(start) = selection.line_start.take() {
+                apply_line_selection(renderer, selection, start, screen_position)
+            } else {
+                selection.line_start = Some(screen_position);
+                *status = "Line selector start point set".to_string();
+                *needs_redraw = true;
+                return;
+            }
+        }
+    };
+
+    match result {
+        Ok(true) => {
+            selection.push_undo_snapshot(snapshot);
+            sync_selection_overlay(renderer, selection);
+            *status = selection.summary();
+            *needs_redraw = true;
+        }
+        Ok(false) => {
+            *status = "Selection hit nothing".to_string();
+            *needs_redraw = true;
+        }
+        Err(err) => {
+            *status = format!("Selection failed: {err}");
+            *needs_redraw = true;
+        }
+    }
+}
+
+fn handle_brush_selection(
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    screen_position: Vec2,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    if selection
+        .last_brush_position
+        .map(|last| last.distance(screen_position) < 3.0)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    selection.last_brush_position = Some(screen_position);
+
+    match apply_brush_selection(renderer, selection, screen_position) {
+        Ok(true) => {
+            if let Some(snapshot) = selection.brush_undo_snapshot.take() {
+                selection.push_undo_snapshot(snapshot);
+            }
+            sync_selection_overlay(renderer, selection);
+            *status = selection.summary();
+            *needs_redraw = true;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            *status = format!("Brush selection failed: {err}");
+            *needs_redraw = true;
+        }
+    }
+}
+
+fn handle_selection_shortcut(
+    key: PhysicalKey,
+    modifiers: ModifiersState,
+    renderer: &mut WgpuRenderer<'_>,
+    selection: &mut SelectionState,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) -> bool {
+    if matches!(key, PhysicalKey::Code(KeyCode::KeyZ))
+        && (modifiers.control_key() || modifiers.super_key())
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+    {
+        if undo_selection(renderer, selection) {
+            *status = format!("Undid selection: {}", selection.summary());
+        } else {
+            *status = "No selection undo available".to_string();
+        }
+        *needs_redraw = true;
+        return true;
+    }
+
+    if modifiers.super_key() || modifiers.control_key() || modifiers.alt_key() {
+        return false;
+    }
+
+    match key {
+        PhysicalKey::Code(KeyCode::KeyA) => selection.element = SelectionElement::Vertex,
+        PhysicalKey::Code(KeyCode::KeyS) => selection.element = SelectionElement::Edge,
+        PhysicalKey::Code(KeyCode::KeyD) => selection.element = SelectionElement::Face,
+        PhysicalKey::Code(KeyCode::KeyQ) => {
+            selection.tool = SelectionTool::Point;
+            selection.cancel_active_gesture();
+        }
+        PhysicalKey::Code(KeyCode::KeyW) => {
+            selection.tool = SelectionTool::Brush;
+            selection.cancel_active_gesture();
+        }
+        PhysicalKey::Code(KeyCode::KeyE) => {
+            selection.tool = SelectionTool::Line;
+            selection.cancel_active_gesture();
+        }
+        PhysicalKey::Code(KeyCode::KeyX) => selection.depth = selection.depth.next(),
+        PhysicalKey::Code(KeyCode::Escape) => {
+            if clear_selection(renderer, selection, true) {
+                *status = "Selection cleared".to_string();
+            } else {
+                *status = "Selection already clear".to_string();
+            }
+            *needs_redraw = true;
+            return true;
+        }
+        PhysicalKey::Code(KeyCode::Backspace) | PhysicalKey::Code(KeyCode::Delete) => {
+            if clear_selection(renderer, selection, true) {
+                *status = "Selection cleared".to_string();
+            } else {
+                *status = "Selection already clear".to_string();
+            }
+            *needs_redraw = true;
+            return true;
+        }
+        _ => return false,
+    }
+
+    *status = format!(
+        "{} {} selection ({})",
+        selection.depth.label(),
+        selection.element.label(),
+        selection.tool.label()
+    );
+    selection.last_brush_position = None;
+    sync_selection_overlay(renderer, selection);
+    *needs_redraw = true;
+    true
+}
+
 pub fn run_native(
     initial_file: Option<PathBuf>,
     smoke_window: bool,
@@ -616,6 +1300,7 @@ pub fn run_native(
     );
     let mut camera_input = CameraInput::default();
     let mut ui_input = UiInputState::default();
+    let mut selection_state = SelectionState::default();
     let mut active_modifiers = ModifiersState::default();
     let mut needs_redraw = true;
 
@@ -642,6 +1327,7 @@ pub fn run_native(
                                 &mut view_mode,
                                 &mut show_shortcuts,
                                 &mut status,
+                                &mut selection_state,
                                 &mut needs_redraw,
                             );
                             native_menu.set_model_loaded(model_info.is_some());
@@ -673,6 +1359,7 @@ pub fn run_native(
                         let mut action = UiAction::None;
                         let mut next_display_settings = renderer.display_settings();
                         let mut next_ui_regions = UiInputRegions::default();
+                        let previous_selection_element = selection_state.element;
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             draw_ui(
                                 ctx,
@@ -683,6 +1370,8 @@ pub fn run_native(
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut next_display_settings,
+                                &mut selection_state,
+                                window.scale_factor() as f32,
                                 &mut show_shortcuts,
                                 &mut show_view_switcher,
                                 &mut action,
@@ -695,6 +1384,11 @@ pub fn run_native(
 
                         if next_display_settings != renderer.display_settings() {
                             renderer.set_display_settings(next_display_settings);
+                            needs_redraw = true;
+                        }
+                        if previous_selection_element != selection_state.element {
+                            sync_selection_overlay(&mut renderer, &selection_state);
+                            status = selection_state.summary();
                             needs_redraw = true;
                         }
 
@@ -712,6 +1406,7 @@ pub fn run_native(
                                     &mut view_mode,
                                     &mut show_shortcuts,
                                     &mut status,
+                                    &mut selection_state,
                                     &mut needs_redraw,
                                 );
                                 native_menu.set_model_loaded(model_info.is_some());
@@ -771,24 +1466,81 @@ pub fn run_native(
                             &mut model_info,
                             &mut status,
                         );
+                        selection_state.reset_for_model_change();
                         needs_redraw = true;
                         native_menu.set_model_loaded(model_info.is_some());
                     }
                     WindowEvent::MouseInput { state, button, .. } => match state {
+                        ElementState::Pressed
+                            if button == MouseButton::Left
+                                && selection_state.tool == SelectionTool::Brush
+                                && !active_modifiers.shift_key()
+                                && ui_input.allows_pointer_action(window.scale_factor() as f32) =>
+                        {
+                            selection_state.brush_active = true;
+                            selection_state.last_brush_position = None;
+                            selection_state.brush_undo_snapshot =
+                                Some(selection_state.selected.clone());
+                            if let Some(position) = selection_state.cursor_position {
+                                handle_brush_selection(
+                                    &mut renderer,
+                                    &mut selection_state,
+                                    position,
+                                    &mut status,
+                                    &mut needs_redraw,
+                                );
+                            }
+                        }
                         ElementState::Pressed
                             if is_camera_button(button)
                                 && ui_input.allows_pointer_action(window.scale_factor() as f32) =>
                         {
                             camera_input.press(button);
                         }
+                        ElementState::Released
+                            if button == MouseButton::Left && selection_state.brush_active =>
+                        {
+                            selection_state.brush_active = false;
+                            selection_state.last_brush_position = None;
+                            selection_state.brush_undo_snapshot = None;
+                            needs_redraw = true;
+                        }
                         ElementState::Released => {
-                            camera_input.release(button);
+                            if let Some(click_position) = camera_input.release(button) {
+                                if button == MouseButton::Left
+                                    && ui_input.regions.allows_physical_position(
+                                        Some(click_position),
+                                        window.scale_factor() as f32,
+                                    )
+                                {
+                                    handle_selection_click(
+                                        &mut renderer,
+                                        &mut selection_state,
+                                        click_position,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    );
+                                }
+                            }
                         }
                         _ => {}
                     },
                     WindowEvent::CursorMoved { position, .. } => {
                         ui_input.set_cursor_position(position.x, position.y);
-                        if let Some((button, delta)) =
+                        let cursor = Vec2::new(position.x as f32, position.y as f32);
+                        selection_state.cursor_position = Some(cursor);
+                        if selection_state.brush_active {
+                            let _ = camera_input.cursor_delta(position.x, position.y);
+                            if ui_input.allows_pointer_action(window.scale_factor() as f32) {
+                                handle_brush_selection(
+                                    &mut renderer,
+                                    &mut selection_state,
+                                    cursor,
+                                    &mut status,
+                                    &mut needs_redraw,
+                                );
+                            }
+                        } else if let Some((button, delta)) =
                             camera_input.cursor_delta(position.x, position.y)
                         {
                             if let Some(drag) =
@@ -823,6 +1575,7 @@ pub fn run_native(
                                         &mut view_mode,
                                         &mut show_shortcuts,
                                         &mut status,
+                                        &mut selection_state,
                                         &mut needs_redraw,
                                     );
                                     native_menu.set_model_loaded(model_info.is_some());
@@ -836,12 +1589,25 @@ pub fn run_native(
                                         &mut view_mode,
                                         &mut show_shortcuts,
                                         &mut status,
+                                        &mut selection_state,
                                         &mut needs_redraw,
                                     );
                                     native_menu.set_model_loaded(model_info.is_some());
                                 }
                             }
-                        } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ)) {
+                        } else if handle_selection_shortcut(
+                            event.physical_key,
+                            active_modifiers,
+                            &mut renderer,
+                            &mut selection_state,
+                            &mut status,
+                            &mut needs_redraw,
+                        ) {
+                        } else if matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ))
+                            && !active_modifiers.control_key()
+                            && !active_modifiers.super_key()
+                            && !active_modifiers.alt_key()
+                        {
                             show_view_switcher = true;
                             needs_redraw = true;
                         }
@@ -863,6 +1629,7 @@ pub fn run_native(
                                 &mut view_mode,
                                 &mut show_shortcuts,
                                 &mut status,
+                                &mut selection_state,
                                 &mut needs_redraw,
                             );
                             native_menu.set_model_loaded(model_info.is_some());
@@ -1261,6 +2028,8 @@ fn draw_ui(
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
+    selection_state: &mut SelectionState,
+    scale_factor: f32,
     show_shortcuts: &mut bool,
     show_view_switcher: &mut bool,
     action: &mut UiAction,
@@ -1283,6 +2052,11 @@ fn draw_ui(
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
         .show(ctx, |_ui| {});
+
+    if let Some(rect) = draw_selection_palette(ctx, selection_state, action) {
+        ui_regions.add(rect);
+    }
+    draw_selection_cursor(ctx, selection_state, scale_factor);
 
     let bottom_response = egui::TopBottomPanel::bottom("status_bar")
         .resizable(false)
@@ -1309,6 +2083,211 @@ fn draw_ui(
             draw_view_switcher(ctx, view_mode, display_settings, show_view_switcher, action)
         {
             ui_regions.add(rect);
+        }
+    }
+}
+
+fn draw_selection_palette(
+    ctx: &egui::Context,
+    selection_state: &mut SelectionState,
+    action: &mut UiAction,
+) -> Option<egui::Rect> {
+    let response = egui::Area::new(egui::Id::new("selection_palette"))
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 50.0))
+        .show(ctx, |ui| {
+            egui::Frame::dark_canvas(ui.style())
+                .rounding(egui::Rounding::same(7.0))
+                .inner_margin(egui::Margin::symmetric(5.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width(50.0);
+                    palette_caption(ui, "Element");
+                    for element in SelectionElement::ALL {
+                        if palette_icon_button(
+                            ui,
+                            element.icon(),
+                            &format!("{} select ({})", element.label(), element.shortcut()),
+                            selection_state.element == element,
+                        )
+                        .clicked()
+                        {
+                            selection_state.element = element;
+                        }
+                    }
+
+                    ui.add_space(5.0);
+                    ui.separator();
+                    ui.add_space(5.0);
+                    palette_caption(ui, "Tool");
+                    for tool in SelectionTool::ALL {
+                        if palette_icon_button(
+                            ui,
+                            tool.icon(),
+                            &format!("{} selection ({})", tool.label(), tool.shortcut()),
+                            selection_state.tool == tool,
+                        )
+                        .clicked()
+                        {
+                            selection_state.tool = tool;
+                            selection_state.cancel_active_gesture();
+                        }
+                    }
+
+                    ui.add_space(5.0);
+                    ui.separator();
+                    ui.add_space(5.0);
+                    let depth_label = match selection_state.depth {
+                        SelectionDepth::Front => "1st",
+                        SelectionDepth::Through => "All",
+                    };
+                    if palette_button(
+                        ui,
+                        depth_label,
+                        "Toggle front-surface vs through selection (X)",
+                        selection_state.depth == SelectionDepth::Through,
+                    )
+                    .clicked()
+                    {
+                        selection_state.depth = selection_state.depth.next();
+                    }
+
+                    if selection_state.tool == SelectionTool::Brush {
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            if mini_button(ui, "-").clicked() {
+                                selection_state.brush_radius_px =
+                                    (selection_state.brush_radius_px - 4.0).max(8.0);
+                            }
+                            ui.label(format!("{:.0}", selection_state.brush_radius_px));
+                            if mini_button(ui, "+").clicked() {
+                                selection_state.brush_radius_px =
+                                    (selection_state.brush_radius_px + 4.0).min(180.0);
+                            }
+                        });
+                    }
+
+                    ui.add_space(5.0);
+                    ui.separator();
+                    ui.add_space(5.0);
+                    if palette_icon_button(ui, Icon::ClearSelection, "Clear selection (Esc)", false)
+                        .clicked()
+                    {
+                        *action = UiAction::ClearSelection;
+                    }
+                });
+        });
+    Some(response.response.rect)
+}
+
+fn palette_caption(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label)
+            .size(9.5)
+            .color(ui.visuals().weak_text_color()),
+    );
+}
+
+fn palette_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    tooltip: &str,
+    selected: bool,
+) -> egui::Response {
+    let size = egui::vec2(42.0, 31.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        visuals.widgets.inactive.bg_fill
+    };
+    let stroke_color = if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.widgets.inactive.fg_stroke.color
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(6.0), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(6.0),
+        egui::Stroke::new(1.0, stroke_color.gamma_multiply(0.75)),
+    );
+    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(19.0, 19.0));
+    draw_icon(ui.painter(), icon_rect, icon, stroke_color);
+    response.on_hover_text(tooltip)
+}
+
+fn palette_button(ui: &mut egui::Ui, label: &str, tooltip: &str, selected: bool) -> egui::Response {
+    let size = egui::vec2(42.0, 31.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        visuals.widgets.inactive.bg_fill
+    };
+    let stroke_color = if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.widgets.inactive.fg_stroke.color
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(6.0), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(6.0),
+        egui::Stroke::new(1.0, stroke_color.gamma_multiply(0.75)),
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        stroke_color,
+    );
+    response.on_hover_text(tooltip)
+}
+
+fn mini_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized([16.0, 20.0], egui::Button::new(label))
+}
+
+fn draw_selection_cursor(ctx: &egui::Context, selection_state: &SelectionState, scale_factor: f32) {
+    let scale_factor = scale_factor.max(0.1);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("selection_cursor"),
+    ));
+    let cursor = selection_state
+        .cursor_position
+        .map(|position| egui::pos2(position.x / scale_factor, position.y / scale_factor));
+
+    if selection_state.tool == SelectionTool::Brush {
+        if let Some(cursor) = cursor {
+            let radius = selection_state.brush_radius_px / scale_factor;
+            painter.circle_stroke(
+                cursor,
+                radius,
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(155, 220, 255)),
+            );
+            painter.circle_filled(cursor, 2.0, egui::Color32::from_rgb(210, 245, 255));
+        }
+    }
+
+    if selection_state.tool == SelectionTool::Line {
+        if let Some(start) = selection_state.line_start {
+            let start = egui::pos2(start.x / scale_factor, start.y / scale_factor);
+            painter.circle_filled(start, 3.5, egui::Color32::from_rgb(210, 245, 255));
+            if let Some(cursor) = cursor {
+                painter.line_segment(
+                    [start, cursor],
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(155, 220, 255)),
+                );
+            }
         }
     }
 }
@@ -1448,6 +2427,13 @@ fn draw_shortcuts_window(ctx: &egui::Context, show_shortcuts: &mut bool) -> Opti
             ui.monospace("Shift+Left drag  Pan");
             ui.monospace("Middle/Right     Pan");
             ui.monospace("Wheel/trackpad   Zoom");
+            ui.separator();
+            ui.label("Selection");
+            ui.monospace("A/S/D        Vertex / Edge / Face");
+            ui.monospace("Q/W/E        Point / Brush / Line");
+            ui.monospace("X            Front / Through");
+            ui.monospace("Esc/Delete   Clear selection");
+            ui.monospace("Cmd/Ctrl+Z   Undo selection");
         })
         .map(|response| response.response.rect)
 }
@@ -1485,6 +2471,7 @@ fn handle_ui_action(
     view_mode: &mut ViewMode,
     show_shortcuts: &mut bool,
     status: &mut String,
+    selection_state: &mut SelectionState,
     needs_redraw: &mut bool,
 ) {
     match action {
@@ -1497,6 +2484,7 @@ fn handle_ui_action(
         UiAction::OpenStl => {
             if let Some(path) = meshmend_io::pick_stl_file() {
                 load_model_into_app(&path, renderer, window, model_info, status);
+                selection_state.reset_for_model_change();
                 *needs_redraw = true;
             }
         }
@@ -1523,12 +2511,21 @@ fn handle_ui_action(
                 match export_current_stl(&model.path, &path) {
                     Ok(()) => {
                         load_model_into_app(&path, renderer, window, model_info, status);
+                        selection_state.reset_for_model_change();
                         *status = format!("Exported {}", path.display());
                     }
                     Err(err) => *status = format!("Export failed: {err}"),
                 }
                 *needs_redraw = true;
             }
+        }
+        UiAction::ClearSelection => {
+            if clear_selection(renderer, selection_state, true) {
+                *status = "Selection cleared".to_string();
+            } else {
+                *status = "Selection already clear".to_string();
+            }
+            *needs_redraw = true;
         }
         UiAction::Fit => {
             renderer.fit_camera_to_mesh();
@@ -1926,6 +2923,108 @@ mod tests {
             camera_drag_for_button(MouseButton::Right, delta, ModifiersState::empty()),
             Some(CameraDrag::Pan(delta))
         );
+    }
+
+    #[test]
+    fn selection_edges_deduplicate_when_direction_changes() {
+        let mut selected = SelectedElements::default();
+        let a = Vec3::new(1.0, 2.0, 3.0);
+        let b = Vec3::new(4.0, 5.0, 6.0);
+
+        assert!(selected.add_edge(a, b));
+        assert!(!selected.add_edge(b, a));
+        assert_eq!(selected.edges.len(), 1);
+    }
+
+    #[test]
+    fn selection_overlay_only_contains_active_element_type() {
+        let mut selected = SelectedElements::default();
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(1.0, 0.0, 0.0);
+        let c = Vec3::new(0.0, 1.0, 0.0);
+
+        selected.add_vertex(a);
+        selected.add_edge(a, b);
+        selected.add_face(
+            TriangleId {
+                chunk: 0,
+                local_index: 0,
+            },
+            [a, b, c],
+        );
+
+        let face_overlay = selected.overlay_for(SelectionElement::Face);
+        assert_eq!(face_overlay.faces.len(), 1);
+        assert!(face_overlay.edges.is_empty());
+        assert!(face_overlay.vertices.is_empty());
+
+        let edge_overlay = selected.overlay_for(SelectionElement::Edge);
+        assert_eq!(edge_overlay.edges.len(), 1);
+        assert!(edge_overlay.faces.is_empty());
+        assert!(edge_overlay.vertices.is_empty());
+
+        let vertex_overlay = selected.overlay_for(SelectionElement::Vertex);
+        assert_eq!(vertex_overlay.vertices.len(), 1);
+        assert!(vertex_overlay.faces.is_empty());
+        assert!(vertex_overlay.edges.is_empty());
+    }
+
+    #[test]
+    fn selection_undo_restores_previous_snapshot() {
+        let mut selection = SelectionState::default();
+        let before = selection.selected.clone();
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(1.0, 0.0, 0.0);
+
+        selection.selected.add_edge(a, b);
+        selection.push_undo_snapshot(before);
+
+        assert_eq!(selection.selected.edges.len(), 1);
+        assert!(selection.undo_last_selection());
+        assert!(selection.selected.is_empty());
+        assert!(!selection.undo_last_selection());
+    }
+
+    #[test]
+    fn selection_reset_for_model_change_clears_selection_and_undo() {
+        let mut selection = SelectionState::default();
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(1.0, 0.0, 0.0);
+
+        selection.selected.add_edge(a, b);
+        selection.push_undo_snapshot(SelectedElements::default());
+        selection.line_start = Some(Vec2::new(4.0, 8.0));
+        selection.brush_active = true;
+        selection.reset_for_model_change();
+
+        assert!(selection.selected.is_empty());
+        assert!(selection.undo_stack.is_empty());
+        assert!(selection.line_start.is_none());
+        assert!(!selection.brush_active);
+    }
+
+    #[test]
+    fn brush_samples_include_center_and_stay_inside_circle() {
+        let center = Vec2::new(120.0, 80.0);
+        let radius = 44.0;
+        let points = brush_sample_points(center, radius);
+
+        assert!(points.contains(&center));
+        assert!(points.len() > 8);
+        assert!(points
+            .iter()
+            .all(|point| point.distance(center) <= radius + f32::EPSILON));
+    }
+
+    #[test]
+    fn line_samples_include_endpoints() {
+        let start = Vec2::new(10.0, 20.0);
+        let end = Vec2::new(40.0, 20.0);
+        let points = line_sample_points(start, end);
+
+        assert_eq!(points.first().copied(), Some(start));
+        assert_eq!(points.last().copied(), Some(end));
+        assert!(points.len() > 2);
     }
 
     fn fixture_path(name: &str) -> PathBuf {

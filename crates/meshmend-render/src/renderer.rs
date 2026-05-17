@@ -1,7 +1,15 @@
-use std::{fs, path::Path, time::Instant};
+use std::{
+    fs,
+    path::Path,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::Instant,
+};
 
 use glam::{Vec2, Vec3, Vec4};
-use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshBounds, Triangle, TriangleId};
+use meshmend_core::{
+    CrossSectionAxis, CrossSectionPlane, CrossSectionState, MeshBounds, Triangle, TriangleId,
+};
 use meshmend_geometry::{Ray, SelectionMesh};
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
@@ -93,6 +101,19 @@ pub struct LabelStrokeOverlay {
     pub color: [f32; 4],
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SelectionOverlay {
+    pub vertices: Vec<Vec3>,
+    pub edges: Vec<[Vec3; 2]>,
+    pub faces: Vec<[Vec3; 3]>,
+}
+
+impl SelectionOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty() && self.edges.is_empty() && self.faces.is_empty()
+    }
+}
+
 pub struct WgpuRenderer<'window> {
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
@@ -108,6 +129,7 @@ pub struct WgpuRenderer<'window> {
     mesh_culled_pipeline: wgpu::RenderPipeline,
     mesh_xray_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    selection_face_pipeline: wgpu::RenderPipeline,
     picking_pipeline: wgpu::RenderPipeline,
     picking_target: PickingTarget,
     egui_renderer: egui_wgpu::Renderer,
@@ -117,8 +139,11 @@ pub struct WgpuRenderer<'window> {
     cross_section: CrossSectionState,
     cross_section_guide: Option<SceneLines>,
     label_strokes: Option<SceneLines>,
+    selection_overlay: Option<SelectionSceneOverlay>,
     selection_marker: Option<SceneLines>,
     issue_markers: Option<SceneLines>,
+    pick_mesh: Option<PickMesh>,
+    pick_mesh_build: Option<Receiver<PickMesh>>,
     selection_mesh: Option<SelectionMesh>,
     display_settings: DisplaySettings,
     info: RendererInfo,
@@ -284,6 +309,8 @@ impl<'window> WgpuRenderer<'window> {
         );
         let grid_pipeline =
             create_grid_pipeline(&device, surface_format, &camera_bind_group_layout);
+        let selection_face_pipeline =
+            create_selection_face_pipeline(&device, surface_format, &camera_bind_group_layout);
         let picking_pipeline =
             create_picking_pipeline(&device, &camera_bind_group_layout, &chunk_bind_group_layout);
         let picking_target = PickingTarget::new(&device, config.width, config.height);
@@ -319,6 +346,7 @@ impl<'window> WgpuRenderer<'window> {
             mesh_culled_pipeline,
             mesh_xray_pipeline,
             grid_pipeline,
+            selection_face_pipeline,
             picking_pipeline,
             picking_target,
             egui_renderer,
@@ -328,8 +356,11 @@ impl<'window> WgpuRenderer<'window> {
             cross_section: CrossSectionState::default(),
             cross_section_guide: None,
             label_strokes: None,
+            selection_overlay: None,
             selection_marker: None,
             issue_markers: None,
+            pick_mesh: None,
+            pick_mesh_build: None,
             selection_mesh: None,
             display_settings: DisplaySettings::default(),
             info,
@@ -411,8 +442,11 @@ impl<'window> WgpuRenderer<'window> {
         self.cross_section = CrossSectionState::centered(bounds);
         self.update_cross_section_guide();
         self.label_strokes = None;
+        self.selection_overlay = None;
         self.selection_marker = None;
         self.issue_markers = None;
+        self.pick_mesh = None;
+        self.pick_mesh_build = None;
         self.selection_mesh = None;
 
         for chunk in chunks {
@@ -470,6 +504,7 @@ impl<'window> WgpuRenderer<'window> {
             });
         }
 
+        self.start_pick_mesh_build();
         self.fit_camera_to_mesh();
     }
 
@@ -517,6 +552,97 @@ impl<'window> WgpuRenderer<'window> {
             "built CPU selection geometry on demand"
         );
         self.selection_mesh = Some(selection_mesh);
+    }
+
+    fn start_pick_mesh_build(&mut self) {
+        let chunk_triangles = self
+            .mesh_chunks
+            .iter()
+            .map(|chunk| (chunk.chunk_index, chunk.cpu_triangles.clone()))
+            .collect::<Vec<_>>();
+        let triangle_count = chunk_triangles
+            .iter()
+            .map(|(_, triangles)| triangles.len())
+            .sum();
+        if triangle_count == 0 {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let pick_mesh = PickMesh::from_chunk_triangles(chunk_triangles, triangle_count);
+            tracing::info!(
+                faces = pick_mesh.triangles.len(),
+                build_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "built fast CPU pick mesh in background"
+            );
+            let _ = sender.send(pick_mesh);
+        });
+        self.pick_mesh_build = Some(receiver);
+    }
+
+    fn poll_pick_mesh_build(&mut self) {
+        let Some(result) = self.pick_mesh_build.as_ref().map(Receiver::try_recv) else {
+            return;
+        };
+        match result {
+            Ok(pick_mesh) => {
+                self.pick_mesh = Some(pick_mesh);
+                self.pick_mesh_build = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.pick_mesh_build = None;
+            }
+        }
+    }
+
+    pub fn selection_acceleration_ready(&mut self) -> bool {
+        self.poll_pick_mesh_build();
+        self.pick_mesh.is_some() || self.mesh_chunks.is_empty()
+    }
+
+    fn ensure_pick_mesh(&mut self) {
+        self.poll_pick_mesh_build();
+        if self.pick_mesh.is_some() {
+            return;
+        }
+        let started = Instant::now();
+        let pick_mesh = if let Some(receiver) = self.pick_mesh_build.take() {
+            match receiver.recv() {
+                Ok(pick_mesh) => pick_mesh,
+                Err(_) => {
+                    let chunk_triangles = self
+                        .mesh_chunks
+                        .iter()
+                        .map(|chunk| (chunk.chunk_index, chunk.cpu_triangles.clone()))
+                        .collect::<Vec<_>>();
+                    let triangle_count = chunk_triangles
+                        .iter()
+                        .map(|(_, triangles)| triangles.len())
+                        .sum();
+                    PickMesh::from_chunk_triangles(chunk_triangles, triangle_count)
+                }
+            }
+        } else {
+            let chunk_triangles = self
+                .mesh_chunks
+                .iter()
+                .map(|chunk| (chunk.chunk_index, chunk.cpu_triangles.clone()))
+                .collect::<Vec<_>>();
+            let triangle_count = chunk_triangles
+                .iter()
+                .map(|(_, triangles)| triangles.len())
+                .sum();
+            PickMesh::from_chunk_triangles(chunk_triangles, triangle_count)
+        };
+        tracing::info!(
+            faces = pick_mesh.triangles.len(),
+            build_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "waited for fast CPU pick mesh"
+        );
+        self.pick_mesh = Some(pick_mesh);
     }
 
     pub fn selection_summary(&self) -> Option<SelectionSummary> {
@@ -654,6 +780,22 @@ impl<'window> WgpuRenderer<'window> {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_vertex_buffer(0, strokes.buffer.slice(..));
                 pass.draw(0..strokes.grid_vertex_count, 0..1);
+            }
+            if let Some(selection) = &self.selection_overlay {
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, selection.buffer.slice(..));
+                if selection.face_vertex_count > 0 {
+                    pass.set_pipeline(&self.selection_face_pipeline);
+                    pass.draw(0..selection.face_vertex_count, 0..1);
+                }
+                if selection.line_vertex_count > 0 {
+                    pass.set_pipeline(&self.grid_pipeline);
+                    pass.draw(
+                        selection.face_vertex_count
+                            ..selection.face_vertex_count + selection.line_vertex_count,
+                        0..1,
+                    );
+                }
             }
             if let Some(marker) = &self.selection_marker {
                 pass.set_pipeline(&self.grid_pipeline);
@@ -894,18 +1036,15 @@ impl<'window> WgpuRenderer<'window> {
         self.picking_target.readback.unmap();
 
         let Some(triangle_id) = TriangleId::decode_picking_id(pick_id) else {
-            self.set_selection_marker(None);
             return Ok(None);
         };
         let Some(triangle) = self.triangle(triangle_id) else {
-            self.set_selection_marker(None);
             return Ok(None);
         };
         let ray = self.pick_ray(screen_position);
         let position = intersect_triangle(ray, triangle).unwrap_or_else(|| {
             (triangle.vertices[0] + triangle.vertices[1] + triangle.vertices[2]) / 3.0
         });
-        self.set_selection_marker(Some(position));
 
         Ok(Some(PickResult {
             triangle_id,
@@ -917,20 +1056,28 @@ impl<'window> WgpuRenderer<'window> {
         &mut self,
         screen_position: Vec2,
     ) -> Result<Vec<PickResult>, RenderError> {
-        self.ensure_selection_mesh();
+        self.pick_selection_hits(screen_position, true)
+    }
+
+    pub fn pick_selection_hits(
+        &mut self,
+        screen_position: Vec2,
+        through: bool,
+    ) -> Result<Vec<PickResult>, RenderError> {
+        self.ensure_pick_mesh();
         let ray = self.pick_ray(screen_position);
         let clip_plane = self
             .cross_section
             .enabled
             .then(|| self.cross_section.plane());
-        let Some(selection_mesh) = &self.selection_mesh else {
+        let Some(pick_mesh) = &self.pick_mesh else {
             return Ok(Vec::new());
         };
-        Ok(selection_mesh
-            .hit_stack(ray, clip_plane)
+        Ok(pick_mesh
+            .hits(ray, clip_plane, through)
             .into_iter()
             .map(|hit| PickResult {
-                triangle_id: hit.source_id,
+                triangle_id: hit.triangle_id,
                 position: hit.position,
             })
             .collect())
@@ -983,6 +1130,31 @@ impl<'window> WgpuRenderer<'window> {
     pub fn set_label_strokes(&mut self, strokes: &[LabelStrokeOverlay]) {
         self.label_strokes =
             (!strokes.is_empty()).then(|| SceneLines::label_strokes(&self.device, strokes));
+    }
+
+    pub fn set_selection_overlay(&mut self, overlay: &SelectionOverlay) {
+        self.selection_overlay = (!overlay.is_empty()).then(|| {
+            SelectionSceneOverlay::new(&self.device, overlay, self.marker_radius() * 0.55)
+        });
+    }
+
+    pub fn triangle_vertices(&self, triangle_id: TriangleId) -> Option<[Vec3; 3]> {
+        self.triangle(triangle_id).map(|triangle| triangle.vertices)
+    }
+
+    pub fn world_to_screen(&self, point: Vec3) -> Option<Vec2> {
+        if self.size.width == 0 || self.size.height == 0 {
+            return None;
+        }
+        let clip = self.camera.view_projection(self.aspect()) * point.extend(1.0);
+        if clip.w.abs() <= f32::EPSILON {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some(Vec2::new(
+            (ndc.x + 1.0) * 0.5 * self.size.width as f32,
+            (1.0 - ndc.y) * 0.5 * self.size.height as f32,
+        ))
     }
 
     fn update_cross_section_guide(&mut self) {
@@ -1090,6 +1262,22 @@ impl<'window> WgpuRenderer<'window> {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_vertex_buffer(0, strokes.buffer.slice(..));
             pass.draw(0..strokes.grid_vertex_count, 0..1);
+        }
+        if let Some(selection) = &self.selection_overlay {
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, selection.buffer.slice(..));
+            if selection.face_vertex_count > 0 {
+                pass.set_pipeline(&self.selection_face_pipeline);
+                pass.draw(0..selection.face_vertex_count, 0..1);
+            }
+            if selection.line_vertex_count > 0 {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.draw(
+                    selection.face_vertex_count
+                        ..selection.face_vertex_count + selection.line_vertex_count,
+                    0..1,
+                );
+            }
         }
     }
 
@@ -1449,6 +1637,26 @@ impl SceneLines {
         }
     }
 
+    fn push_segment(vertices: &mut Vec<LineVertex>, start: Vec3, end: Vec3, color: [f32; 4]) {
+        vertices.push(LineVertex {
+            position: start.to_array(),
+            color,
+        });
+        vertices.push(LineVertex {
+            position: end.to_array(),
+            color,
+        });
+    }
+
+    fn push_triangle(vertices: &mut Vec<LineVertex>, face: [Vec3; 3], color: [f32; 4]) {
+        for position in face {
+            vertices.push(LineVertex {
+                position: position.to_array(),
+                color,
+            });
+        }
+    }
+
     fn push_ring(
         vertices: &mut Vec<LineVertex>,
         center: Vec3,
@@ -1555,6 +1763,72 @@ impl SceneLines {
     }
 }
 
+struct SelectionSceneOverlay {
+    buffer: wgpu::Buffer,
+    face_vertex_count: u32,
+    line_vertex_count: u32,
+}
+
+impl SelectionSceneOverlay {
+    fn new(device: &wgpu::Device, overlay: &SelectionOverlay, marker_radius: f32) -> Self {
+        let face_fill = [1.0, 0.48, 0.02, 0.46];
+        let edge_color = [1.0, 0.56, 0.08, 1.0];
+        let vertex_color = [1.0, 0.72, 0.20, 1.0];
+        let mut vertices = Vec::with_capacity(
+            overlay.faces.len() * 3 + overlay.edges.len() * 2 + overlay.vertices.len() * 96,
+        );
+
+        for face in &overlay.faces {
+            SceneLines::push_triangle(&mut vertices, *face, face_fill);
+        }
+        let face_vertex_count = vertices.len() as u32;
+
+        for [start, end] in &overlay.edges {
+            SceneLines::push_segment(&mut vertices, *start, *end, edge_color);
+        }
+        for position in &overlay.vertices {
+            let radius = marker_radius * 1.35;
+            SceneLines::push_ring(
+                &mut vertices,
+                *position,
+                radius,
+                Vec3::X,
+                Vec3::Y,
+                vertex_color,
+            );
+            SceneLines::push_ring(
+                &mut vertices,
+                *position,
+                radius,
+                Vec3::X,
+                Vec3::Z,
+                vertex_color,
+            );
+            SceneLines::push_ring(
+                &mut vertices,
+                *position,
+                radius,
+                Vec3::Y,
+                Vec3::Z,
+                vertex_color,
+            );
+        }
+
+        let line_vertex_count = vertices.len() as u32 - face_vertex_count;
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend selection overlay buffer"),
+            contents: bytemuck::cast_slice(vertices.as_slice()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            buffer,
+            face_vertex_count,
+            line_vertex_count,
+        }
+    }
+}
+
 fn create_grid_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
@@ -1589,6 +1863,59 @@ fn create_grid_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DepthTexture::FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    })
+}
+
+fn create_selection_face_pipeline(
+    device: &wgpu::Device,
+    surface_format: wgpu::TextureFormat,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("MeshMend selection face shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("MeshMend selection face pipeline layout"),
+        bind_group_layouts: &[camera_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("MeshMend selection face pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[LineVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: None,
@@ -1701,6 +2028,364 @@ impl PickingTarget {
             depth: DepthTexture::new(device, width, height),
             readback,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PickMesh {
+    triangles: Vec<PickTriangle>,
+    bvh: PickBvh,
+}
+
+impl PickMesh {
+    fn from_chunk_triangles(
+        chunk_triangles: Vec<(u32, Vec<Triangle>)>,
+        triangle_count: usize,
+    ) -> Self {
+        let mut triangles = Vec::with_capacity(triangle_count);
+        for (chunk_index, chunk_triangles) in chunk_triangles {
+            triangles.extend(chunk_triangles.into_iter().enumerate().map(
+                |(local_index, triangle)| {
+                    PickTriangle::new(
+                        TriangleId {
+                            chunk: chunk_index,
+                            local_index: local_index as u32,
+                        },
+                        triangle,
+                    )
+                },
+            ));
+        }
+        let bvh = PickBvh::build(&triangles);
+        Self { triangles, bvh }
+    }
+
+    fn hits(&self, ray: Ray, clip_plane: Option<CrossSectionPlane>, through: bool) -> Vec<PickHit> {
+        if through {
+            let mut hits = Vec::new();
+            self.bvh.traverse(ray, |triangle_index| {
+                if let Some(hit) = self.intersect(triangle_index, ray, clip_plane) {
+                    hits.push(hit);
+                }
+            });
+            hits.sort_by(|left, right| {
+                left.distance
+                    .partial_cmp(&right.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            hits
+        } else {
+            self.nearest_hit(ray, clip_plane).into_iter().collect()
+        }
+    }
+
+    fn nearest_hit(&self, ray: Ray, clip_plane: Option<CrossSectionPlane>) -> Option<PickHit> {
+        let mut nearest = None::<PickHit>;
+        if self.bvh.nodes.is_empty() {
+            return None;
+        }
+
+        let mut stack = vec![0_u32];
+        while let Some(node_index) = stack.pop() {
+            let node = self.bvh.nodes[node_index as usize];
+            let Some(node_distance) = node.bounds.intersect_ray(ray) else {
+                continue;
+            };
+            if nearest
+                .as_ref()
+                .map(|hit| node_distance > hit.distance)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            if node.is_leaf() {
+                let start = node.first as usize;
+                let end = start + node.count as usize;
+                for &triangle_index in &self.bvh.triangle_indices[start..end] {
+                    let Some(hit) = self.intersect(triangle_index, ray, clip_plane) else {
+                        continue;
+                    };
+                    if nearest
+                        .as_ref()
+                        .map(|current| hit.distance < current.distance)
+                        .unwrap_or(true)
+                    {
+                        nearest = Some(hit);
+                    }
+                }
+            } else {
+                let left_distance = self.bvh.nodes[node.left as usize].bounds.intersect_ray(ray);
+                let right_distance = self.bvh.nodes[node.right as usize]
+                    .bounds
+                    .intersect_ray(ray);
+                match (left_distance, right_distance) {
+                    (Some(left), Some(right)) if left < right => {
+                        stack.push(node.right);
+                        stack.push(node.left);
+                    }
+                    (Some(_), Some(_)) => {
+                        stack.push(node.left);
+                        stack.push(node.right);
+                    }
+                    (Some(_), None) => stack.push(node.left),
+                    (None, Some(_)) => stack.push(node.right),
+                    (None, None) => {}
+                }
+            }
+        }
+        nearest
+    }
+
+    fn intersect(
+        &self,
+        triangle_index: u32,
+        ray: Ray,
+        clip_plane: Option<CrossSectionPlane>,
+    ) -> Option<PickHit> {
+        let triangle = self.triangles[triangle_index as usize];
+        let position = intersect_triangle(ray, triangle.triangle)?;
+        if let Some(plane) = clip_plane {
+            if !plane.keeps_point(position) {
+                return None;
+            }
+        }
+        Some(PickHit {
+            triangle_id: triangle.id,
+            distance: position.distance(ray.origin),
+            position,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickTriangle {
+    id: TriangleId,
+    triangle: Triangle,
+    bounds: PickAabb,
+    centroid: Vec3,
+}
+
+impl PickTriangle {
+    fn new(id: TriangleId, triangle: Triangle) -> Self {
+        let bounds = PickAabb::from_points(triangle.vertices);
+        Self {
+            id,
+            triangle,
+            bounds,
+            centroid: bounds.center(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickHit {
+    triangle_id: TriangleId,
+    distance: f32,
+    position: Vec3,
+}
+
+#[derive(Debug, Clone)]
+struct PickBvh {
+    nodes: Vec<PickBvhNode>,
+    triangle_indices: Vec<u32>,
+}
+
+impl PickBvh {
+    const LEAF_SIZE: usize = 8;
+
+    fn build(triangles: &[PickTriangle]) -> Self {
+        let mut bvh = Self {
+            nodes: Vec::new(),
+            triangle_indices: (0..triangles.len() as u32).collect(),
+        };
+        if !bvh.triangle_indices.is_empty() {
+            bvh.build_node(triangles, 0, bvh.triangle_indices.len());
+        }
+        bvh
+    }
+
+    fn build_node(&mut self, triangles: &[PickTriangle], start: usize, end: usize) -> u32 {
+        let node_index = self.nodes.len() as u32;
+        self.nodes.push(PickBvhNode::empty());
+        let bounds = self.bounds_for_range(triangles, start, end);
+        let count = end - start;
+        if count <= Self::LEAF_SIZE {
+            self.nodes[node_index as usize] = PickBvhNode {
+                bounds,
+                first: start as u32,
+                count: count as u32,
+                left: u32::MAX,
+                right: u32::MAX,
+            };
+            return node_index;
+        }
+
+        let centroid_bounds = self.centroid_bounds_for_range(triangles, start, end);
+        let axis = centroid_bounds.longest_axis();
+        let mid = start + count / 2;
+        self.triangle_indices[start..end].select_nth_unstable_by(mid - start, |left, right| {
+            triangles[*left as usize].centroid[axis]
+                .partial_cmp(&triangles[*right as usize].centroid[axis])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let left = self.build_node(triangles, start, mid);
+        let right = self.build_node(triangles, mid, end);
+        self.nodes[node_index as usize] = PickBvhNode {
+            bounds,
+            first: 0,
+            count: 0,
+            left,
+            right,
+        };
+        node_index
+    }
+
+    fn bounds_for_range(&self, triangles: &[PickTriangle], start: usize, end: usize) -> PickAabb {
+        let mut bounds = PickAabb::empty();
+        for &triangle_index in &self.triangle_indices[start..end] {
+            bounds = bounds.union(triangles[triangle_index as usize].bounds);
+        }
+        bounds
+    }
+
+    fn centroid_bounds_for_range(
+        &self,
+        triangles: &[PickTriangle],
+        start: usize,
+        end: usize,
+    ) -> PickAabb {
+        let mut bounds = PickAabb::empty();
+        for &triangle_index in &self.triangle_indices[start..end] {
+            bounds.include_point(triangles[triangle_index as usize].centroid);
+        }
+        bounds
+    }
+
+    fn traverse(&self, ray: Ray, mut visit: impl FnMut(u32)) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut stack = vec![0_u32];
+        while let Some(node_index) = stack.pop() {
+            let node = self.nodes[node_index as usize];
+            if node.bounds.intersect_ray(ray).is_none() {
+                continue;
+            }
+            if node.is_leaf() {
+                let start = node.first as usize;
+                let end = start + node.count as usize;
+                for &triangle_index in &self.triangle_indices[start..end] {
+                    visit(triangle_index);
+                }
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickBvhNode {
+    bounds: PickAabb,
+    first: u32,
+    count: u32,
+    left: u32,
+    right: u32,
+}
+
+impl PickBvhNode {
+    fn empty() -> Self {
+        Self {
+            bounds: PickAabb::empty(),
+            first: 0,
+            count: 0,
+            left: u32::MAX,
+            right: u32::MAX,
+        }
+    }
+
+    fn is_leaf(self) -> bool {
+        self.count > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PickAabb {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl PickAabb {
+    const RAY_EPSILON: f32 = 1.0e-7;
+
+    fn empty() -> Self {
+        Self {
+            min: Vec3::splat(f32::INFINITY),
+            max: Vec3::splat(f32::NEG_INFINITY),
+        }
+    }
+
+    fn from_points(points: [Vec3; 3]) -> Self {
+        let mut bounds = Self::empty();
+        for point in points {
+            bounds.include_point(point);
+        }
+        bounds
+    }
+
+    fn include_point(&mut self, point: Vec3) {
+        self.min = self.min.min(point);
+        self.max = self.max.max(point);
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        self.include_point(other.min);
+        self.include_point(other.max);
+        self
+    }
+
+    fn center(self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
+
+    fn longest_axis(self) -> usize {
+        let extent = self.max - self.min;
+        if extent.x >= extent.y && extent.x >= extent.z {
+            0
+        } else if extent.y >= extent.z {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn intersect_ray(self, ray: Ray) -> Option<f32> {
+        let mut t_min = 0.0_f32;
+        let mut t_max = f32::INFINITY;
+        for axis in 0..3 {
+            let origin = ray.origin[axis];
+            let direction = ray.direction[axis];
+            if direction.abs() < Self::RAY_EPSILON {
+                if origin < self.min[axis] || origin > self.max[axis] {
+                    return None;
+                }
+                continue;
+            }
+            let inverse = 1.0 / direction;
+            let mut near = (self.min[axis] - origin) * inverse;
+            let mut far = (self.max[axis] - origin) * inverse;
+            if near > far {
+                std::mem::swap(&mut near, &mut far);
+            }
+            t_min = t_min.max(near);
+            t_max = t_max.min(far);
+            if t_min > t_max {
+                return None;
+            }
+        }
+        Some(t_min)
     }
 }
 

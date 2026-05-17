@@ -10,6 +10,13 @@ pub enum Icon {
     Headlight,
     Fit,
     Reset,
+    VertexSelect,
+    EdgeSelect,
+    FaceSelect,
+    PointSelect,
+    BrushSelect,
+    LineSelect,
+    ClearSelection,
 }
 
 pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui::Color32) {
@@ -93,6 +100,54 @@ pub fn draw_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: e
             line(p(7.0, 8.0), p(7.0, 4.0), stroke);
             line(p(7.0, 4.0), p(11.0, 4.0), stroke);
             line(p(7.0, 4.0), p(9.0, 7.0), stroke);
+        }
+        Icon::VertexSelect => {
+            line(p(6.0, 17.0), p(12.0, 6.0), soft);
+            line(p(12.0, 6.0), p(19.0, 16.0), soft);
+            line(p(19.0, 16.0), p(6.0, 17.0), soft);
+            for point in [p(6.0, 17.0), p(12.0, 6.0), p(19.0, 16.0)] {
+                painter.circle_filled(point, rect.width() * 0.105, color);
+            }
+        }
+        Icon::EdgeSelect => {
+            line(p(5.0, 17.0), p(19.0, 7.0), stroke);
+            line(p(7.0, 8.0), p(17.0, 18.0), soft);
+            painter.circle_filled(p(5.0, 17.0), rect.width() * 0.085, color);
+            painter.circle_filled(p(19.0, 7.0), rect.width() * 0.085, color);
+        }
+        Icon::FaceSelect => {
+            let face = vec![p(6.0, 17.0), p(12.0, 6.0), p(19.0, 16.0)];
+            painter.add(egui::Shape::convex_polygon(
+                face,
+                color.gamma_multiply(0.22),
+                stroke,
+            ));
+            line(p(6.0, 17.0), p(19.0, 16.0), soft);
+        }
+        Icon::PointSelect => {
+            painter.circle_stroke(p(12.0, 12.0), rect.width() * 0.18, stroke);
+            line(p(12.0, 4.0), p(12.0, 8.0), stroke);
+            line(p(12.0, 16.0), p(12.0, 20.0), stroke);
+            line(p(4.0, 12.0), p(8.0, 12.0), stroke);
+            line(p(16.0, 12.0), p(20.0, 12.0), stroke);
+        }
+        Icon::BrushSelect => {
+            painter.circle_stroke(p(10.0, 10.0), rect.width() * 0.23, stroke);
+            line(p(14.0, 14.0), p(20.0, 20.0), stroke);
+            line(p(17.0, 17.0), p(20.0, 14.0), soft);
+        }
+        Icon::LineSelect => {
+            line(p(5.0, 18.0), p(19.0, 6.0), stroke);
+            painter.circle_filled(p(5.0, 18.0), rect.width() * 0.09, color);
+            painter.circle_filled(p(19.0, 6.0), rect.width() * 0.09, color);
+            line(p(9.0, 18.0), p(15.0, 18.0), soft);
+            line(p(15.0, 18.0), p(15.0, 12.0), soft);
+        }
+        Icon::ClearSelection => {
+            painter.circle_stroke(p(12.0, 12.0), rect.width() * 0.32, soft);
+            line(p(6.5, 17.5), p(17.5, 6.5), stroke);
+            painter.circle_filled(p(9.0, 9.0), rect.width() * 0.07, color);
+            painter.circle_filled(p(15.0, 15.0), rect.width() * 0.07, color);
         }
     }
 }
