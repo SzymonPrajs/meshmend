@@ -19,12 +19,32 @@ pub struct RendererInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightingMode {
+    Fixed,
+    Headlight,
+    Studio,
+}
+
+impl LightingMode {
+    fn uniform_value(self) -> u32 {
+        match self {
+            Self::Fixed => 0,
+            Self::Headlight => 1,
+            Self::Studio => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplaySettings {
     pub wireframe: bool,
     pub show_backfaces: bool,
     pub show_grid: bool,
     pub show_axes: bool,
     pub normal_debug: bool,
+    pub transparent: bool,
+    pub xray_wire: bool,
+    pub lighting_mode: LightingMode,
 }
 
 impl Default for DisplaySettings {
@@ -35,6 +55,9 @@ impl Default for DisplaySettings {
             show_grid: true,
             show_axes: true,
             normal_debug: false,
+            transparent: false,
+            xray_wire: false,
+            lighting_mode: LightingMode::Headlight,
         }
     }
 }
@@ -73,6 +96,7 @@ pub struct WgpuRenderer<'window> {
     chunk_bind_group_layout: wgpu::BindGroupLayout,
     mesh_pipeline: wgpu::RenderPipeline,
     mesh_culled_pipeline: wgpu::RenderPipeline,
+    mesh_xray_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
     picking_pipeline: wgpu::RenderPipeline,
     picking_target: PickingTarget,
@@ -213,14 +237,39 @@ impl<'window> WgpuRenderer<'window> {
             surface_format,
             &camera_bind_group_layout,
             &chunk_bind_group_layout,
-            None,
+            MeshPipelineConfig {
+                label: "MeshMend mesh pipeline",
+                cull_mode: None,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                blend: wgpu::BlendState::REPLACE,
+            },
         );
         let mesh_culled_pipeline = create_mesh_pipeline(
             &device,
             surface_format,
             &camera_bind_group_layout,
             &chunk_bind_group_layout,
-            Some(wgpu::Face::Back),
+            MeshPipelineConfig {
+                label: "MeshMend culled mesh pipeline",
+                cull_mode: Some(wgpu::Face::Back),
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                blend: wgpu::BlendState::REPLACE,
+            },
+        );
+        let mesh_xray_pipeline = create_mesh_pipeline(
+            &device,
+            surface_format,
+            &camera_bind_group_layout,
+            &chunk_bind_group_layout,
+            MeshPipelineConfig {
+                label: "MeshMend x-ray mesh pipeline",
+                cull_mode: None,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                blend: wgpu::BlendState::ALPHA_BLENDING,
+            },
         );
         let grid_pipeline =
             create_grid_pipeline(&device, surface_format, &camera_bind_group_layout);
@@ -257,6 +306,7 @@ impl<'window> WgpuRenderer<'window> {
             chunk_bind_group_layout,
             mesh_pipeline,
             mesh_culled_pipeline,
+            mesh_xray_pipeline,
             grid_pipeline,
             picking_pipeline,
             picking_target,
@@ -509,11 +559,14 @@ impl<'window> WgpuRenderer<'window> {
                     );
                 }
             }
-            let mesh_pipeline = if self.display_settings.show_backfaces {
-                &self.mesh_pipeline
-            } else {
-                &self.mesh_culled_pipeline
-            };
+            let mesh_pipeline =
+                if self.display_settings.xray_wire || self.display_settings.transparent {
+                    &self.mesh_xray_pipeline
+                } else if self.display_settings.show_backfaces {
+                    &self.mesh_pipeline
+                } else {
+                    &self.mesh_culled_pipeline
+                };
             pass.set_pipeline(mesh_pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             for chunk in &self.mesh_chunks {
@@ -897,7 +950,10 @@ impl<'window> WgpuRenderer<'window> {
                 );
             }
         }
-        let mesh_pipeline = if self.display_settings.show_backfaces {
+        let mesh_pipeline = if self.display_settings.xray_wire || self.display_settings.transparent
+        {
+            &self.mesh_xray_pipeline
+        } else if self.display_settings.show_backfaces {
             &self.mesh_pipeline
         } else {
             &self.mesh_culled_pipeline
@@ -961,6 +1017,7 @@ struct CameraUniform {
     material: [f32; 4],
     clip_plane: [f32; 4],
     settings: [u32; 4],
+    view: [u32; 4],
 }
 
 impl CameraUniform {
@@ -971,16 +1028,27 @@ impl CameraUniform {
         cross_section: CrossSectionState,
     ) -> Self {
         let plane = cross_section.plane();
+        let (_, _, camera_forward) = camera.basis();
+        let light_dir = match settings.lighting_mode {
+            LightingMode::Fixed | LightingMode::Studio => Vec3::new(-0.35, -0.65, -0.62),
+            LightingMode::Headlight => camera_forward,
+        };
         Self {
             view_proj: camera.view_projection(aspect).to_cols_array_2d(),
             eye: camera.eye().extend(1.0).to_array(),
-            light_dir: Vec4::new(-0.35, -0.65, -0.62, 0.0).to_array(),
+            light_dir: light_dir.extend(0.0).to_array(),
             material: Vec4::new(0.66, 0.70, 0.70, 1.0).to_array(),
             clip_plane: plane.normal.extend(plane.offset).to_array(),
             settings: [
                 settings.wireframe as u32,
                 settings.normal_debug as u32,
                 cross_section.enabled as u32,
+                0,
+            ],
+            view: [
+                settings.transparent as u32,
+                settings.xray_wire as u32,
+                settings.lighting_mode.uniform_value(),
                 0,
             ],
         }
@@ -994,12 +1062,20 @@ struct ChunkUniform {
     _pad: [u32; 3],
 }
 
+struct MeshPipelineConfig {
+    label: &'static str,
+    cull_mode: Option<wgpu::Face>,
+    depth_write_enabled: bool,
+    depth_compare: wgpu::CompareFunction,
+    blend: wgpu::BlendState,
+}
+
 fn create_mesh_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     chunk_bind_group_layout: &wgpu::BindGroupLayout,
-    cull_mode: Option<wgpu::Face>,
+    config: MeshPipelineConfig,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("MeshMend mesh shader"),
@@ -1012,7 +1088,7 @@ fn create_mesh_pipeline(
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("MeshMend mesh pipeline"),
+        label: Some(config.label),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -1024,7 +1100,7 @@ fn create_mesh_pipeline(
             entry_point: "fs_main",
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(config.blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -1032,15 +1108,15 @@ fn create_mesh_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode,
+            cull_mode: config.cull_mode,
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DepthTexture::FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: config.depth_write_enabled,
+            depth_compare: config.depth_compare,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),

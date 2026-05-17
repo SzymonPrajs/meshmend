@@ -11,7 +11,8 @@ use egui_winit::State as EguiWinitState;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_render::{
-    DisplaySettings, LabelStrokeOverlay, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer,
+    DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
+    WgpuRenderer,
 };
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
@@ -621,6 +622,76 @@ pub fn run_cross_section_capture(input: PathBuf, output: Option<PathBuf>) -> Res
         show_plane_guide: true,
     };
     run_capture_with_options(input, output, Some(cross_section), true)
+}
+
+pub fn run_view_mode_verification(input: PathBuf) -> Result<()> {
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new()
+        .with_title("MeshMend view mode verification")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_visible(false)
+        .build(&event_loop)?;
+    let window: &'static Window = Box::leak(Box::new(window));
+    let window_id = window.id();
+    let redraw_window = window;
+    let mut renderer = pollster::block_on(WgpuRenderer::new(window))?;
+    let model = load_model(&input, &mut renderer, window)?;
+    let bounds = model.stats.bounds;
+    let result: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+    let result_writer = Arc::clone(&result);
+    let mut needs_redraw = true;
+    let mut captured = false;
+
+    event_loop.run(move |event, target| {
+        target.set_control_flow(ControlFlow::Wait);
+
+        match event {
+            Event::WindowEvent {
+                window_id: event_window_id,
+                event: WindowEvent::RedrawRequested,
+            } if event_window_id == window_id && !captured => {
+                captured = true;
+                let capture = ViewMode::ALL.iter().copied().try_for_each(|mode| {
+                    let mut settings = DisplaySettings::default();
+                    let mut cross_section = CrossSectionState::centered(bounds);
+                    apply_view_mode(mode, &mut settings, &mut cross_section);
+                    renderer.set_display_settings(settings);
+                    renderer.set_cross_section(cross_section);
+                    let stats = renderer.screenshot(None).map_err(anyhow::Error::from)?;
+                    println!(
+                        "view-mode {} {}x{} non_background={} coverage={:.4}",
+                        mode.label(),
+                        stats.width,
+                        stats.height,
+                        stats.non_background_pixels,
+                        stats.coverage
+                    );
+                    if stats.coverage <= 0.001 {
+                        Err(anyhow!(
+                            "{} view verification failed: image is blank",
+                            mode.label()
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                *result_writer
+                    .lock()
+                    .expect("view mode result lock poisoned") = Some(capture);
+                target.exit();
+            }
+            Event::AboutToWait if needs_redraw => {
+                redraw_window.request_redraw();
+                needs_redraw = false;
+            }
+            _ => {}
+        }
+    })?;
+
+    let mut guard = result.lock().expect("view mode result lock poisoned");
+    guard
+        .take()
+        .unwrap_or_else(|| Err(anyhow!("view mode verification did not run")))
 }
 
 fn run_capture_with_options(
@@ -1303,31 +1374,40 @@ fn apply_view_mode(
     display_settings: &mut DisplaySettings,
     cross_section: &mut CrossSectionState,
 ) {
+    display_settings.wireframe = false;
+    display_settings.normal_debug = false;
+    display_settings.transparent = false;
+    display_settings.xray_wire = false;
+    display_settings.lighting_mode = LightingMode::Headlight;
+
     match view_mode {
-        ViewMode::Rendered | ViewMode::Headlight | ViewMode::Studio => {
-            display_settings.wireframe = false;
-            display_settings.normal_debug = false;
+        ViewMode::Rendered => {
+            display_settings.lighting_mode = LightingMode::Fixed;
+        }
+        ViewMode::Headlight => {}
+        ViewMode::Studio => {
+            display_settings.lighting_mode = LightingMode::Studio;
         }
         ViewMode::Normals => {
-            display_settings.wireframe = false;
             display_settings.normal_debug = true;
         }
         ViewMode::SurfaceWire => {
             display_settings.wireframe = true;
-            display_settings.normal_debug = false;
         }
-        ViewMode::XrayWire | ViewMode::Transparent => {
-            display_settings.wireframe = matches!(view_mode, ViewMode::XrayWire);
+        ViewMode::XrayWire => {
+            display_settings.wireframe = true;
+            display_settings.transparent = true;
+            display_settings.xray_wire = true;
             display_settings.show_backfaces = true;
-            display_settings.normal_debug = false;
+        }
+        ViewMode::Transparent => {
+            display_settings.transparent = true;
+            display_settings.show_backfaces = true;
         }
         ViewMode::CrossSection => {
             cross_section.enabled = true;
-            display_settings.normal_debug = false;
         }
-        ViewMode::DefectOverlay | ViewMode::ThicknessOverlay => {
-            display_settings.normal_debug = false;
-        }
+        ViewMode::DefectOverlay | ViewMode::ThicknessOverlay => {}
     }
 }
 

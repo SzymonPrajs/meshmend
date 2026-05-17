@@ -26,4 +26,7 @@ just verify-rose
 ```
 
 `--verify-render` captures pixels from the native WGPU surface and fails if the
-image is effectively blank. Outputs under `outputs/` are ignored.
+image is effectively blank. `--verify-view-modes` repeats the same blank-frame
+check across every first-class viewport mode, including normals, surface wire,
+x-ray wire, transparent, and cross-section. Outputs under `outputs/` are
+ignored.

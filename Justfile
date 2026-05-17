@@ -25,6 +25,7 @@ lint:
 verify:
     cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
     cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
+    cargo run -p meshmend -- --verify-view-modes fixtures/stl/cube_binary.stl
 
 smoke:
     cargo run -p meshmend -- --smoke-window

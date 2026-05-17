@@ -5,6 +5,7 @@ struct Camera {
     material: vec4<f32>,
     clip_plane: vec4<f32>,
     settings: vec4<u32>,
+    view: vec4<u32>,
 };
 
 struct Chunk {

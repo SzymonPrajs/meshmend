@@ -24,6 +24,9 @@ struct Cli {
     #[arg(long, value_name = "STL")]
     verify_cross_section: Option<PathBuf>,
 
+    #[arg(long, value_name = "STL")]
+    verify_view_modes: Option<PathBuf>,
+
     #[arg(long, value_names = ["STL", "PNG"], num_args = 2)]
     cross_section_screenshot: Option<Vec<PathBuf>>,
 
@@ -67,6 +70,10 @@ fn main() -> Result<()> {
     }
     if let Some(path) = cli.verify_cross_section {
         app::run_cross_section_capture(path, None)?;
+        return Ok(());
+    }
+    if let Some(path) = cli.verify_view_modes {
+        app::run_view_mode_verification(path)?;
         return Ok(());
     }
     if let Some(values) = cli.cross_section_screenshot {
