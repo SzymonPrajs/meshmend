@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+glam.workspace = true
 meshmend-core = { path = "../../crates/meshmend-core" }
 meshmend-io = { path = "../../crates/meshmend-io" }
 meshmend-notes = { path = "../../crates/meshmend-notes" }

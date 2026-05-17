@@ -5,10 +5,13 @@ use meshmend_render::{MeshChunkUpload, WgpuRenderer};
 use meshmend_stl::load_binary_stl;
 use winit::{
     dpi::LogicalSize,
-    event::{Event, WindowEvent},
+    event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::WindowBuilder,
 };
+
+use crate::input::CameraInput;
 
 pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -50,6 +53,8 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
             "loaded STL mesh"
         );
     }
+    let mut camera_input = CameraInput::default();
+    let mut needs_redraw = true;
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
@@ -60,7 +65,10 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                 event,
             } if event_window_id == window_id => match event {
                 WindowEvent::CloseRequested => target.exit(),
-                WindowEvent::Resized(size) => renderer.resize(size),
+                WindowEvent::Resized(size) => {
+                    renderer.resize(size);
+                    needs_redraw = true;
+                }
                 WindowEvent::RedrawRequested => {
                     if let Err(err) = renderer.render() {
                         tracing::error!(error = %err, "render failed");
@@ -70,14 +78,81 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                         target.exit();
                     }
                 }
+                WindowEvent::MouseInput { state, button, .. } => match state {
+                    ElementState::Pressed if is_camera_button(button) => {
+                        camera_input.press(button);
+                    }
+                    ElementState::Released => {
+                        camera_input.release(button);
+                    }
+                    _ => {}
+                },
+                WindowEvent::CursorMoved { position, .. } => {
+                    if let Some((button, delta)) = camera_input.cursor_delta(position.x, position.y)
+                    {
+                        let mut camera = renderer.camera();
+                        match button {
+                            MouseButton::Left => camera.orbit(delta),
+                            MouseButton::Right | MouseButton::Middle => {
+                                camera.pan(delta, renderer.size().height as f32);
+                            }
+                            _ => {}
+                        }
+                        renderer.set_camera(camera);
+                        needs_redraw = true;
+                    }
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let wheel_delta = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(position) => position.y as f32 * 0.02,
+                    };
+                    let mut camera = renderer.camera();
+                    camera.zoom(wheel_delta, renderer.mesh_bounds());
+                    renderer.set_camera(camera);
+                    needs_redraw = true;
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed =>
+                {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyF) => {
+                            renderer.fit_camera_to_mesh();
+                            needs_redraw = true;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyR) => {
+                            if let Some(bounds) = renderer.mesh_bounds() {
+                                let mut camera = renderer.camera();
+                                camera.reset_to_bounds(
+                                    bounds,
+                                    renderer.size().width as f32
+                                        / renderer.size().height.max(1) as f32,
+                                );
+                                renderer.set_camera(camera);
+                                needs_redraw = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             },
             Event::AboutToWait => {
-                redraw_window.request_redraw();
+                if needs_redraw {
+                    redraw_window.request_redraw();
+                    needs_redraw = false;
+                }
             }
             _ => {}
         }
     })?;
 
     Ok(())
+}
+
+fn is_camera_button(button: MouseButton) -> bool {
+    matches!(
+        button,
+        MouseButton::Left | MouseButton::Right | MouseButton::Middle
+    )
 }

@@ -6,6 +6,7 @@ use meshmend_stl::{load_binary_stl_with_options, LoadOptions};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
+mod input;
 
 #[derive(Debug, Parser)]
 #[command(name = "meshmend")]
