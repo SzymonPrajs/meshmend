@@ -8,8 +8,8 @@ use std::{
 use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
-use meshmend_core::MeshStats;
-use meshmend_notes::NoteSession;
+use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
+use meshmend_notes::{IssueKind, IssueSession};
 use meshmend_render::{DisplaySettings, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
@@ -37,11 +37,12 @@ enum UiAction {
     LoadStl,
     Fit,
     Reset,
-    AddNote,
-    SaveNotes,
-    LoadNotes,
-    FrameNote(usize),
-    DeleteNote(usize),
+    AddIssue,
+    SaveIssues,
+    LoadIssues,
+    FrameIssue(usize),
+    DeleteIssue(usize),
+    ResetCrossSection,
 }
 
 pub fn run_native(
@@ -79,9 +80,14 @@ pub fn run_native(
         .as_ref()
         .map(|model| format!("Loaded {}", model.file_name))
         .unwrap_or_else(|| "Ready".to_string());
-    let mut note_session = model_info
+    let mut issue_session = model_info
         .as_ref()
-        .map(|model| NoteSession::new(model.file_name.clone(), model.stats.source_bytes));
+        .map(|model| IssueSession::new(model.file_name.clone(), model.stats.source_bytes));
+    let mut cross_section = model_info
+        .as_ref()
+        .map(|model| CrossSectionState::centered(model.stats.bounds))
+        .unwrap_or_default();
+    let mut selected_issue_kind = IssueKind::default();
 
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
@@ -125,7 +131,9 @@ pub fn run_native(
                                 renderer.info(),
                                 model_info.as_ref(),
                                 selected_pick,
-                                &mut note_session,
+                                &mut issue_session,
+                                &mut cross_section,
+                                &mut selected_issue_kind,
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut display_settings,
@@ -144,7 +152,9 @@ pub fn run_native(
                             &mut renderer,
                             redraw_window,
                             &mut model_info,
-                            &mut note_session,
+                            &mut issue_session,
+                            &mut cross_section,
+                            selected_issue_kind,
                             &mut selected_pick,
                             &mut status,
                             &mut needs_redraw,
@@ -199,10 +209,11 @@ pub fn run_native(
                         match load_model(&path, &mut renderer, redraw_window) {
                                 Ok(info) => {
                                     status = format!("Loaded {}", info.file_name);
-                                    note_session = Some(NoteSession::new(
+                                    issue_session = Some(IssueSession::new(
                                         info.file_name.clone(),
                                         info.stats.source_bytes,
                                     ));
+                                    cross_section = CrossSectionState::centered(info.stats.bounds);
                                     model_info = Some(info);
                                     selected_pick = None;
                                     renderer.set_note_markers(&[]);
@@ -592,7 +603,9 @@ fn handle_ui_action(
     renderer: &mut WgpuRenderer<'_>,
     window: &Window,
     model_info: &mut Option<ModelInfo>,
-    note_session: &mut Option<NoteSession>,
+    issue_session: &mut Option<IssueSession>,
+    cross_section: &mut CrossSectionState,
+    selected_issue_kind: IssueKind,
     selected_pick: &mut Option<PickResult>,
     status: &mut String,
     needs_redraw: &mut bool,
@@ -604,10 +617,11 @@ fn handle_ui_action(
                 match load_model(&path, renderer, window) {
                     Ok(info) => {
                         *status = format!("Loaded {}", info.file_name);
-                        *note_session = Some(NoteSession::new(
+                        *issue_session = Some(IssueSession::new(
                             info.file_name.clone(),
                             info.stats.source_bytes,
                         ));
+                        *cross_section = CrossSectionState::centered(info.stats.bounds);
                         *model_info = Some(info);
                         *selected_pick = None;
                         renderer.set_selection_marker(None);
@@ -629,73 +643,90 @@ fn handle_ui_action(
             reset_camera(renderer);
             *needs_redraw = true;
         }
-        UiAction::AddNote => {
-            if let (Some(session), Some(pick)) = (note_session.as_mut(), *selected_pick) {
-                session.add_note(pick.triangle_id, pick.position.to_array());
-                update_note_markers(renderer, session);
-                *status = "Added note".to_string();
+        UiAction::AddIssue => {
+            if let (Some(session), Some(pick)) = (issue_session.as_mut(), *selected_pick) {
+                session.add_issue(
+                    selected_issue_kind,
+                    pick.triangle_id,
+                    pick.position.to_array(),
+                    *cross_section,
+                );
+                update_issue_markers(renderer, session);
+                *status = format!("Added {}", selected_issue_kind.label());
                 *needs_redraw = true;
             }
         }
-        UiAction::SaveNotes => {
-            if let Some(session) = note_session.as_ref() {
-                let default_name = format!("{}.notes.json", session.model_file_name);
-                if let Some(path) = meshmend_io::pick_note_session_to_save(&default_name) {
+        UiAction::SaveIssues => {
+            if let Some(session) = issue_session.as_ref() {
+                let default_name = format!("{}.issues.json", session.model_file_name);
+                if let Some(path) = meshmend_io::pick_issue_session_to_save(&default_name) {
                     match session.save_to_path(&path) {
                         Ok(()) => {
-                            *status = format!("Saved notes to {}", path.display());
+                            *status = format!("Saved issues to {}", path.display());
                         }
                         Err(err) => {
                             *status = format!("Save failed: {err}");
-                            tracing::error!(error = %err, "failed to save notes");
+                            tracing::error!(error = %err, "failed to save issues");
                         }
                     }
                     *needs_redraw = true;
                 }
             }
         }
-        UiAction::LoadNotes => {
-            if let Some(path) = meshmend_io::pick_note_session_to_load() {
-                match NoteSession::load_from_path(&path) {
+        UiAction::LoadIssues => {
+            if let Some(path) = meshmend_io::pick_issue_session_to_load() {
+                match IssueSession::load_from_path(&path) {
                     Ok(session) => {
-                        update_note_markers(renderer, &session);
-                        *status = format!("Loaded notes from {}", path.display());
-                        *note_session = Some(session);
+                        update_issue_markers(renderer, &session);
+                        *status = format!("Loaded issues from {}", path.display());
+                        *issue_session = Some(session);
                     }
                     Err(err) => {
-                        *status = format!("Load notes failed: {err}");
-                        tracing::error!(error = %err, "failed to load notes");
+                        *status = format!("Load issues failed: {err}");
+                        tracing::error!(error = %err, "failed to load issues");
                     }
                 }
                 *needs_redraw = true;
             }
         }
-        UiAction::FrameNote(index) => {
-            if let Some(note) = note_session
+        UiAction::FrameIssue(index) => {
+            if let Some(issue) = issue_session
                 .as_ref()
-                .and_then(|session| session.notes.get(index))
+                .and_then(|session| session.issues.get(index))
             {
-                let position = glam::Vec3::from_array(note.position);
+                let position = glam::Vec3::from_array(issue.position);
                 *selected_pick = Some(PickResult {
-                    triangle_id: note.triangle,
+                    triangle_id: issue.triangle,
                     position,
                 });
+                cross_section.enabled = true;
+                cross_section.axis = issue.cross_section_axis;
+                cross_section.offset = issue.cross_section_offset;
+                cross_section.flip_side = issue.cross_section_flipped;
+                cross_section.show_plane_guide = true;
                 renderer.set_selection_marker(Some(position));
                 *status = format!(
-                    "Framed note {}:{}",
-                    note.triangle.chunk, note.triangle.local_index
+                    "Framed issue {}:{}",
+                    issue.triangle.chunk, issue.triangle.local_index
                 );
                 *needs_redraw = true;
             }
         }
-        UiAction::DeleteNote(index) => {
-            if let Some(session) = note_session.as_mut() {
-                if index < session.notes.len() {
-                    session.notes.remove(index);
-                    update_note_markers(renderer, session);
-                    *status = "Deleted note".to_string();
+        UiAction::DeleteIssue(index) => {
+            if let Some(session) = issue_session.as_mut() {
+                if index < session.issues.len() {
+                    session.issues.remove(index);
+                    update_issue_markers(renderer, session);
+                    *status = "Deleted issue".to_string();
                     *needs_redraw = true;
                 }
+            }
+        }
+        UiAction::ResetCrossSection => {
+            if let Some(model) = model_info.as_ref() {
+                cross_section.reset_to_center(model.stats.bounds);
+                *status = "Centered cross section".to_string();
+                *needs_redraw = true;
             }
         }
     }
@@ -756,11 +787,11 @@ fn upload_parsed_mesh(renderer: &mut WgpuRenderer<'_>, parsed: &ParsedStl) {
     );
 }
 
-fn update_note_markers(renderer: &mut WgpuRenderer<'_>, session: &NoteSession) {
+fn update_issue_markers(renderer: &mut WgpuRenderer<'_>, session: &IssueSession) {
     let positions = session
-        .notes
+        .issues
         .iter()
-        .map(|note| glam::Vec3::from_array(note.position))
+        .map(|issue| glam::Vec3::from_array(issue.position))
         .collect::<Vec<_>>();
     renderer.set_note_markers(&positions);
 }
@@ -771,7 +802,9 @@ fn draw_ui(
     renderer_info: &RendererInfo,
     model_info: Option<&ModelInfo>,
     selected_pick: Option<PickResult>,
-    note_session: &mut Option<NoteSession>,
+    issue_session: &mut Option<IssueSession>,
+    cross_section: &mut CrossSectionState,
+    selected_issue_kind: &mut IssueKind,
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
@@ -842,50 +875,125 @@ fn draw_ui(
             ui.label(format!("Backend: {:?}", renderer_info.backend));
         });
 
-    egui::SidePanel::right("notes_panel")
+    egui::SidePanel::right("inspection_panel")
         .resizable(false)
-        .default_width(300.0)
+        .default_width(330.0)
         .show(ctx, |ui| {
-            ui.heading("Notes");
+            ui.heading("Inspection");
+
+            let Some(model) = model_info else {
+                ui.label("Load an STL to inspect internal geometry.");
+                return;
+            };
+
+            cross_section.clamp_to_bounds(model.stats.bounds);
+
+            ui.checkbox(&mut cross_section.enabled, "Cross Section");
+
             ui.horizontal(|ui| {
-                if ui.button("Add").clicked() {
-                    *action = UiAction::AddNote;
+                ui.label("Axis");
+                let previous_axis = cross_section.axis;
+                for axis in CrossSectionAxis::ALL {
+                    ui.selectable_value(&mut cross_section.axis, axis, axis.label());
                 }
+                if cross_section.axis != previous_axis {
+                    cross_section.set_axis(cross_section.axis, model.stats.bounds);
+                }
+            });
+
+            let range = cross_section.range(model.stats.bounds);
+            ui.add(
+                egui::Slider::new(&mut cross_section.offset, range)
+                    .text("Offset")
+                    .show_value(false),
+            );
+            cross_section.clamp_to_bounds(model.stats.bounds);
+            ui.label(format!(
+                "{} = {:.4}",
+                cross_section.axis.label(),
+                cross_section.offset
+            ));
+
+            ui.checkbox(&mut cross_section.flip_side, "Flip side");
+            ui.checkbox(&mut cross_section.show_plane_guide, "Show plane guide");
+            if ui.button("Center Plane").clicked() {
+                *action = UiAction::ResetCrossSection;
+            }
+
+            ui.separator();
+            ui.heading("Issues");
+
+            egui::ComboBox::from_label("Issue kind")
+                .selected_text(selected_issue_kind.label())
+                .show_ui(ui, |ui| {
+                    for kind in IssueKind::ALL {
+                        ui.selectable_value(selected_issue_kind, kind, kind.label());
+                    }
+                });
+
+            let can_add_issue = selected_pick.is_some() && issue_session.is_some();
+            if ui
+                .add_enabled(can_add_issue, egui::Button::new("Add Issue"))
+                .clicked()
+            {
+                *action = UiAction::AddIssue;
+            }
+
+            ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    *action = UiAction::SaveNotes;
+                    *action = UiAction::SaveIssues;
                 }
                 if ui.button("Load").clicked() {
-                    *action = UiAction::LoadNotes;
+                    *action = UiAction::LoadIssues;
                 }
             });
 
             if let Some(pick) = selected_pick {
-                ui.label(format!(
-                    "Selected {}:{}",
-                    pick.triangle_id.chunk, pick.triangle_id.local_index
+                ui.small(format!(
+                    "Selected {}:{} at {:.3}, {:.3}, {:.3}",
+                    pick.triangle_id.chunk,
+                    pick.triangle_id.local_index,
+                    pick.position.x,
+                    pick.position.y,
+                    pick.position.z
                 ));
             }
 
             ui.separator();
-            if let Some(session) = note_session.as_mut() {
-                for (index, note) in session.notes.iter_mut().enumerate() {
+            if let Some(session) = issue_session.as_mut() {
+                if session.issues.is_empty() {
+                    ui.label("No issues recorded");
+                }
+                for (index, issue) in session.issues.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         if ui.button("Frame").clicked() {
-                            *action = UiAction::FrameNote(index);
+                            *action = UiAction::FrameIssue(index);
                         }
-                        ui.text_edit_singleline(&mut note.label);
                         if ui.button("Delete").clicked() {
-                            *action = UiAction::DeleteNote(index);
+                            *action = UiAction::DeleteIssue(index);
                         }
                     });
+                    ui.label(issue.kind.label());
+                    ui.text_edit_singleline(&mut issue.label);
                     ui.small(format!(
                         "{}:{}  {:.3}, {:.3}, {:.3}",
-                        note.triangle.chunk,
-                        note.triangle.local_index,
-                        note.position[0],
-                        note.position[1],
-                        note.position[2]
+                        issue.triangle.chunk,
+                        issue.triangle.local_index,
+                        issue.position[0],
+                        issue.position[1],
+                        issue.position[2]
                     ));
+                    ui.small(format!(
+                        "Cross Section {} {:.3}{}",
+                        issue.cross_section_axis.label(),
+                        issue.cross_section_offset,
+                        if issue.cross_section_flipped {
+                            " flipped"
+                        } else {
+                            ""
+                        }
+                    ));
+                    ui.separator();
                 }
             }
         });
