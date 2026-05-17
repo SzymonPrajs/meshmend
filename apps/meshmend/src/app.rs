@@ -317,6 +317,26 @@ pub fn run_native(
 }
 
 pub fn run_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
+    run_capture_with_options(input, output, None, false)
+}
+
+pub fn run_cross_section_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
+    let cross_section = CrossSectionState {
+        enabled: true,
+        axis: CrossSectionAxis::X,
+        offset: 0.0,
+        flip_side: false,
+        show_plane_guide: true,
+    };
+    run_capture_with_options(input, output, Some(cross_section), true)
+}
+
+fn run_capture_with_options(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    cross_section: Option<CrossSectionState>,
+    verify_pick: bool,
+) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new()
         .with_title("MeshMend render verification")
@@ -328,6 +348,9 @@ pub fn run_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
     let redraw_window = window;
     let mut renderer = pollster::block_on(WgpuRenderer::new(window))?;
     let _info = load_model(&input, &mut renderer, window)?;
+    if let Some(cross_section) = cross_section {
+        renderer.set_cross_section(cross_section);
+    }
     let result: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
     let result_writer = Arc::clone(&result);
     let mut needs_redraw = true;
@@ -342,20 +365,58 @@ pub fn run_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
                 event: WindowEvent::RedrawRequested,
             } if event_window_id == window_id && !captured => {
                 captured = true;
-                let capture = renderer
-                    .screenshot(output.as_deref())
-                    .map_err(anyhow::Error::from)
-                    .and_then(|stats| {
-                        println!(
-                            "render {}x{} non_background={} coverage={:.4}",
-                            stats.width, stats.height, stats.non_background_pixels, stats.coverage
-                        );
-                        if stats.coverage <= 0.001 {
-                            Err(anyhow!("render verification failed: image is blank"))
-                        } else {
-                            Ok(())
-                        }
-                    });
+                let pick_result = if verify_pick {
+                    let center = glam::Vec2::new(
+                        renderer.size().width as f32 * 0.5,
+                        renderer.size().height as f32 * 0.5,
+                    );
+                    let plane = renderer.cross_section().plane();
+                    renderer
+                        .pick(center)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|pick| match pick {
+                            Some(pick) if plane.keeps_point(pick.position) => {
+                                println!(
+                                    "cross-section pick {}:{} at {:.6},{:.6},{:.6}",
+                                    pick.triangle_id.chunk,
+                                    pick.triangle_id.local_index,
+                                    pick.position.x,
+                                    pick.position.y,
+                                    pick.position.z
+                                );
+                                Ok(())
+                            }
+                            Some(pick) => Err(anyhow!(
+                                "cross-section pick returned hidden-side point {:.6},{:.6},{:.6}",
+                                pick.position.x,
+                                pick.position.y,
+                                pick.position.z
+                            )),
+                            None => Err(anyhow!("cross-section pick did not hit the visible mesh")),
+                        })
+                } else {
+                    Ok(())
+                };
+
+                let capture = pick_result.and_then(|()| {
+                    renderer
+                        .screenshot(output.as_deref())
+                        .map_err(anyhow::Error::from)
+                        .and_then(|stats| {
+                            println!(
+                                "render {}x{} non_background={} coverage={:.4}",
+                                stats.width,
+                                stats.height,
+                                stats.non_background_pixels,
+                                stats.coverage
+                            );
+                            if stats.coverage <= 0.001 {
+                                Err(anyhow!("render verification failed: image is blank"))
+                            } else {
+                                Ok(())
+                            }
+                        })
+                });
                 *result_writer.lock().expect("capture result lock poisoned") = Some(capture);
                 target.exit();
             }

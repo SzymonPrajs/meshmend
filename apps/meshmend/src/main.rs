@@ -21,6 +21,12 @@ struct Cli {
     #[arg(long, value_name = "STL")]
     verify_render: Option<PathBuf>,
 
+    #[arg(long, value_name = "STL")]
+    verify_cross_section: Option<PathBuf>,
+
+    #[arg(long, value_names = ["STL", "PNG"], num_args = 2)]
+    cross_section_screenshot: Option<Vec<PathBuf>>,
+
     #[arg(value_name = "STL")]
     input: Option<PathBuf>,
 
@@ -57,6 +63,14 @@ fn main() -> Result<()> {
     }
     if let Some(path) = cli.verify_render {
         app::run_capture(path, None)?;
+        return Ok(());
+    }
+    if let Some(path) = cli.verify_cross_section {
+        app::run_cross_section_capture(path, None)?;
+        return Ok(());
+    }
+    if let Some(values) = cli.cross_section_screenshot {
+        app::run_cross_section_capture(values[0].clone(), Some(values[1].clone()))?;
         return Ok(());
     }
 

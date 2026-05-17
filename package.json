@@ -7,6 +7,8 @@
     "start": "scripts/run-meshmend.sh",
     "smoke": "cargo run -p meshmend -- --smoke-window",
     "verify": "cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl",
+    "verify:cross-section": "cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl",
+    "screenshot:cross-section": "cargo run -p meshmend -- --cross-section-screenshot fixtures/stl/cube_binary.stl outputs/cube-cross-section.png",
     "test": "cargo test --workspace"
   }
 }
