@@ -1,0 +1,16 @@
+[package]
+name = "meshmend-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+image.workspace = true
+meshmend-core = { path = "../meshmend-core" }
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true

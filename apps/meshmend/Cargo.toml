@@ -1,0 +1,19 @@
+[package]
+name = "meshmend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+meshmend-core = { path = "../../crates/meshmend-core" }
+meshmend-io = { path = "../../crates/meshmend-io" }
+meshmend-notes = { path = "../../crates/meshmend-notes" }
+meshmend-render = { path = "../../crates/meshmend-render" }
+meshmend-stl = { path = "../../crates/meshmend-stl" }
+pollster.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
