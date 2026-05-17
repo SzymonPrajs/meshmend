@@ -65,6 +65,14 @@ enum Command {
         #[arg(long, value_name = "STL")]
         output: PathBuf,
     },
+    LocalWrap {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "STL")]
+        output: PathBuf,
+        #[arg(long, value_name = "MODEL_UNITS")]
+        voxel_size: Option<f64>,
+    },
     Perf {
         #[arg(value_name = "STL")]
         path: PathBuf,
@@ -213,6 +221,57 @@ fn main() -> Result<()> {
             if !result.response.success {
                 anyhow::bail!(
                     "hole fill worker failed: {}",
+                    result
+                        .response
+                        .error
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            let parsed = load_binary_stl_with_options(
+                &output,
+                &LoadOptions {
+                    parallel: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            let report = app::analyze_parsed_stl(&parsed);
+            println!("wrote: {}", output.display());
+            println!("triangles: {}", parsed.stats.triangle_count);
+            println!("boundary loops: {}", report.topology.boundary_loop_count);
+            println!(
+                "non-manifold edges: {}",
+                report.topology.non_manifold_edge_count
+            );
+        }
+        Some(Command::LocalWrap {
+            path,
+            output,
+            voxel_size,
+        }) => {
+            let binary = discover_worker_binary("meshmend-openvdb-worker").ok_or_else(|| {
+                anyhow::anyhow!("OpenVDB worker was not found; run `just worker-build`")
+            })?;
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let response_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("local-wrap-response.json");
+            let request_path = PathBuf::from("outputs")
+                .join("workers")
+                .join("local-wrap-request.json");
+            let mut request =
+                WorkerRequest::new(WorkerOperation::LocalSdfWrap, path.clone(), response_path);
+            request.output_mesh = Some(output.clone());
+            request.preview = false;
+            request.target_edge_length = voxel_size;
+            let result = WorkerRunner::new(binary).run(&request, &request_path)?;
+            if !result.response.success {
+                anyhow::bail!(
+                    "local wrap worker failed: {}",
                     result
                         .response
                         .error

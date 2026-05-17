@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -63,6 +64,35 @@ inline std::optional<std::string> json_string(const std::string &json,
     value.push_back(c);
   }
   return std::nullopt;
+}
+
+inline std::optional<double> json_number(const std::string &json, const std::string &key) {
+  const std::string needle = "\"" + key + "\"";
+  const auto key_pos = json.find(needle);
+  if (key_pos == std::string::npos) {
+    return std::nullopt;
+  }
+  const auto colon = json.find(':', key_pos + needle.size());
+  if (colon == std::string::npos) {
+    return std::nullopt;
+  }
+  auto start = colon + 1;
+  while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) {
+    ++start;
+  }
+  if (json.compare(start, 4, "null") == 0) {
+    return std::nullopt;
+  }
+  std::size_t consumed = 0;
+  try {
+    const double value = std::stod(json.substr(start), &consumed);
+    if (consumed == 0) {
+      return std::nullopt;
+    }
+    return value;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
 }
 
 inline WorkerRequest parse_request(const std::filesystem::path &request_path) {

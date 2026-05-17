@@ -40,6 +40,8 @@ repair-smoke:
     just worker-build
     cargo run -p meshmend -- hole-fill fixtures/stl/cube_missing_top.stl --output outputs/cube-missing-top-filled.stl
     cargo run -p meshmend -- analyze outputs/cube-missing-top-filled.stl --output outputs/cube-missing-top-filled-analysis.json
+    cargo run -p meshmend -- local-wrap fixtures/stl/cube_binary.stl --output outputs/cube-local-wrap.stl --voxel-size 0.08
+    cargo run -p meshmend -- analyze outputs/cube-local-wrap.stl --output outputs/cube-local-wrap-analysis.json
 
 perf path:
     mkdir -p outputs

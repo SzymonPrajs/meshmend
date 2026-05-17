@@ -6,10 +6,11 @@ progress from stdout, then reads the final response JSON.
 
 Current binaries:
 
-- `meshmend-cgal-worker`: links CGAL and validates binary STL input as the first
-  polygon-processing smoke operation.
-- `meshmend-openvdb-worker`: links OpenVDB and validates binary STL input as
-  the first SDF/voxel-processing smoke operation.
+- `meshmend-cgal-worker`: links CGAL, validates binary STL input, and performs
+  the current `hole_fill` operation for simple boundary-loop repair.
+- `meshmend-openvdb-worker`: links OpenVDB, validates binary STL input, and
+  performs the current `local_sdf_wrap` operation by converting STL triangles
+  to an OpenVDB level set, extracting a replacement surface, and writing STL.
 
 Local dependencies are installed through Homebrew:
 
@@ -23,6 +24,8 @@ Build and smoke-test:
 just worker-build
 cargo run -p meshmend -- worker-smoke cgal fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- worker-smoke openvdb fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- hole-fill fixtures/stl/cube_missing_top.stl --output outputs/cube-filled.stl
+cargo run -p meshmend -- local-wrap fixtures/stl/cube_binary.stl --output outputs/cube-wrapped.stl --voxel-size 0.08
 ```
 
 `MESHMEND_WORKER_DIR` can point the Rust runner at a custom worker directory.

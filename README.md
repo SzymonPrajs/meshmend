@@ -43,6 +43,8 @@ The active implementation is now the native viewer:
   by `just worker-build`
 - CGAL-backed `meshmend hole-fill` repair smoke path for closing simple
   boundary loops and exporting a repaired STL
+- OpenVDB-backed `meshmend local-wrap` path for rebuilding a mesh through an
+  explicit voxel/SDF surface extraction and exporting the wrapped STL
 
 ## App Location
 
