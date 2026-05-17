@@ -34,6 +34,14 @@ The active implementation is now the native viewer:
 - orbit, pan, zoom, fit, and reset camera controls
 - mesh stats, notes, selection, screenshots, and performance metrics
 
+## Current Plan
+
+The next active product step is cross-section inspection:
+
+```text
+docs/cross-section-inspection-plan.md
+```
+
 ## App Location
 
 The native app crate is under:

@@ -11,7 +11,8 @@ Build toward:
 - a local native desktop app
 - STL input only
 - orbit, pan, and zoom viewing
-- a clean foundation for selection, notes, validation, and later repair tools
+- a clean foundation for cross-section inspection, issue marking, validation,
+  and later repair tools
 
 Do not revive the old Python repair pipeline as active product code. It is
 archived at:
@@ -39,19 +40,20 @@ planning files, not raw model data.
 - Put the app under `apps/meshmend/`.
 - Use a Rust workspace with `winit`, native `wgpu`, and `egui`.
 - Keep the hot path in Rust: STL parsing, validation, chunking, GPU upload,
-  camera math, picking, notes, screenshots, and performance metrics.
+  camera math, picking, issue marking, screenshots, and performance metrics.
 - Do not reintroduce the Three.js/Vite/Tauri webview viewer as active product
   code.
-- Keep the native viewer focused on inspection. No repair, mesh
-  simplification, slicing, ROI tools, or defect classification until the native
-  viewer core is stable.
+- Keep the native viewer focused on inspection. The next active feature is the
+  cross-section inspection plan in `docs/cross-section-inspection-plan.md`.
+- Do not build repair, mesh simplification, printable slicing/layer export, ROI
+  tools, or automatic defect classification yet.
 - Keep source assets and generated app artifacts separate.
 - Keep generated build outputs, Rust `target`, large STL outputs, and local
   raw model files ignored.
 
-## First Milestone Definition
+## Next Milestone Definition
 
-The native viewer milestone is complete when:
+The cross-section inspection milestone is complete when:
 
 - a native Rust app launches locally
 - the app accepts an STL file selected from disk
@@ -59,7 +61,8 @@ The native viewer milestone is complete when:
 - orbit, pan, and zoom work smoothly enough to inspect the loaded mesh
 - the camera fits the model to view after loading
 - the app reports basic mesh stats such as triangle count and bounds
-- basic selection, notes, screenshots, and performance metrics work
+- basic selection, issue marking, screenshots, and performance metrics work
+- a cross-section plane can inspect hidden internal geometry along X, Y, or Z
 
 Anything beyond that belongs to a later milestone.
 
