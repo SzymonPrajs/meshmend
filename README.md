@@ -24,22 +24,15 @@ rose/raw.stl
 `rose/raw.stl` is intentionally ignored by Git because this repository should
 track code and planning files, not raw model data.
 
-## Active Plan
+## Current Implementation
 
-The native WGPU master plan is here:
-
-```text
-docs/meshmend-native-wgpu-master-plan.md
-```
-
-The replacement implementation is intentionally staged:
+The active implementation is now the native viewer:
 
 - native `winit` desktop window
 - native `wgpu` renderer
 - Rust binary STL parsing and validation
 - orbit, pan, zoom, fit, and reset camera controls
 - mesh stats, notes, selection, screenshots, and performance metrics
-- CI/release workflows after the native viewer core is measurable
 
 ## App Location
 
