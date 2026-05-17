@@ -8,6 +8,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
+use meshmend_analysis::AnalysisReport;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
 use meshmend_project::{
@@ -50,6 +51,8 @@ enum UiAction {
     ExportReport,
     Undo,
     Redo,
+    RunAnalysis,
+    FrameAnalysisDefect(usize),
     Fit,
     Reset,
     AddIssue,
@@ -261,6 +264,7 @@ pub fn run_native(
         .as_ref()
         .map(|model| IssueSession::new(model.file_name.clone(), model.stats.source_bytes));
     let mut project = model_info.as_ref().map(project_from_model);
+    let mut analysis_report: Option<AnalysisReport> = None;
     let mut cross_section = model_info
         .as_ref()
         .map(|model| CrossSectionState::centered(model.stats.bounds))
@@ -319,6 +323,7 @@ pub fn run_native(
                                 selected_pick,
                                 &mut issue_session,
                                 project.as_ref(),
+                                analysis_report.as_ref(),
                                 &mut cross_section,
                                 &mut selected_issue_kind,
                                 &mut brush_tool,
@@ -344,6 +349,7 @@ pub fn run_native(
                             &mut model_info,
                             &mut issue_session,
                             &mut project,
+                            &mut analysis_report,
                             &mut cross_section,
                             selected_issue_kind,
                             &mut brush_tool,
@@ -411,6 +417,7 @@ pub fn run_native(
                                     info.stats.source_bytes,
                                 ));
                                 project = Some(project_from_model(&info));
+                                analysis_report = None;
                                 cross_section = CrossSectionState::centered(info.stats.bounds);
                                 model_info = Some(info);
                                 selected_pick = None;
@@ -1129,6 +1136,7 @@ fn handle_ui_action(
     model_info: &mut Option<ModelInfo>,
     issue_session: &mut Option<IssueSession>,
     project: &mut Option<MeshMendProject>,
+    analysis_report: &mut Option<AnalysisReport>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: IssueKind,
     brush_tool: &mut BrushToolState,
@@ -1149,6 +1157,7 @@ fn handle_ui_action(
                             info.stats.source_bytes,
                         ));
                         *project = Some(project_from_model(&info));
+                        *analysis_report = None;
                         *cross_section = CrossSectionState::centered(info.stats.bounds);
                         *model_info = Some(info);
                         *selected_pick = None;
@@ -1181,6 +1190,7 @@ fn handle_ui_action(
                                     ));
                                     *cross_section = CrossSectionState::centered(info.stats.bounds);
                                     *model_info = Some(info);
+                                    *analysis_report = None;
                                     *selected_pick = None;
                                     hit_stack_state.clear();
                                     brush_tool.finish_stroke();
@@ -1276,6 +1286,62 @@ fn handle_ui_action(
         UiAction::Fit => {
             renderer.fit_camera_to_mesh();
             *needs_redraw = true;
+        }
+        UiAction::RunAnalysis => {
+            if let Some(model) = model_info.as_ref() {
+                match run_analysis_for_model(model) {
+                    Ok(report) => {
+                        let centers = report
+                            .defects
+                            .iter()
+                            .map(|defect| glam::Vec3::from_array(defect.center))
+                            .collect::<Vec<_>>();
+                        renderer.set_issue_markers(&centers);
+                        if let Some(project) = project.as_mut() {
+                            project.record_operation(
+                                OperationKind::Analyze,
+                                OperationStatus::Planned,
+                                serde_json::json!({
+                                    "analysis": {
+                                        "defects": report.defects.len(),
+                                        "boundary_loops": report.topology.boundary_loop_count,
+                                        "non_manifold_edges": report.topology.non_manifold_edge_count,
+                                    }
+                                }),
+                                Vec::new(),
+                            );
+                        }
+                        *status = format!(
+                            "Analysis found {} defects across {} components",
+                            report.defects.len(),
+                            report.topology.component_count
+                        );
+                        *analysis_report = Some(report);
+                    }
+                    Err(err) => {
+                        *status = format!("Analysis failed: {err}");
+                        tracing::error!(error = %err, "analysis failed");
+                    }
+                }
+                *needs_redraw = true;
+            }
+        }
+        UiAction::FrameAnalysisDefect(index) => {
+            if let Some(defect) = analysis_report
+                .as_ref()
+                .and_then(|report| report.defects.get(index))
+            {
+                let position = glam::Vec3::from_array(defect.center);
+                renderer.set_selection_marker(Some(position));
+                if let Some(triangle) = defect.triangle_ids.first().copied() {
+                    *selected_pick = Some(PickResult {
+                        triangle_id: triangle,
+                        position,
+                    });
+                }
+                *status = format!("Framed {:?}: {}", defect.kind, defect.recommendation);
+                *needs_redraw = true;
+            }
         }
         UiAction::Reset => {
             reset_camera(renderer);
@@ -1538,6 +1604,34 @@ fn project_from_model(model: &ModelInfo) -> MeshMendProject {
     )
 }
 
+fn run_analysis_for_model(model: &ModelInfo) -> Result<AnalysisReport> {
+    let parsed = load_binary_stl(&model.path)?;
+    Ok(analyze_parsed_stl(&parsed))
+}
+
+pub fn analyze_parsed_stl(parsed: &ParsedStl) -> AnalysisReport {
+    meshmend_analysis::analyze_triangles(
+        parsed.chunks.iter().flat_map(|chunk| {
+            chunk
+                .triangles
+                .iter()
+                .copied()
+                .enumerate()
+                .map(move |(local_index, triangle)| {
+                    (
+                        meshmend_core::TriangleId {
+                            chunk: chunk.chunk_index,
+                            local_index: local_index as u32,
+                        },
+                        triangle,
+                    )
+                })
+        }),
+        parsed.stats.clone(),
+        parsed.stats.bounds.radius().max(1.0) * 1.0e-6,
+    )
+}
+
 fn selection_reference_from_pick(pick: PickResult) -> SelectionReference {
     SelectionReference {
         triangle_chunk: pick.triangle_id.chunk,
@@ -1749,6 +1843,7 @@ fn draw_ui(
     selected_pick: Option<PickResult>,
     issue_session: &mut Option<IssueSession>,
     project: Option<&MeshMendProject>,
+    analysis_report: Option<&AnalysisReport>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
@@ -1844,6 +1939,7 @@ fn draw_ui(
                 selected_pick,
                 issue_session,
                 project,
+                analysis_report,
                 cross_section,
                 selected_issue_kind,
                 brush_tool,
@@ -1979,6 +2075,7 @@ fn draw_repair_panel(
     selected_pick: Option<PickResult>,
     issue_session: &mut Option<IssueSession>,
     project: Option<&MeshMendProject>,
+    analysis_report: Option<&AnalysisReport>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
@@ -2010,6 +2107,7 @@ fn draw_repair_panel(
             ui,
             selected_pick,
             issue_session,
+            analysis_report,
             selected_issue_kind,
             action,
         ),
@@ -2049,6 +2147,7 @@ fn draw_repair_panel(
                 ui,
                 selected_pick,
                 issue_session,
+                analysis_report,
                 selected_issue_kind,
                 action,
             );
@@ -2252,10 +2351,37 @@ fn draw_defect_tools(
     ui: &mut egui::Ui,
     selected_pick: Option<PickResult>,
     issue_session: &mut Option<IssueSession>,
+    analysis_report: Option<&AnalysisReport>,
     selected_issue_kind: &mut IssueKind,
     action: &mut UiAction,
 ) {
     ui.heading("Defects");
+    if ui.button("Run Analysis").clicked() {
+        *action = UiAction::RunAnalysis;
+    }
+    if let Some(report) = analysis_report {
+        ui.small(format!(
+            "{} findings | {} components | {} boundary loops | {} non-manifold edges",
+            report.defects.len(),
+            report.topology.component_count,
+            report.topology.boundary_loop_count,
+            report.topology.non_manifold_edge_count
+        ));
+        for (index, defect) in report.defects.iter().take(10).enumerate() {
+            ui.horizontal(|ui| {
+                if ui.button("Frame").clicked() {
+                    *action = UiAction::FrameAnalysisDefect(index);
+                }
+                ui.label(format!(
+                    "{:?} {:?} ({:.0}%)",
+                    defect.kind,
+                    defect.severity,
+                    defect.confidence * 100.0
+                ));
+            });
+        }
+        ui.separator();
+    }
     egui::ComboBox::from_label("Defect type")
         .selected_text(selected_issue_kind.label())
         .show_ui(ui, |ui| {

@@ -1760,6 +1760,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "glam",
+ "meshmend-analysis",
  "meshmend-core",
  "meshmend-inspection",
  "meshmend-io",
@@ -1772,6 +1773,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winit",
+]
+
+[[package]]
+name = "meshmend-analysis"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "meshmend-core",
+ "meshmend-geometry",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

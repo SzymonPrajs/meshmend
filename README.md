@@ -36,6 +36,9 @@ The active implementation is now the native viewer:
   screenshots, and performance metrics
 - directory-backed `.meshmend` project state for source hashes, operation
   history, undo/redo revision pointers, exports, and repair reports
+- Rust topology analysis for components, open boundaries, non-manifold edges,
+  duplicate/degenerate faces, simple contained-shell candidates, and CLI
+  reports via `meshmend analyze`
 
 ## App Location
 

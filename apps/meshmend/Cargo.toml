@@ -12,6 +12,7 @@ egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
 glam.workspace = true
+meshmend-analysis = { path = "../../crates/meshmend-analysis" }
 meshmend-core = { path = "../../crates/meshmend-core" }
 meshmend-io = { path = "../../crates/meshmend-io" }
 meshmend-inspection = { path = "../../crates/meshmend-inspection" }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "apps/meshmend",
+  "crates/meshmend-analysis",
   "crates/meshmend-core",
   "crates/meshmend-geometry",
   "crates/meshmend-io",

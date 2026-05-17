@@ -16,6 +16,13 @@ cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- inspect rose/raw.stl --parallel
 ```
 
+Analysis checks:
+
+```bash
+cargo test -p meshmend-analysis
+cargo run -p meshmend -- analyze fixtures/stl/cube_binary.stl --output outputs/analysis-cube.json
+```
+
 Project checks:
 
 ```bash

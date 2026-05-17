@@ -52,6 +52,12 @@ enum Command {
         #[arg(long)]
         parallel: bool,
     },
+    Analyze {
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+        #[arg(long, value_name = "JSON")]
+        output: Option<PathBuf>,
+    },
     Perf {
         #[arg(value_name = "STL")]
         path: PathBuf,
@@ -135,6 +141,34 @@ fn main() -> Result<()> {
                 "parse ms: {:.3}",
                 parsed.timings.parse.as_secs_f64() * 1000.0
             );
+        }
+        Some(Command::Analyze { path, output }) => {
+            let parsed = load_binary_stl_with_options(
+                &path,
+                &LoadOptions {
+                    parallel: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            let report = app::analyze_parsed_stl(&parsed);
+            println!("file: {}", parsed.source_path.display());
+            println!("defects: {}", report.defects.len());
+            println!("components: {}", report.topology.component_count);
+            println!("boundary loops: {}", report.topology.boundary_loop_count);
+            println!(
+                "non-manifold edges: {}",
+                report.topology.non_manifold_edge_count
+            );
+            if let Some(output) = output {
+                if let Some(parent) = output
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&output, serde_json::to_string_pretty(&report)?)?;
+                println!("wrote: {}", output.display());
+            }
         }
         Some(Command::Perf { path, output }) => {
             app::run_perf(path, output)?;

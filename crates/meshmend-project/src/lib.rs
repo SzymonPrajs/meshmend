@@ -327,6 +327,7 @@ pub struct MeshRevision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationKind {
+    Analyze,
     DefectRecord,
     RepairRegionStroke,
     CleanMesh,
