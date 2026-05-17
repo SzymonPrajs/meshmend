@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
-use meshmend_notes::{IssueKind, IssueSession};
+use meshmend_inspection::{IssueKind, IssueSession};
 use meshmend_render::{DisplaySettings, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{

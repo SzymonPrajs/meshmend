@@ -4,7 +4,7 @@ members = [
   "apps/meshmend",
   "crates/meshmend-core",
   "crates/meshmend-io",
-  "crates/meshmend-notes",
+  "crates/meshmend-inspection",
   "crates/meshmend-render",
   "crates/meshmend-stl",
 ]

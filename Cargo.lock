@@ -1761,8 +1761,8 @@ dependencies = [
  "egui-winit",
  "glam",
  "meshmend-core",
+ "meshmend-inspection",
  "meshmend-io",
- "meshmend-notes",
  "meshmend-render",
  "meshmend-stl",
  "pollster",
@@ -1783,15 +1783,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "meshmend-io"
-version = "0.1.0"
-dependencies = [
- "rfd",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "meshmend-notes"
+name = "meshmend-inspection"
 version = "0.1.0"
 dependencies = [
  "meshmend-core",
@@ -1799,6 +1791,14 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "meshmend-io"
+version = "0.1.0"
+dependencies = [
+ "rfd",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ egui-winit.workspace = true
 glam.workspace = true
 meshmend-core = { path = "../../crates/meshmend-core" }
 meshmend-io = { path = "../../crates/meshmend-io" }
-meshmend-notes = { path = "../../crates/meshmend-notes" }
+meshmend-inspection = { path = "../../crates/meshmend-inspection" }
 meshmend-render = { path = "../../crates/meshmend-render" }
 meshmend-stl = { path = "../../crates/meshmend-stl" }
 pollster.workspace = true

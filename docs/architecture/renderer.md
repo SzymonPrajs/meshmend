@@ -14,8 +14,10 @@ Current passes:
 - shader barycentric wireframe overlay
 - normal debug mode
 - hidden `R32Uint` GPU picking pass
+- cross-section clipping in the mesh and picking shaders
+- cross-section guide line pass
 - screenshot/readback pass for verification and performance metrics
-- `egui` overlay pass for controls, stats, and notes
+- `egui` overlay pass for controls, stats, inspection, and issues
 
 The renderer keeps a compact CPU copy of loaded triangles for exact pick-hit
 positions after the GPU identifies the visible triangle.

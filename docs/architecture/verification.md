@@ -21,6 +21,8 @@ Renderer checks:
 
 ```bash
 cargo run -p meshmend -- --verify-render fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --verify-cross-section fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- --cross-section-screenshot fixtures/stl/cube_binary.stl outputs/cube-cross-section.png
 cargo run -p meshmend -- --screenshot fixtures/stl/cube_binary.stl outputs/cube.png
 cargo run -p meshmend -- --verify-render rose/raw.stl
 ```

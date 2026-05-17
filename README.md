@@ -32,7 +32,8 @@ The active implementation is now the native viewer:
 - native `wgpu` renderer
 - Rust binary STL parsing and validation
 - orbit, pan, zoom, fit, and reset camera controls
-- mesh stats, notes, selection, screenshots, and performance metrics
+- mesh stats, cross-section inspection, issue marking, selection, screenshots,
+  and performance metrics
 
 ## Current Plan
 
