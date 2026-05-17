@@ -16,8 +16,7 @@ created by AI 3D generation tools and prepared for resin printing.
 The app must let a user load a problematic mesh, inspect it clearly, detect
 print-breaking defects, repair those defects locally or automatically, preview
 the result, and export a repaired mesh. The output is not an annotation JSON
-file. The output is a repaired mesh plus optional project history and repair
-report.
+file. The output is a repaired mesh plus project history and a repair report.
 
 The primary rose-class failure cases are:
 
@@ -155,8 +154,8 @@ solid/rendered, undo, redo, cancel, and apply.
 - Save a MeshMend project file with operations, previews, logs, source hash,
   scale, and output references.
 - Export repaired STL.
-- Export an optional repair report with defect counts, operations applied,
-  final triangle count, and validation status.
+- Export a repair report with defect counts, operations applied, final triangle
+  count, and validation status.
 
 ## View Modes
 
@@ -233,8 +232,8 @@ Rename or remove current UI concepts:
 - Remove "Labels" as a user-facing section.
 - Remove "Issues" as a user-facing output workflow.
 - Replace them with "Repair", "Defects", "Operations", and "Validation".
-- The saved JSON issue format can remain temporarily for migration tests, but
-  the product should move to a project/operation format.
+- Convert any useful saved JSON issue tests into project/operation tests, then
+  delete the annotation-session format.
 
 ## Data Model
 
@@ -272,28 +271,29 @@ Use Rust for:
 - file IO and project state
 - STL load/write
 - renderer and GPU resources
-- mesh selection, simple topology, and operation orchestration
+- indexed mesh storage, mesh connectivity, boundary loops, and components
+- our own BVH and ray intersection stack for x-ray selection
+- repair operation orchestration
 - progress UI, cancellation, and validation summaries
 
-Use C++ workers where mature geometry libraries are needed:
+Use C++ workers where mature geometry libraries are clearly the right tool:
 
 - CGAL worker for polygon mesh processing: mesh cleanup, connected components,
   hole filling, clipping/corefinement where appropriate, remeshing, and
   self-intersection checks.
 - OpenVDB worker for voxel/SDF wrapping: local implicit rebuilds, cavity fills,
   and volume-to-mesh outputs.
-- Optional Manifold or libigl experiments only after CGAL/OpenVDB are evaluated
-  against the rose-class cases.
 
-Prefer an external worker process before direct in-process FFI:
+Use external worker processes for heavy geometry:
 
 - process isolation protects the UI from C++ crashes and long-running jobs
 - stdout/stderr can stream progress JSON and logs
 - temp mesh files avoid unstable pointer ownership between Rust and C++
 - cancellation can terminate the worker safely
 
-Use `cxx` or a C ABI only for small, stable calls after the process protocol is
-proven. Do not block the UI thread on geometry repair.
+Do not block the UI thread on geometry repair. Direct Rust/C++ FFI is outside
+the active implementation path until the process protocol is stable and there is
+a specific small API worth embedding.
 
 Every worker request should include:
 
@@ -331,7 +331,7 @@ Build analysis in layers.
 ### Intersection Pass
 
 - broad-phase triangle acceleration
-- self-intersection candidates
+- self-intersection face pairs
 - exact C++ confirmation for hard cases
 - group intersections spatially for UI display
 
@@ -386,7 +386,7 @@ Inputs:
 
 - healthy anchor stroke or selected anchor region
 - target/cavity opening region
-- optional exclude region
+- exclude region when nearby surface must be protected
 - target physical resolution when scale exists
 
 Steps:
@@ -461,7 +461,7 @@ Add explicit project and output handling.
 
 - `Save Project`: writes `.meshmend` project metadata and operation history.
 - `Export STL`: writes the current repaired mesh.
-- `Export Report`: writes optional JSON/Markdown repair report.
+- `Export Report`: writes JSON/Markdown repair report.
 - `Undo/Redo`: operation-level mesh state history.
 - `Snapshots`: allow named before/after mesh states for risky operations.
 
@@ -543,33 +543,26 @@ implementation starts on each phase, especially the repair and worker phases.
 
 ### Research Summary
 
-The geometry plan should use a staged toolchain rather than betting on one
-library to solve every case.
+The implementation plan is now deliberately opinionated. MeshMend should
+reimplement the core mesh representation, topology analysis, BVH, ray picking,
+operation history, and project model in Rust so the codebase teaches the actual
+geometry and remains understandable. It should use large external geometry
+engines only where the problem is genuinely deep enough to justify them.
 
-- Rust remains the owner of the app, UI, project state, rendering, selection,
-  lightweight topology, and CLI.
-- CGAL Polygon Mesh Processing is the first candidate for exact polygon mesh
-  operations: connected components, orientation, stitching, hole filling,
-  clipping/splitting, remeshing, simplification, and self-intersection checks.
-  Its Polygon Mesh Processing and Surface Mesh Simplification packages are GPL,
-  so licensing must be treated as a release blocker before distributing
-  binaries.
-- OpenVDB is the first candidate for local SDF/voxel wrap operations. It
-  directly supports mesh-to-level-set conversion, signed/unsigned distance
-  fields, cancellation callbacks for conversion, level-set filtering, and
-  volume-to-mesh extraction.
-- Manifold is a serious optional candidate for fast booleans and cut results
-  when the input can first be made manifold. It explicitly requires manifold
-  input for its guarantee and offers only limited help for slightly
-  non-manifold meshes, so it is not the first bad-input repair tool.
-- libigl remains optional research material. Its core is MPL2, but many useful
-  mesh operations live under copyleft dependency folders, so include choices
-  must be audited carefully.
-- Rust BVH/spatial tooling should be evaluated for interactive picking:
-  `parry3d::shape::TriMesh` has built-in BVH construction, ray casts,
-  connected components, plane intersections, and split helpers; `bvh` is a
-  focused ray/BVH crate; `rstar` is useful for broad-phase AABB candidate
-  queries.
+- Rust owns the app, UI, project state, rendering, CLI, indexed mesh storage,
+  connectivity, boundary loops, components, BVH, ray hit stacks, lightweight
+  validation, and repair orchestration.
+- CGAL Polygon Mesh Processing is the polygon repair engine: connected
+  components, orientation, stitching, hole filling, clipping/corefinement,
+  remeshing, simplification, and self-intersection checks. Its Polygon Mesh
+  Processing and Surface Mesh Simplification packages are GPL; because this is a
+  learning/local project, proceed with CGAL and record the licensing consequence
+  clearly before distributing binaries.
+- OpenVDB is the local SDF/voxel wrap engine: mesh-to-level-set conversion,
+  signed/unsigned distance fields, cancellable conversion, level-set filtering,
+  and volume-to-mesh extraction.
+- Do not add small geometry crates for BVH, broad-phase search, or topology.
+  Implement those parts in Rust inside `meshmend-geometry`.
 
 Research sources:
 
@@ -582,13 +575,7 @@ Research sources:
 - OpenVDB transforms: https://www.openvdb.org/documentation/doxygen/transformsAndMaps.html
 - OpenVDB dependencies: https://www.openvdb.org/documentation/doxygen/dependencies.html
 - OpenVDB license: https://www.openvdb.org/license/
-- Manifold docs: https://manifoldcad.org/docs/html/index.html
-- libigl: https://libigl.github.io/
-- Rust `cxx`: https://cxx.rs/
 - Just manual: https://just.systems/man/en/
-- parry3d `TriMesh`: https://docs.rs/parry3d/latest/parry3d/shape/struct.TriMesh.html
-- Rust `bvh`: https://docs.rs/bvh/latest/bvh/
-- Rust `rstar`: https://docs.rs/rstar/latest/rstar/struct.RTree.html
 
 ### Phase 1 Research: Just Workflow
 
@@ -605,8 +592,8 @@ Implementation:
 - Make the first/default recipe list commands with `just --list`.
 - Use `just run` as the Codex Run action target.
 - Keep `cargo` as the actual Rust build/test engine.
-- Remove `package.json` and `scripts/run-meshmend.sh` only after command parity
-  is proven.
+- Prove command parity, then remove `package.json` and
+  `scripts/run-meshmend.sh`.
 
 Initial recipes:
 
@@ -707,16 +694,21 @@ Risks:
 The existing GPU picking pass returns only the front-most visible triangle. That
 is good for normal surface selection but not for x-ray/internal repair.
 
-Implementation options:
+Implementation:
 
-- `parry3d::shape::TriMesh` can build a BVH during mesh construction and offers
-  ray casting, connected components, plane intersections, splitting, and
-  optional topology flags. Prototype this first for pick-through and plane
-  intersection because it gives the broadest immediate API surface.
-- `bvh` is a focused ray/BVH crate and is a good fallback if `parry3d` memory or
-  coordinate-type choices are not a fit.
-- `rstar` is better for broad-phase spatial queries and candidate overlap
-  detection than for exact ray intersection stacks.
+- Add `crates/meshmend-geometry`.
+- Convert STL triangle soup into an indexed mesh with quantized vertex welding.
+- Store face-to-original-triangle mapping so render picks, defect reports, and
+  operations can point back to source triangles.
+- Build adjacency maps: vertex-to-face, edge-to-face, face-to-face, component
+  IDs, boundary loops, and non-manifold edge lists.
+- Implement a Rust BVH over triangle AABBs. Start with a median-split flattened
+  binary BVH, then improve split quality if measurement shows it is needed.
+- Implement ray-AABB traversal and exact ray-triangle hits using stable
+  model-space `f32` math.
+- Return a sorted intersection stack with triangle id, component id, distance,
+  hit point, normal, and front/back face classification.
+- Add plane filtering for active cross sections.
 
 Selection data structure:
 
@@ -751,10 +743,10 @@ generated mesh states, previews, worker logs, scale, exports, and undo history.
 
 Project format:
 
-- Use a directory-backed project first, optionally zipped later.
+- Use a directory-backed project for the implementation.
 - `project.meshmend.json`: metadata, source hash, unit, scale, printer profile,
   current mesh revision, operations.
-- `meshes/source.stl`: optional copy or hash reference to source.
+- `meshes/source.stl`: source copy or source hash reference.
 - `meshes/rev-0001.stl`, `meshes/rev-0002.stl`: saved mesh revisions.
 - `previews/`: temporary preview meshes and screenshots.
 - `logs/`: worker JSONL logs.
@@ -886,7 +878,6 @@ Build approach:
 - Add one binary per backend at first:
   - `meshmend-cgal-worker`
   - `meshmend-openvdb-worker`
-  - `meshmend-manifold-worker` only if needed
 - Add `just worker-build` to configure and build workers.
 - Add worker discovery in Rust: look next to app binary, then `target/workers`,
   then environment override.
@@ -894,19 +885,20 @@ Build approach:
 Dependency strategy:
 
 - macOS local development can start with Homebrew packages where available.
-- CI/release needs pinned dependency setup, probably CMake plus vcpkg or vendored
-  source builds.
-- CGAL licensing must be decided before distributing worker binaries. Because
-  PMP and simplification are GPL packages, commercial licensing or GPL release
-  implications must be resolved early.
-- OpenVDB core uses C++17, TBB, and optional compression dependencies; this is
+- CI/release needs pinned dependency setup: CMake plus vcpkg or vendored source
+  builds.
+- CGAL licensing must be documented before distributing worker binaries.
+  Because PMP and simplification are GPL packages, public binary distribution
+  must follow GPL terms or use a commercial CGAL license.
+- OpenVDB core uses C++17, TBB, and compression dependencies; this is
   heavier than CGAL and should stay in a separate worker binary.
 
-When to use `cxx`:
+Direct Rust/C++ FFI:
 
-- Only after request/response shapes stabilize.
-- Use it for small stable APIs, not for long-running repair jobs.
-- Keep process workers as the default for heavy operations.
+- Not part of the active implementation path.
+- Process workers are the geometry execution model for this plan.
+- Revisit direct FFI only as a separate plan update if a small stable API
+  becomes worth embedding.
 
 ### Phase 8 Research: Hole Fill And Simple Repair
 
@@ -938,11 +930,6 @@ Patch quality rules:
 - Validate that no new boundary loops, non-manifold edges, or self-intersections
   were introduced.
 - Show patch triangle count and target edge length before apply.
-
-Fallback:
-
-- If CGAL patch self-intersects or times out, offer a planar/projected cap for
-  simple near-planar holes and mark the operation as lower confidence.
 
 ### Phase 9 Research: Local Cavity Repair
 
@@ -1011,8 +998,8 @@ UI-to-plane conversion:
 Worker implementation:
 
 - For clean closed meshes, use CGAL `clip()` or `split()` against a halfspace.
-- If using a cutter volume rather than a plane, use CGAL corefinement/boolean
-  difference only after self-intersections are checked.
+- If using a cutter volume rather than a plane, run self-intersection checks
+  before CGAL corefinement/boolean difference.
 - CGAL booleans require non-self-intersecting input and manifold output, so the
   cut operation should run a preflight analysis before apply.
 - After clipping, find boundary loops on the remaining mesh and use the hole
@@ -1025,7 +1012,7 @@ Preview:
 - Worker preview generates an actual mesh before apply.
 - Side selection should be reversible until Apply.
 
-Freehand knife later:
+Phase 10B freehand knife:
 
 - Convert screen path to a ruled/extruded cutting surface.
 - Split with the cutting surface.
@@ -1066,8 +1053,6 @@ Implementation:
 - Use CGAL `isotropic_remeshing()` for local repaired regions and caps.
 - Use CGAL Surface Mesh Simplification `edge_collapse()` for whole-model
   triangle reduction when the mesh is already a valid oriented 2-manifold.
-- Use ACVD or Delaunay surface remeshing only after tests show they preserve the
-  topology and visual details needed for organic AI meshes.
 - Always compute deviation metrics after simplification; do not treat triangle
   count reduction as success by itself.
 
@@ -1100,8 +1085,9 @@ Output formats:
 - STL is required because the current workflow is resin printing.
 - Project file stores scale and operation history because STL cannot be trusted
   to preserve that context.
-- Consider 3MF later for richer manufacturing metadata, but do not block STL
-  export on 3MF support.
+- 3MF is a future export expansion for richer manufacturing metadata. The
+  current plan delivers STL export and keeps scale/project context in the
+  MeshMend project file.
 
 Report:
 
@@ -1112,8 +1098,8 @@ Report:
 
 ### Phase 13 Research: Archive Deletion
 
-Delete the archive only after porting useful behavior. Do not keep Python as a
-parallel fallback.
+Delete the archive after porting useful behavior. Do not keep Python as a
+parallel implementation.
 
 Port mapping:
 
@@ -1149,7 +1135,7 @@ Packaging stages:
 1. Package Rust app only.
 2. Package app plus worker binaries built locally.
 3. Package app plus pinned worker dependencies.
-4. Add codesigning/notarization only after binary layout stabilizes.
+4. Add codesigning/notarization after binary layout stabilizes.
 
 Worker binary layout:
 
@@ -1160,9 +1146,9 @@ MeshMend.app/
   Contents/Resources/workers/meshmend-openvdb-worker
 ```
 
-Release blocker list:
+Release readiness list:
 
-- CGAL licensing decision.
+- CGAL licensing documentation.
 - OpenVDB dependency bundle strategy.
 - worker crash/error reporting.
 - output validation.
@@ -1174,21 +1160,33 @@ Do this in commit-sized stages. Do not split this into separate plan files.
 
 ### Phase 0: Plan Consolidation
 
-- Add this master plan.
-- Confirm no other `*plan*.md` files remain.
-- Keep architecture docs only as references.
+Goal: make the plan itself the single source of truth.
+
+Build:
+
+- Keep `docs/meshmend-master-plan.md` as the only plan file.
+- Treat architecture docs as implementation references, not competing plans.
+- Keep AGENTS/README aligned with the plan when workflows change.
 
 Acceptance:
 
 - `docs/meshmend-master-plan.md` is the single plan file.
 - No obsolete plan markdown remains.
+- Future planning updates edit this file instead of creating new plan files.
 
 ### Phase 1: Just Workflow And Run Action
 
-- Add `Justfile`.
-- Move Run action to `just run`.
+Goal: make the project feel like a Rust-native app, not an npm wrapper.
+
+Build:
+
+- Add root `Justfile` with `run`, `run-file`, `build`, `release`, `test`,
+  `lint`, `verify`, `verify-rose`, `perf`, `clean`, and `worker-build`.
+- Move `.codex/environments/environment.toml` Run action to `just run`.
 - Update README and AGENTS command references.
-- Remove npm scripts and package file after parity.
+- Remove `package.json` and `scripts/run-meshmend.sh` after the just recipes
+  launch the same app paths.
+- Keep `cargo` as the actual compiler/test runner.
 
 Acceptance:
 
@@ -1199,10 +1197,21 @@ Acceptance:
 
 ### Phase 2: UI Shell And Tool Palette
 
-- Replace top checkbox strip with icon tool palette and view mode strip.
-- Move model stats into collapsible panel.
-- Replace Labels/Issues panels with Defects/Repair/Operations panels.
-- Add tooltips and keyboard shortcuts.
+Goal: replace the scattered inspection UI with a repair-workstation shell.
+
+Build:
+
+- Add `ToolMode` and `ViewMode` app state.
+- Add a left vertical icon palette for select, navigate, analyze,
+  cross-section, x-ray inspect, repair brush, hole fill, cut, measure, remesh,
+  and export.
+- Add a top contextual strip for view modes and active tool options.
+- Add a right contextual panel for Defects, Repair, Operations, and Validation.
+- Add a bottom status/job bar with progress and cancellation.
+- Move model stats into a collapsible panel.
+- Replace user-facing Labels/Issues language with operation-focused repair
+  language.
+- Add icon assets, hover tooltips, and keyboard shortcuts.
 
 Acceptance:
 
@@ -1210,14 +1219,23 @@ Acceptance:
   as discoverable controls.
 - Repair tools are reachable from the palette.
 - The viewport is visually dominant.
+- The UI presents repair operations, not annotation management.
 
 ### Phase 3: View Modes And Lighting
 
-- Add headlight lighting tied to camera.
-- Add studio/fixed light modes.
-- Add surface wire and x-ray wire as distinct modes.
-- Improve normal mode access.
-- Add transparent shell rendering.
+Goal: make the model readable from every angle and make internal inspection
+usable.
+
+Build:
+
+- Add `view_mode` and `lighting_mode` uniforms.
+- Add camera-headlight rendering as the default view.
+- Add studio/fixed lighting for shape checks.
+- Keep normal color view as a first-class mode.
+- Keep depth-tested surface wire as visible-surface wire.
+- Add x-ray wire as a distinct non-depth-tested/transparent inspection mode.
+- Add transparent shell rendering for spatial context.
+- Add defect overlay drawing hooks for analysis results.
 
 Acceptance:
 
@@ -1228,119 +1246,228 @@ Acceptance:
 
 ### Phase 4: Selection Core
 
-- Add CPU BVH/intersection stack.
-- Add x-ray pick-through selection.
-- Add cross-section-aware picking.
-- Add selection overlays for boundary loops and components.
+Goal: make selection work on visible, internal, and back-side geometry.
+
+Build:
+
+- Add `crates/meshmend-geometry`.
+- Convert STL triangle soup into indexed mesh storage with source triangle
+  mapping.
+- Implement quantized vertex welding, adjacency maps, components, boundary
+  loops, and non-manifold edge lists.
+- Implement a flattened Rust BVH over triangle AABBs.
+- Implement ray-AABB traversal and exact ray-triangle intersections.
+- Return sorted hit stacks for x-ray selection.
+- Filter hit stacks by cross-section plane when active.
+- Render selection overlays for faces, components, and boundary loops.
 
 Acceptance:
 
 - User can pick visible, back-side, and internal hits in x-ray mode.
 - Picking remains responsive on `rose/raw.stl`.
+- Selection data feeds repair operations directly.
 
 ### Phase 5: Project And Operation State
 
-- Introduce project model and operation history.
-- Replace annotation-first session UI.
-- Add save project, export STL, undo, redo, and operation logs.
+Goal: replace temporary issue sessions with real repair project state.
+
+Build:
+
+- Add `meshmend-project` crate.
+- Store project metadata, source hash, scale, printer profile, current mesh
+  revision, operation history, worker logs, preview artifacts, and export
+  records.
+- Use directory-backed `.meshmend` projects for readable early development.
+- Implement operation records with input revision, output revision, parameters,
+  selection references, status, warnings, and validation summary.
+- Implement undo/redo by switching mesh revision pointers.
+- Add Save Project, Open Project, Export STL, Export Report, Undo, and Redo UI.
 
 Acceptance:
 
 - A repair operation can be previewed, applied, undone, and exported.
 - JSON labels/issues are no longer the main product output.
+- Project files preserve scale, repair history, logs, and output references.
 
 ### Phase 6: Mesh Analysis
 
-- Add topology defect detection.
-- Add automatic defect list and viewport overlays.
-- Add CLI `analyze`.
-- Add synthetic fixture meshes for holes, non-manifold edges, internal shells,
-  and self-intersections.
+Goal: automatically identify the defects that matter for resin printing.
+
+Build:
+
+- Add `meshmend-analysis` crate.
+- Implement Rust topology pass: boundary edges, boundary loops, non-manifold
+  edges, duplicate faces, degenerate triangles, connected components, and tiny
+  fragments.
+- Implement Rust geometry pass: bounds, area, edge-length distribution, volume
+  estimate for closed components, and grouped defect bounds.
+- Add CGAL confirmation through the worker for self-intersection and orientation
+  checks.
+- Add cavity/internal shell analysis using component containment and voxel flood
+  fill.
+- Add printability analysis after scale exists: thin walls, over-dense detail,
+  and feature size warnings.
+- Add CLI `meshmend analyze`.
+- Add synthetic fixtures for every defect kind.
 
 Acceptance:
 
 - The app identifies open holes and simple topology errors automatically.
 - Analysis results are grouped, selectable, and frameable.
+- Defect findings recommend the next repair tool.
 
 ### Phase 7: Worker Framework
 
-- Add worker request/response schema.
-- Add worker process runner with progress and cancellation.
-- Add C++ worker build path.
-- Add initial CGAL mesh load/validate smoke operation.
+Goal: run heavy geometry operations without freezing or crashing the UI.
+
+Build:
+
+- Add `meshmend-worker-api` crate with versioned request, progress, and response
+  schemas.
+- Add process runner that writes request JSON, launches worker binary, streams
+  JSONL progress, handles cancellation, and reads final response.
+- Add `workers/cpp/CMakeLists.txt`.
+- Build `meshmend-cgal-worker` and `meshmend-openvdb-worker`.
+- Add worker discovery beside the app binary, in `target/workers`, and through
+  an environment override.
+- Add first CGAL smoke operation: load mesh, validate basic counts, write
+  response.
+- Add UI job bar integration.
 
 Acceptance:
 
 - UI can run a background worker without freezing.
 - Worker progress appears in the job bar.
 - Worker failure is reported without crashing the app.
+- Worker operations can be cancelled.
 
 ### Phase 8: Hole Fill And Simple Repair
 
-- Implement boundary-loop selection.
-- Implement simple hole fill worker.
-- Add gridded/refined patch output for larger holes.
-- Validate repaired mesh.
+Goal: ship the first real mesh repair operation.
+
+Build:
+
+- Use Rust analysis to detect and select boundary loops.
+- Render selected loop and patch preview.
+- Send selected loop to CGAL worker.
+- Use CGAL hole filling with refinement/fairing for sculptable patches.
+- Remesh patch and transition ring to mesh-detail or physical target edge
+  length.
+- Write preview mesh, then apply to create a new mesh revision.
+- Validate patch: boundary loops, non-manifold edges, self-intersections, and
+  patch triangle quality.
 
 Acceptance:
 
 - Open holes can be filled and exported.
 - Filled patches remain sculptable, not single stretched fans.
+- Hole fill creates an undoable operation with a validation report.
 
 ### Phase 9: Local Cavity Repair
 
-- Implement anchor/target repair brush as operation input.
-- Detect and remove internal ROI surfaces.
-- Generate local wrap/replacement patch.
-- Preview and apply local repair.
+Goal: solve the rose-class internal cave problem locally.
+
+Build:
+
+- Convert repair brush strokes into operation inputs: healthy anchors, repair
+  target, and protected exclude regions.
+- Prototype A: derive ROI and boundary, remove target faces, fill with refined
+  patch.
+- Prototype B: identify internal shell triangles inside ROI, remove them, and
+  close resulting boundaries.
+- Prototype C: extract ROI, create an OpenVDB level set at target voxel size,
+  smooth within a mask, extract replacement mesh, trim, stitch, and remesh the
+  transition band.
+- Preserve protected anchor samples and report deviation.
+- Re-run cavity analysis inside the repaired ROI.
 
 Acceptance:
 
 - Rose-class cavity workflow can remove an internal cave and replace the local
   surface while preserving surrounding healthy surface.
+- The operation previews before apply and produces an undoable repaired mesh
+  revision.
 
 ### Phase 10: Cut/Bisect
 
-- Implement straight line cut.
-- Add side preview and side deletion.
-- Cap and remesh cut surface.
-- Add later freehand knife path.
+Goal: make printable chopping fast and purpose-built.
+
+Build:
+
+- Straight cut: draw a screen-space line, derive a cut plane from unprojected
+  rays and camera direction, preview both sides with GPU clipping.
+- Side selection: user clicks the side to delete or keep.
+- Worker cut: split/clip mesh with CGAL, delete chosen side, detect new
+  boundary loops, cap them with the hole-fill operation, and remesh caps.
+- Validate result: closedness, non-manifold edges, self-intersections, and cap
+  quality.
+- Phase 10B: freehand knife path creates a ruled cutting surface, splits the
+  mesh, selects the kept side, caps, remeshes, and validates.
 
 Acceptance:
 
 - User can chop away unwanted mesh parts quickly and export a closed result.
+- Straight cut is previewable, undoable, and validation-backed.
 
 ### Phase 11: Physical Scale And Remesh
 
-- Add two-point measure tool.
-- Add scale assignment.
-- Add printer profile.
-- Add remesh/simplify operation based on target microns.
+Goal: make mesh density meaningful for resin printing.
+
+Build:
+
+- Add measure tool with two pick points and model-space distance.
+- Let user assign real distance and unit.
+- Store model-units-per-mm in the project.
+- Add printer profile with XY pixel size, layer height, wall threshold, surface
+  tolerance, and edge-length multiplier.
+- Compute edge-length distribution in physical units.
+- Use CGAL isotropic remeshing for repaired patches and caps.
+- Use CGAL edge-collapse simplification for valid whole-mesh reduction.
+- Measure deviation after remesh/simplify.
 
 Acceptance:
 
 - User can set a 1 cm reference distance.
 - App can remesh toward a 20 micron style target and report triangle reduction
   and estimated deviation.
+- Physical dimensions and printer profile persist in the project.
 
 ### Phase 12: Export, Reports, And Validation
 
-- Export repaired STL.
-- Save project.
-- Export repair report.
-- Add final validation pass before export.
+Goal: produce trustworthy repaired output.
+
+Build:
+
+- Add explicit Export STL flow that never overwrites the source mesh silently.
+- Add final validation before export: STL round trip, boundary loops,
+  non-manifold edges, components, self-intersections, internal shell/cavity
+  estimate, triangle count, and physical dimensions.
+- Write repaired STL.
+- Write JSON and Markdown repair reports.
+- Store export paths and validation summaries in the project.
+- Add screenshot/report hooks for before/after views.
 
 Acceptance:
 
 - Exported mesh is validated for boundary loops, non-manifold edges, internal
   shells, and scale metadata/report consistency.
+- Exported STL and report are linked from the project history.
 
 ### Phase 13: Archive Deletion
 
-- Port useful Python behavior.
-- Convert needed tests.
-- Delete `archive/python-resinmesh`.
-- Remove Python-specific references and dependencies.
+Goal: remove the old Python repair pipeline after its useful ideas are
+reimplemented.
+
+Build:
+
+- Port diagnostics into `meshmend-analysis`.
+- Port voxel/wrap concepts into OpenVDB worker operations.
+- Port ROI concepts into Rust selection and ROI extraction.
+- Port useful CLI semantics into Rust CLI commands.
+- Convert useful tests into Rust fixtures and worker golden tests.
+- Delete `archive/python-resinmesh`, Python requirements, and archive-specific
+  docs.
+- Remove all references that describe Python as product code.
 
 Acceptance:
 
@@ -1349,15 +1476,26 @@ Acceptance:
 
 ### Phase 14: Packaging And Performance
 
-- Package the native app for macOS first.
-- Keep large mesh load and interaction performance measured.
-- Add worker progress regression tests where possible.
+Goal: make the native app practical to run repeatedly on the real rose-sized
+models.
+
+Build:
+
+- Package the native Rust app for macOS.
+- Bundle worker binaries under app resources.
+- Document CGAL/OpenVDB dependency and license requirements.
+- Add performance reports for load, BVH build, first frame, orbit/pan/zoom, and
+  repair job progress.
+- Add crash/error reporting for worker failures.
+- Add cancellation tests for long-running worker operations.
+- Keep `rose/raw.stl` as the local large-model performance check.
 
 Acceptance:
 
 - Large STL viewing remains responsive.
 - Repair jobs show progress and can be cancelled.
 - Release build and verification pass.
+- Packaged app can find and run bundled workers.
 
 ## Verification Strategy
 
@@ -1422,20 +1560,8 @@ Use primary documentation when implementing or changing a worker dependency.
   https://www.openvdb.org/documentation/doxygen/transformsAndMaps.html
 - OpenVDB license:
   https://www.openvdb.org/license/
-- Manifold:
-  https://manifoldcad.org/docs/html/index.html
-- libigl:
-  https://libigl.github.io/
-- Rust `cxx`:
-  https://cxx.rs/
 - Just:
   https://just.systems/man/en/
-- parry3d `TriMesh`:
-  https://docs.rs/parry3d/latest/parry3d/shape/struct.TriMesh.html
-- Rust `bvh`:
-  https://docs.rs/bvh/latest/bvh/
-- Rust `rstar`:
-  https://docs.rs/rstar/latest/rstar/struct.RTree.html
 
 Complete licensing and packaging checks before shipping any C++ dependency.
 CGAL is the most urgent legal check because the plan currently depends on CGAL
