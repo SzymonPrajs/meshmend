@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::MeshStats;
@@ -300,6 +301,65 @@ pub fn run_native(
     })?;
 
     Ok(())
+}
+
+pub fn run_capture(input: PathBuf, output: Option<PathBuf>) -> Result<()> {
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new()
+        .with_title("MeshMend render verification")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_visible(false)
+        .build(&event_loop)?;
+    let window: &'static Window = Box::leak(Box::new(window));
+    let window_id = window.id();
+    let redraw_window = window;
+    let mut renderer = pollster::block_on(WgpuRenderer::new(window))?;
+    let _info = load_model(&input, &mut renderer, window)?;
+    let result: Arc<Mutex<Option<Result<()>>>> = Arc::new(Mutex::new(None));
+    let result_writer = Arc::clone(&result);
+    let mut needs_redraw = true;
+    let mut captured = false;
+
+    event_loop.run(move |event, target| {
+        target.set_control_flow(ControlFlow::Wait);
+
+        match event {
+            Event::WindowEvent {
+                window_id: event_window_id,
+                event: WindowEvent::RedrawRequested,
+            } if event_window_id == window_id && !captured => {
+                captured = true;
+                let capture = renderer
+                    .screenshot(output.as_deref())
+                    .map_err(anyhow::Error::from)
+                    .and_then(|stats| {
+                        println!(
+                            "render {}x{} non_background={} coverage={:.4}",
+                            stats.width, stats.height, stats.non_background_pixels, stats.coverage
+                        );
+                        if stats.coverage <= 0.001 {
+                            Err(anyhow!("render verification failed: image is blank"))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                *result_writer.lock().expect("capture result lock poisoned") = Some(capture);
+                target.exit();
+            }
+            Event::AboutToWait => {
+                if needs_redraw {
+                    redraw_window.request_redraw();
+                    needs_redraw = false;
+                }
+            }
+            _ => {}
+        }
+    })?;
+
+    let mut guard = result.lock().expect("capture result lock poisoned");
+    guard
+        .take()
+        .unwrap_or_else(|| Err(anyhow!("render verification did not run")))
 }
 
 fn handle_ui_action(

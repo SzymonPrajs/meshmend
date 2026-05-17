@@ -15,6 +15,12 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    #[arg(long, value_names = ["STL", "PNG"], num_args = 2)]
+    screenshot: Option<Vec<PathBuf>>,
+
+    #[arg(long, value_name = "STL")]
+    verify_render: Option<PathBuf>,
+
     #[arg(value_name = "STL")]
     input: Option<PathBuf>,
 
@@ -39,6 +45,15 @@ fn main() -> Result<()> {
     init_logging();
 
     let cli = Cli::parse();
+    if let Some(values) = cli.screenshot {
+        app::run_capture(values[0].clone(), Some(values[1].clone()))?;
+        return Ok(());
+    }
+    if let Some(path) = cli.verify_render {
+        app::run_capture(path, None)?;
+        return Ok(());
+    }
+
     match cli.command {
         Some(Command::Inspect { path, parallel }) => {
             let parsed = load_binary_stl_with_options(

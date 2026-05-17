@@ -1,3 +1,5 @@
+use std::{fs, path::Path};
+
 use glam::{Vec2, Vec3, Vec4};
 use meshmend_core::{MeshBounds, Triangle, TriangleId};
 use wgpu::util::DeviceExt;
@@ -41,6 +43,14 @@ impl Default for DisplaySettings {
 pub struct PickResult {
     pub triangle_id: TriangleId,
     pub position: Vec3,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenshotStats {
+    pub width: u32,
+    pub height: u32,
+    pub non_background_pixels: u64,
+    pub coverage: f64,
 }
 
 pub struct WgpuRenderer<'window> {
@@ -118,7 +128,7 @@ impl<'window> WgpuRenderer<'window> {
             .unwrap_or(wgpu::PresentMode::Fifo);
         let alpha_mode = caps.alpha_modes[0];
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -534,6 +544,110 @@ impl<'window> WgpuRenderer<'window> {
             .sum()
     }
 
+    pub fn screenshot(&mut self, path: Option<&Path>) -> Result<ScreenshotStats, RenderError> {
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.resize(self.size);
+                return Err(RenderError::SurfaceUnavailable);
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Err(RenderError::SurfaceUnavailable),
+            Err(wgpu::SurfaceError::OutOfMemory) => return Err(RenderError::SurfaceOutOfMemory),
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let width = self.config.width.max(1);
+        let height = self.config.height.max(1);
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row = align_to(unpadded_bytes_per_row, 256);
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MeshMend screenshot readback"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("MeshMend screenshot encoder"),
+            });
+        self.encode_scene(&mut encoder, &view);
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &frame.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &output_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+
+        let slice = output_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|_| RenderError::PickReadbackClosed)??;
+        let data = slice.get_mapped_range();
+        let mut rgba = vec![0; (width * height * 4) as usize];
+        for y in 0..height as usize {
+            let src_start = y * padded_bytes_per_row as usize;
+            let dst_start = y * unpadded_bytes_per_row as usize;
+            let src = &data[src_start..src_start + unpadded_bytes_per_row as usize];
+            let dst = &mut rgba[dst_start..dst_start + unpadded_bytes_per_row as usize];
+            match self.config.format {
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+                    for (src, dst) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                        dst[0] = src[2];
+                        dst[1] = src[1];
+                        dst[2] = src[0];
+                        dst[3] = src[3];
+                    }
+                }
+                _ => dst.copy_from_slice(src),
+            }
+        }
+        drop(data);
+        output_buffer.unmap();
+
+        if let Some(path) = path {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent)?;
+            }
+            image::save_buffer(path, &rgba, width, height, image::ColorType::Rgba8)?;
+        }
+
+        let non_background_pixels = count_non_background_pixels(&rgba);
+        let total = u64::from(width) * u64::from(height);
+        Ok(ScreenshotStats {
+            width,
+            height,
+            non_background_pixels,
+            coverage: non_background_pixels as f64 / total.max(1) as f64,
+        })
+    }
+
     pub fn pick(&mut self, screen_position: Vec2) -> Result<Option<PickResult>, RenderError> {
         if self.mesh_chunks.is_empty() || self.size.width == 0 || self.size.height == 0 {
             return Ok(None);
@@ -686,6 +800,60 @@ impl<'window> WgpuRenderer<'window> {
             .map(|bounds| bounds.radius() * 0.018)
             .unwrap_or(0.05)
             .max(0.002)
+    }
+
+    fn encode_scene(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("MeshMend screenshot scene pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.045,
+                        g: 0.052,
+                        b: 0.06,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        if let Some(lines) = &self.scene_lines {
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, lines.buffer.slice(..));
+            if self.display_settings.show_grid && lines.grid_vertex_count > 0 {
+                pass.draw(0..lines.grid_vertex_count, 0..1);
+            }
+            if self.display_settings.show_axes && lines.axes_vertex_count > 0 {
+                pass.draw(
+                    lines.grid_vertex_count..lines.grid_vertex_count + lines.axes_vertex_count,
+                    0..1,
+                );
+            }
+        }
+        let mesh_pipeline = if self.display_settings.show_backfaces {
+            &self.mesh_pipeline
+        } else {
+            &self.mesh_culled_pipeline
+        };
+        pass.set_pipeline(mesh_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        for chunk in &self.mesh_chunks {
+            pass.set_bind_group(1, &chunk.bind_group, &[]);
+            pass.draw(0..3, 0..chunk.triangle_count);
+        }
     }
 
     fn write_camera(&self) {
@@ -1137,6 +1305,25 @@ fn intersect_triangle(ray: Ray, triangle: Triangle) -> Option<Vec3> {
     (t > epsilon).then(|| ray.origin + ray.direction * t)
 }
 
+fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
+fn count_non_background_pixels(rgba: &[u8]) -> u64 {
+    let background = [12_u8, 13_u8, 15_u8, 255_u8];
+    rgba.chunks_exact(4)
+        .filter(|pixel| {
+            pixel[3] > 0
+                && pixel
+                    .iter()
+                    .zip(background)
+                    .map(|(actual, expected)| actual.abs_diff(expected) as u16)
+                    .sum::<u16>()
+                    > 18
+        })
+        .count() as u64
+}
+
 fn aspect_from_size(size: PhysicalSize<u32>) -> f32 {
     size.width.max(1) as f32 / size.height.max(1) as f32
 }
@@ -1188,6 +1375,8 @@ fn preferred_backends() -> wgpu::Backends {
 pub enum RenderError {
     #[error("no compatible GPU adapter was found")]
     NoAdapter,
+    #[error("GPU surface was unavailable for screenshot capture")]
+    SurfaceUnavailable,
     #[error("GPU surface is out of memory")]
     SurfaceOutOfMemory,
     #[error("GPU picking readback channel closed")]
@@ -1198,4 +1387,8 @@ pub enum RenderError {
     CreateSurface(#[from] wgpu::CreateSurfaceError),
     #[error(transparent)]
     RequestDevice(#[from] wgpu::RequestDeviceError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Image(#[from] image::ImageError),
 }
