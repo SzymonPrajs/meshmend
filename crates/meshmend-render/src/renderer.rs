@@ -53,6 +53,12 @@ pub struct ScreenshotStats {
     pub coverage: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct LabelStrokeOverlay {
+    pub points: Vec<Vec3>,
+    pub color: [f32; 4],
+}
+
 pub struct WgpuRenderer<'window> {
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
@@ -75,6 +81,7 @@ pub struct WgpuRenderer<'window> {
     mesh_bounds: Option<MeshBounds>,
     cross_section: CrossSectionState,
     cross_section_guide: Option<SceneLines>,
+    label_strokes: Option<SceneLines>,
     selection_marker: Option<SceneLines>,
     issue_markers: Option<SceneLines>,
     display_settings: DisplaySettings,
@@ -258,6 +265,7 @@ impl<'window> WgpuRenderer<'window> {
             mesh_bounds: None,
             cross_section: CrossSectionState::default(),
             cross_section_guide: None,
+            label_strokes: None,
             selection_marker: None,
             issue_markers: None,
             display_settings: DisplaySettings::default(),
@@ -339,6 +347,7 @@ impl<'window> WgpuRenderer<'window> {
         self.scene_lines = Some(SceneLines::new(&self.device, bounds));
         self.cross_section = CrossSectionState::centered(bounds);
         self.update_cross_section_guide();
+        self.label_strokes = None;
         self.selection_marker = None;
         self.issue_markers = None;
 
@@ -515,6 +524,12 @@ impl<'window> WgpuRenderer<'window> {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_vertex_buffer(0, guide.buffer.slice(..));
                 pass.draw(0..guide.grid_vertex_count, 0..1);
+            }
+            if let Some(strokes) = &self.label_strokes {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, strokes.buffer.slice(..));
+                pass.draw(0..strokes.grid_vertex_count, 0..1);
             }
             if let Some(marker) = &self.selection_marker {
                 pass.set_pipeline(&self.grid_pipeline);
@@ -796,6 +811,11 @@ impl<'window> WgpuRenderer<'window> {
         });
     }
 
+    pub fn set_label_strokes(&mut self, strokes: &[LabelStrokeOverlay]) {
+        self.label_strokes = (!strokes.is_empty())
+            .then(|| SceneLines::label_strokes(&self.device, strokes, self.marker_radius() * 0.45));
+    }
+
     fn update_cross_section_guide(&mut self) {
         self.cross_section_guide = self
             .mesh_bounds
@@ -892,6 +912,12 @@ impl<'window> WgpuRenderer<'window> {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_vertex_buffer(0, guide.buffer.slice(..));
             pass.draw(0..guide.grid_vertex_count, 0..1);
+        }
+        if let Some(strokes) = &self.label_strokes {
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, strokes.buffer.slice(..));
+            pass.draw(0..strokes.grid_vertex_count, 0..1);
         }
     }
 
@@ -1159,6 +1185,60 @@ impl SceneLines {
         }
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MeshMend marker buffer"),
+            contents: bytemuck::cast_slice(vertices.as_slice()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            buffer,
+            grid_vertex_count: vertices.len() as u32,
+            axes_vertex_count: 0,
+        }
+    }
+
+    fn label_strokes(
+        device: &wgpu::Device,
+        strokes: &[LabelStrokeOverlay],
+        point_radius: f32,
+    ) -> Self {
+        let mut vertices = Vec::new();
+        for stroke in strokes {
+            for segment in stroke.points.windows(2) {
+                vertices.push(LineVertex {
+                    position: segment[0].to_array(),
+                    color: stroke.color,
+                });
+                vertices.push(LineVertex {
+                    position: segment[1].to_array(),
+                    color: stroke.color,
+                });
+            }
+
+            if let Some(first) = stroke.points.first() {
+                let radius = point_radius.max(0.001);
+                vertices.extend_from_slice(&[
+                    LineVertex {
+                        position: (*first + Vec3::new(-radius, 0.0, 0.0)).to_array(),
+                        color: stroke.color,
+                    },
+                    LineVertex {
+                        position: (*first + Vec3::new(radius, 0.0, 0.0)).to_array(),
+                        color: stroke.color,
+                    },
+                    LineVertex {
+                        position: (*first + Vec3::new(0.0, -radius, 0.0)).to_array(),
+                        color: stroke.color,
+                    },
+                    LineVertex {
+                        position: (*first + Vec3::new(0.0, radius, 0.0)).to_array(),
+                        color: stroke.color,
+                    },
+                ]);
+            }
+        }
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend label stroke buffer"),
             contents: bytemuck::cast_slice(vertices.as_slice()),
             usage: wgpu::BufferUsages::VERTEX,
         });

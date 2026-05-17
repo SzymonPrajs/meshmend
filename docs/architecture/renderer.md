@@ -16,6 +16,7 @@ Current passes:
 - hidden `R32Uint` GPU picking pass
 - cross-section clipping in the mesh and picking shaders
 - cross-section guide line pass
+- brush label stroke overlay pass for painted inspection regions
 - screenshot/readback pass for verification and performance metrics
 - `egui` overlay pass for controls, stats, inspection, and issues
 

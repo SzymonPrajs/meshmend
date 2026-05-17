@@ -9,8 +9,10 @@ use anyhow::{anyhow, Result};
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
-use meshmend_inspection::{IssueKind, IssueSession};
-use meshmend_render::{DisplaySettings, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer};
+use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
+use meshmend_render::{
+    DisplaySettings, LabelStrokeOverlay, MeshChunkUpload, PickResult, RendererInfo, WgpuRenderer,
+};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
     dpi::LogicalSize,
@@ -43,6 +45,38 @@ enum UiAction {
     FrameIssue(usize),
     DeleteIssue(usize),
     ResetCrossSection,
+    ClearLabelStrokes,
+    DeleteLabelStroke(usize),
+}
+
+#[derive(Debug, Clone)]
+struct BrushToolState {
+    enabled: bool,
+    kind: BrushLabelKind,
+    radius: f32,
+    min_screen_spacing: f32,
+    active_stroke_index: Option<usize>,
+    last_sample_screen: Option<glam::Vec2>,
+}
+
+impl Default for BrushToolState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kind: BrushLabelKind::default(),
+            radius: 0.0,
+            min_screen_spacing: 10.0,
+            active_stroke_index: None,
+            last_sample_screen: None,
+        }
+    }
+}
+
+impl BrushToolState {
+    fn finish_stroke(&mut self) {
+        self.active_stroke_index = None;
+        self.last_sample_screen = None;
+    }
 }
 
 pub fn run_native(
@@ -88,6 +122,7 @@ pub fn run_native(
         .map(|model| CrossSectionState::centered(model.stats.bounds))
         .unwrap_or_default();
     let mut selected_issue_kind = IssueKind::default();
+    let mut brush_tool = BrushToolState::default();
 
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
@@ -138,6 +173,7 @@ pub fn run_native(
                                 &mut issue_session,
                                 &mut cross_section,
                                 &mut selected_issue_kind,
+                                &mut brush_tool,
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut display_settings,
@@ -159,6 +195,7 @@ pub fn run_native(
                             &mut issue_session,
                             &mut cross_section,
                             selected_issue_kind,
+                            &mut brush_tool,
                             &mut selected_pick,
                             &mut status,
                             &mut needs_redraw,
@@ -224,7 +261,9 @@ pub fn run_native(
                                     cross_section = CrossSectionState::centered(info.stats.bounds);
                                     model_info = Some(info);
                                     selected_pick = None;
+                                    brush_tool.finish_stroke();
                                     renderer.set_issue_markers(&[]);
+                                    renderer.set_label_strokes(&[]);
                                 }
                             Err(err) => {
                                 status = format!("Load failed: {err}");
@@ -238,10 +277,35 @@ pub fn run_native(
                             if is_camera_button(button) && !egui_response.consumed =>
                         {
                             camera_input.press(button);
+                            if button == MouseButton::Left
+                                && brush_tool.enabled
+                                && !active_modifiers.shift_key()
+                            {
+                                if let Some(position) = camera_input.cursor_position() {
+                                    sample_label_brush(
+                                        &mut renderer,
+                                        issue_session.as_mut(),
+                                        &mut brush_tool,
+                                        position,
+                                        &mut selected_pick,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    );
+                                }
+                            }
                         }
                         ElementState::Released => {
                             if let Some(position) = camera_input.release(button) {
-                                if button == MouseButton::Left
+                                if button == MouseButton::Left && brush_tool.active_stroke_index.is_some()
+                                {
+                                    if let Some(session) = issue_session.as_mut() {
+                                        session.discard_empty_label_strokes();
+                                        update_label_strokes(&mut renderer, session);
+                                    }
+                                    brush_tool.finish_stroke();
+                                    needs_redraw = true;
+                                } else if button == MouseButton::Left
+                                    && !brush_tool.enabled
                                     && !active_modifiers.shift_key()
                                     && !egui_response.consumed
                                 {
@@ -274,6 +338,19 @@ pub fn run_native(
                         {
                             let mut camera = renderer.camera();
                             match button {
+                                MouseButton::Left
+                                    if brush_tool.enabled && !active_modifiers.shift_key() =>
+                                {
+                                    sample_label_brush(
+                                        &mut renderer,
+                                        issue_session.as_mut(),
+                                        &mut brush_tool,
+                                        glam::Vec2::new(position.x as f32, position.y as f32),
+                                        &mut selected_pick,
+                                        &mut status,
+                                        &mut needs_redraw,
+                                    );
+                                }
                                 MouseButton::Left if active_modifiers.shift_key() => {
                                     camera.pan(delta, renderer.size().height as f32);
                                 }
@@ -681,6 +758,7 @@ fn handle_ui_action(
     issue_session: &mut Option<IssueSession>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: IssueKind,
+    brush_tool: &mut BrushToolState,
     selected_pick: &mut Option<PickResult>,
     status: &mut String,
     needs_redraw: &mut bool,
@@ -699,8 +777,10 @@ fn handle_ui_action(
                         *cross_section = CrossSectionState::centered(info.stats.bounds);
                         *model_info = Some(info);
                         *selected_pick = None;
+                        brush_tool.finish_stroke();
                         renderer.set_selection_marker(None);
                         renderer.set_issue_markers(&[]);
+                        renderer.set_label_strokes(&[]);
                     }
                     Err(err) => {
                         *status = format!("Load failed: {err}");
@@ -753,6 +833,7 @@ fn handle_ui_action(
                 match IssueSession::load_from_path(&path) {
                     Ok(session) => {
                         update_issue_markers(renderer, &session);
+                        update_label_strokes(renderer, &session);
                         *status = format!("Loaded issues from {}", path.display());
                         *issue_session = Some(session);
                     }
@@ -801,6 +882,24 @@ fn handle_ui_action(
             if let Some(model) = model_info.as_ref() {
                 cross_section.reset_to_center(model.stats.bounds);
                 *status = "Centered cross section".to_string();
+                *needs_redraw = true;
+            }
+        }
+        UiAction::ClearLabelStrokes => {
+            if let Some(session) = issue_session.as_mut() {
+                session.clear_label_strokes();
+                renderer.set_label_strokes(&[]);
+                brush_tool.finish_stroke();
+                *status = "Cleared brush labels".to_string();
+                *needs_redraw = true;
+            }
+        }
+        UiAction::DeleteLabelStroke(index) => {
+            if let Some(session) = issue_session.as_mut() {
+                session.remove_label_stroke(index);
+                update_label_strokes(renderer, session);
+                brush_tool.finish_stroke();
+                *status = "Deleted brush label".to_string();
                 *needs_redraw = true;
             }
         }
@@ -871,6 +970,64 @@ fn update_issue_markers(renderer: &mut WgpuRenderer<'_>, session: &IssueSession)
     renderer.set_issue_markers(&positions);
 }
 
+fn update_label_strokes(renderer: &mut WgpuRenderer<'_>, session: &IssueSession) {
+    let strokes = session
+        .label_strokes
+        .iter()
+        .filter(|stroke| !stroke.samples.is_empty())
+        .map(|stroke| LabelStrokeOverlay {
+            points: stroke
+                .samples
+                .iter()
+                .map(|sample| glam::Vec3::from_array(sample.position))
+                .collect(),
+            color: stroke.kind.color(),
+        })
+        .collect::<Vec<_>>();
+    renderer.set_label_strokes(&strokes);
+}
+
+fn sample_label_brush(
+    renderer: &mut WgpuRenderer<'_>,
+    session: Option<&mut IssueSession>,
+    brush: &mut BrushToolState,
+    screen_position: glam::Vec2,
+    selected_pick: &mut Option<PickResult>,
+    status: &mut String,
+    needs_redraw: &mut bool,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    if let Some(last) = brush.last_sample_screen {
+        if screen_position.distance(last) < brush.min_screen_spacing {
+            return;
+        }
+    }
+
+    let stroke_index = brush
+        .active_stroke_index
+        .unwrap_or_else(|| session.start_label_stroke(brush.kind, brush.radius.max(0.001)));
+    brush.active_stroke_index = Some(stroke_index);
+
+    match renderer.pick(screen_position) {
+        Ok(Some(pick)) => {
+            session.add_label_sample(stroke_index, pick.triangle_id, pick.position.to_array());
+            brush.last_sample_screen = Some(screen_position);
+            *selected_pick = Some(pick);
+            update_label_strokes(renderer, session);
+            *status = format!("Painted {}", brush.kind.label());
+            *needs_redraw = true;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            *status = format!("Brush pick failed: {err}");
+            tracing::error!(error = %err, "failed to paint brush label");
+            *needs_redraw = true;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_ui(
     ctx: &egui::Context,
@@ -880,6 +1037,7 @@ fn draw_ui(
     issue_session: &mut Option<IssueSession>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
+    brush_tool: &mut BrushToolState,
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
@@ -993,6 +1151,48 @@ fn draw_ui(
             ui.checkbox(&mut cross_section.show_plane_guide, "Show plane guide");
             if ui.button("Center Plane").clicked() {
                 *action = UiAction::ResetCrossSection;
+            }
+
+            ui.separator();
+            ui.heading("Labels");
+            ui.checkbox(&mut brush_tool.enabled, "Brush");
+
+            egui::ComboBox::from_label("Label")
+                .selected_text(brush_tool.kind.label())
+                .show_ui(ui, |ui| {
+                    for kind in BrushLabelKind::ALL {
+                        ui.selectable_value(&mut brush_tool.kind, kind, kind.label());
+                    }
+                });
+
+            let max_radius = (model.stats.bounds.radius() * 0.08).max(0.01);
+            if brush_tool.radius <= 0.0 {
+                brush_tool.radius = (model.stats.bounds.radius() * 0.015).max(0.01);
+            }
+            ui.add(
+                egui::Slider::new(&mut brush_tool.radius, 0.001..=max_radius).text("Brush radius"),
+            );
+            ui.add(
+                egui::Slider::new(&mut brush_tool.min_screen_spacing, 2.0..=32.0).text("Spacing"),
+            );
+
+            if ui.button("Clear Labels").clicked() {
+                *action = UiAction::ClearLabelStrokes;
+            }
+
+            if let Some(session) = issue_session.as_mut() {
+                for (index, stroke) in session.label_strokes.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{}: {} samples",
+                            stroke.kind.label(),
+                            stroke.samples.len()
+                        ));
+                        if ui.button("Delete").clicked() {
+                            *action = UiAction::DeleteLabelStroke(index);
+                        }
+                    });
+                }
             }
 
             ui.separator();

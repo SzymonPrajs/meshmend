@@ -12,8 +12,8 @@ Build toward:
 - a local native desktop app
 - STL input only
 - orbit, pan, and zoom viewing
-- a clean foundation for cross-section inspection, issue marking, validation,
-  and later repair tools
+- a clean foundation for cross-section inspection, brush labels, issue marking,
+  validation, and later repair tools
 
 Do not revive the old Python repair pipeline as active product code. It is
 archived at:
@@ -41,13 +41,16 @@ planning files, not raw model data.
 - Put the app under `apps/meshmend/`.
 - Use a Rust workspace with `winit`, native `wgpu`, and `egui`.
 - Keep the hot path in Rust: STL parsing, validation, chunking, GPU upload,
-  camera math, picking, issue marking, screenshots, and performance metrics.
+  camera math, picking, brush labels, issue marking, screenshots, and
+  performance metrics.
 - Do not reintroduce the Three.js/Vite/Tauri webview viewer as active product
   code.
-- Keep the native viewer focused on inspection. Cross-section inspection and
-  manual issue marking are active product features.
-- Do not build repair, mesh simplification, printable slicing/layer export, ROI
-  tools, or automatic defect classification yet.
+- Keep the native viewer focused on inspection. Cross-section inspection, brush
+  labels, and manual issue marking are active product features.
+- Local repair should start from brush labels as described in
+  `docs/architecture/local-heal.md`.
+- Do not build global repair, mesh simplification, printable slicing/layer
+  export, ROI tools, or automatic defect classification yet.
 - Keep source assets and generated app artifacts separate.
 - Keep generated build outputs, Rust `target`, large STL outputs, and local
   raw model files ignored.
@@ -64,6 +67,7 @@ The current inspection milestone is complete when:
 - the app reports basic mesh stats such as triangle count and bounds
 - basic selection, issue marking, screenshots, and performance metrics work
 - a cross-section plane can inspect hidden internal geometry along X, Y, or Z
+- brush labels can mark healthy boundary and repair target regions
 
 Anything beyond that belongs to a later milestone.
 

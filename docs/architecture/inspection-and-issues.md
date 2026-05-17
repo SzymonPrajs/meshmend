@@ -14,6 +14,14 @@ hidden-side triangles are not selectable after the plane is enabled.
 
 Issue sessions are stored as versioned JSON in `crates/meshmend-inspection`.
 
+Brush labels are stored in the same session. They are stroke-based surface
+labels, not point issues. The first active label types are:
+
+- healthy boundary: good surface around a cavity or damaged area that should be
+  preserved by local repair
+- repair target: the damaged or hollow area to heal
+- exclude: nearby surface that should not be pulled into a local repair solve
+
 Current issue fields:
 
 - model file name
@@ -27,5 +35,14 @@ Current issue fields:
 - label
 - status
 
-The UI can select an issue kind, add an issue at the selected point, edit
-labels, frame an issue, delete issues, save issues, and load issues from JSON.
+Current brush stroke fields:
+
+- stroke ID
+- label kind
+- brush radius
+- sampled triangle IDs
+- sampled model-space positions
+
+The UI can paint brush labels on the visible mesh, select an issue kind, add an
+issue at the selected point, edit labels, frame an issue, delete issues, save
+sessions, and load sessions from JSON.

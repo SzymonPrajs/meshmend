@@ -37,4 +37,8 @@ impl CameraInput {
             .zip(delta)
             .filter(|(_, delta)| delta.length_squared() > 0.0)
     }
+
+    pub fn cursor_position(&self) -> Option<Vec2> {
+        self.last_cursor
+    }
 }
