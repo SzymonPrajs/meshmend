@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use meshmend_render::WgpuRenderer;
 use winit::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -20,19 +21,39 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
         .with_min_inner_size(LogicalSize::new(720.0, 480.0))
         .build(&event_loop)?;
+    let window: &'static winit::window::Window = Box::leak(Box::new(window));
+    let window_id = window.id();
+    let redraw_window = window;
+    let mut renderer = pollster::block_on(WgpuRenderer::new(window))?;
+    tracing::info!(
+        adapter = %renderer.info().adapter_name,
+        backend = ?renderer.info().backend,
+        "native renderer ready"
+    );
 
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Wait);
 
         match event {
-            Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
+            Event::WindowEvent {
+                window_id: event_window_id,
+                event,
+            } if event_window_id == window_id => match event {
                 WindowEvent::CloseRequested => target.exit(),
-                WindowEvent::RedrawRequested if smoke_window => target.exit(),
-                WindowEvent::RedrawRequested => {}
+                WindowEvent::Resized(size) => renderer.resize(size),
+                WindowEvent::RedrawRequested => {
+                    if let Err(err) = renderer.render() {
+                        tracing::error!(error = %err, "render failed");
+                        target.exit();
+                    }
+                    if smoke_window {
+                        target.exit();
+                    }
+                }
                 _ => {}
             },
             Event::AboutToWait => {
-                window.request_redraw();
+                redraw_window.request_redraw();
             }
             _ => {}
         }

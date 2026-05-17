@@ -80,7 +80,7 @@ fn main() -> Result<()> {
 
 fn init_logging() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "meshmend=info,wgpu=warn".into());
+        .unwrap_or_else(|_| "info,wgpu=warn,naga=warn".into());
 
     tracing_subscriber::registry()
         .with(env_filter)
