@@ -73,6 +73,10 @@ screenshots/
 *.mp4
 *.webm
 
+# Tauri app icons are source assets required by the bundle config.
+!apps/*/src-tauri/icons/
+!apps/*/src-tauri/icons/*.png
+
 # Generated reports and large analysis outputs
 *.report.json
 *_worst_error_points.csv

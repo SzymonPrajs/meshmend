@@ -1,7 +1,8 @@
 # Agent Notes
 
 This workspace has pivoted away from the failed global mesh-repair experiments.
-The active direction is a Tauri STL viewer prototype.
+The active direction is MeshMend, a Tauri STL viewer prototype for inspecting
+and later repairing AI-generated mesh files.
 
 ## Current Boundary
 
@@ -35,7 +36,7 @@ planning files, not raw model data.
 
 ## Implementation Rules
 
-- Put the app under `apps/rose-viewer/`.
+- Put the app under `apps/meshmend/`.
 - Use Tauri 2 with a Rust shell and a TypeScript frontend.
 - Use Three.js first. It already provides the practical viewer pieces needed
   for STL loading, camera control, lighting, and ray picking later.
@@ -52,9 +53,18 @@ The first milestone is complete when:
 
 - a Tauri app launches locally
 - the app accepts an STL file selected from disk
-- `rose/raw.stl` renders correctly
-- orbit, pan, and zoom work smoothly enough to inspect petals
+- `rose/raw.stl` renders correctly as the local test model
+- orbit, pan, and zoom work smoothly enough to inspect the loaded mesh
 - the camera fits the model to view after loading
 - the app reports basic mesh stats such as triangle count and bounds
 
 Anything beyond that belongs to a later milestone.
+
+Use these checks after viewer changes:
+
+```bash
+cd apps/meshmend
+npm run build
+npm run verify:viewer
+npm run tauri build -- --bundles app
+```

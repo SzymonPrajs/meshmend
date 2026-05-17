@@ -1,6 +1,7 @@
 # 3D Modelling
 
-This workspace is now focused on a clean Tauri STL viewer prototype.
+This workspace is now focused on MeshMend, a clean Tauri STL viewer prototype
+for inspecting and later repairing AI-generated mesh files.
 
 The previous Python mesh-repair toolchain has been moved out of the active
 source tree:
@@ -34,18 +35,19 @@ docs/tauri-stl-viewer-plan.md
 The first implementation milestone should be only a viewer:
 
 - accept STL files
-- load `rose/raw.stl` manually through the app
+- load any STL file manually through the app
+- use `rose/raw.stl` as the local ignored test model
 - render the mesh
 - support orbit, pan, and zoom
 - fit the camera to the model bounds
 - avoid repair, slicing, picking, and mesh editing until the viewer is stable
 
-## Proposed App Location
+## App Location
 
-When implementation starts, put the Tauri app under:
+The Tauri app is under:
 
 ```text
-apps/rose-viewer/
+apps/meshmend/
 ```
 
 The intended stack is:
@@ -55,3 +57,20 @@ The intended stack is:
 - Three.js for the first renderer
 - WebGPU only as a later evaluated renderer path if the STL workload proves to
   need it
+
+Current implementation commands:
+
+```bash
+cd apps/meshmend
+npm install
+npm run tauri dev
+```
+
+Verification:
+
+```bash
+cd apps/meshmend
+npm run build
+npm run verify:viewer
+npm run tauri build -- --bundles app
+```

@@ -2,7 +2,8 @@
 
 ## Objective
 
-Build a clean desktop viewer for STL models before returning to repair tools.
+Build MeshMend, a clean desktop viewer for STL models before returning to
+repair tools.
 The first useful version should do one thing well: load an STL file and let the
 user inspect it with orbit, pan, and zoom controls.
 
@@ -12,9 +13,10 @@ The active test asset is:
 rose/raw.stl
 ```
 
-This is now the only model asset the viewer should refer to. It is around 93 MB
-and contains about 1.95 million triangles, so the viewer must be designed for a
-large real test file from the start.
+This is the local ignored test model. The app must still load arbitrary STL
+files selected by the user. The test model is around 93 MB and contains about
+1.95 million triangles, so the viewer must be designed for a large real file
+from the start.
 
 ## Non-Goals For The First Demo
 
@@ -88,13 +90,13 @@ Reasons:
 Proposed app location:
 
 ```text
-apps/rose-viewer/
+apps/meshmend/
 ```
 
 Proposed structure:
 
 ```text
-apps/rose-viewer/
+apps/meshmend/
   package.json
   vite.config.ts
   tsconfig.json
@@ -141,11 +143,12 @@ The app should accept STL only.
 For the first version, use a standard file input:
 
 ```text
-Open STL -> user selects rose/raw.stl
+Load STL -> user selects any .stl file, including rose/raw.stl for local testing
 ```
 
-This is better than hardcoding access to `rose/raw.stl` because it avoids early
-Tauri filesystem permission and path-scope complexity.
+This is better than hardcoding access to `rose/raw.stl` because the product is
+a general STL viewer and because it avoids early Tauri filesystem permission and
+path-scope complexity.
 
 Later, add:
 
@@ -178,13 +181,15 @@ size: about 93 MB
 
 Goal: open the Tauri app, choose an STL, inspect it.
 
+Current implementation status: completed under `apps/meshmend/`.
+
 Implementation tasks:
 
-1. Create `apps/rose-viewer/` with Tauri, Vite, and TypeScript.
+1. Create `apps/meshmend/` with Tauri, Vite, and TypeScript.
 2. Install Three.js.
 3. Build a full-window viewport.
 4. Add a small top toolbar with:
-   - open STL button
+   - load STL button
    - mesh name
    - triangle count
    - vertex count
@@ -212,7 +217,7 @@ Implementation tasks:
 Definition of done:
 
 - `npm run tauri dev` opens the app.
-- `rose/raw.stl` loads from disk.
+- any selected STL loads from disk, with `rose/raw.stl` used as the local test.
 - the mesh is visible.
 - orbit, pan, and zoom work.
 - camera fit works.
@@ -226,8 +231,8 @@ These are the intended implementation commands when we move from plan to code:
 ```bash
 mkdir -p apps
 cd apps
-npm create tauri-app@latest rose-viewer
-cd rose-viewer
+npm create tauri-app@latest meshmend
+cd meshmend
 npm install three @types/three
 npm run tauri dev
 ```
@@ -241,9 +246,23 @@ During scaffolding, choose:
 
 Exact prompts may vary slightly by the current Tauri scaffolder.
 
+Current verification commands:
+
+```bash
+cd apps/meshmend
+npm run build
+npm run verify:viewer
+npm run tauri build -- --bundles app
+```
+
+`npm run verify:viewer` loads `../../rose/raw.stl` through the same file input
+used by the app, screenshots the viewer at two desktop-sized viewports, checks
+that the canvas is nonblank, and checks that an orbit drag changes rendered
+pixels.
+
 ## Milestone 2: Large STL Usability
 
-The rose STL is large enough that milestone 2 should focus on responsiveness.
+The local test STL is large enough that milestone 2 should focus on responsiveness.
 
 Tasks:
 
@@ -371,7 +390,7 @@ Cost:
 - UI iteration is slower than a web frontend
 
 This may be worth revisiting only if Tauri plus Three.js cannot handle the real
-rose STL acceptably.
+large test STL acceptably.
 
 ## Performance Risks
 
@@ -435,9 +454,9 @@ Automated tests for milestone 1 should be light:
 Manual verification:
 
 - launch `npm run tauri dev`
-- open `rose/raw.stl`
+- load `rose/raw.stl`
 - confirm camera fit
-- orbit around the rose
+- orbit around the model
 - zoom into petals
 - pan across the model
 - resize the window
@@ -445,7 +464,7 @@ Manual verification:
 
 Visual verification:
 
-- capture a screenshot of the loaded rose
+- capture a screenshot of the loaded test model
 - confirm the model is not blank
 - confirm the model is not clipped at default fit
 - confirm controls remain responsive
