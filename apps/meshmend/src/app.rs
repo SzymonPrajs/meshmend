@@ -18,7 +18,7 @@ use meshmend_project::{
 };
 use meshmend_render::{
     DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
-    SelectionSummary, WgpuRenderer,
+    SelectionSummary, SelectionToolState, WgpuRenderer,
 };
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use meshmend_worker_api::{
@@ -380,6 +380,7 @@ pub fn run_native(
                     WindowEvent::RedrawRequested => {
                         let raw_input = egui_state.take_egui_input(redraw_window);
                         let mut action = UiAction::None;
+                        let selection_tool_state = renderer.selection_tool_state();
                         let mut display_settings = renderer.display_settings();
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             draw_ui(
@@ -397,6 +398,7 @@ pub fn run_native(
                                 &mut remesh_tool,
                                 &mut tool_mode,
                                 &mut view_mode,
+                                selection_tool_state,
                                 renderer.gpu_buffer_bytes(),
                                 &status,
                                 &mut display_settings,
@@ -700,9 +702,18 @@ pub fn run_native(
                     _ => {}
                 }
             }
-            Event::AboutToWait if needs_redraw => {
-                redraw_window.request_redraw();
-                needs_redraw = false;
+            Event::AboutToWait => {
+                let preparing_selection_tools =
+                    renderer.selection_tool_state() == SelectionToolState::Preparing;
+                if needs_redraw || preparing_selection_tools {
+                    redraw_window.request_redraw();
+                    needs_redraw = false;
+                }
+                if preparing_selection_tools {
+                    target.set_control_flow(ControlFlow::WaitUntil(
+                        Instant::now() + Duration::from_millis(250),
+                    ));
+                }
             }
             _ => {}
         }
@@ -821,6 +832,10 @@ pub fn run_hit_stack_verification(input: PathBuf) -> Result<()> {
                 window_id: event_window_id,
                 event: WindowEvent::RedrawRequested,
             } if event_window_id == window_id && !captured => {
+                if renderer.selection_tool_state() == SelectionToolState::Preparing {
+                    needs_redraw = true;
+                    return;
+                }
                 captured = true;
                 let center = glam::Vec2::new(
                     renderer.size().width as f32 * 0.5,
@@ -853,9 +868,18 @@ pub fn run_hit_stack_verification(input: PathBuf) -> Result<()> {
                     .expect("hit stack result lock poisoned") = Some(capture);
                 target.exit();
             }
-            Event::AboutToWait if needs_redraw => {
-                redraw_window.request_redraw();
-                needs_redraw = false;
+            Event::AboutToWait => {
+                let preparing_selection_tools =
+                    renderer.selection_tool_state() == SelectionToolState::Preparing;
+                if needs_redraw || preparing_selection_tools {
+                    redraw_window.request_redraw();
+                    needs_redraw = false;
+                }
+                if preparing_selection_tools {
+                    target.set_control_flow(ControlFlow::WaitUntil(
+                        Instant::now() + Duration::from_millis(50),
+                    ));
+                }
             }
             _ => {}
         }
@@ -1964,6 +1988,19 @@ fn select_at_cursor(
     needs_redraw: &mut bool,
 ) {
     if view_mode == ViewMode::XrayWire {
+        match renderer.selection_tool_state() {
+            SelectionToolState::Ready => {}
+            SelectionToolState::Preparing => {
+                *status = "Preparing X-ray inspect; try again in a moment".to_string();
+                *needs_redraw = true;
+                return;
+            }
+            SelectionToolState::Empty => {
+                *status = "X-ray inspect is not available for this mesh".to_string();
+                *needs_redraw = true;
+                return;
+            }
+        }
         match renderer.pick_hit_stack(position) {
             Ok(hits) if hits.is_empty() => {
                 *selected_pick = None;
@@ -2333,6 +2370,19 @@ fn sample_label_brush(
     let brush_radius = model_info
         .map(|model| brush.world_radius(model))
         .unwrap_or_else(|| brush.size_units.max(1.0));
+    match renderer.selection_tool_state() {
+        SelectionToolState::Ready => {}
+        SelectionToolState::Preparing => {
+            *status = "Preparing repair brush; try again in a moment".to_string();
+            *needs_redraw = true;
+            return;
+        }
+        SelectionToolState::Empty => {
+            *status = "Repair brush is not available for this mesh".to_string();
+            *needs_redraw = true;
+            return;
+        }
+    }
     let stroke_index = brush
         .active_stroke_index
         .unwrap_or_else(|| session.start_label_stroke(brush.kind, brush_radius));
@@ -2449,6 +2499,7 @@ fn draw_ui(
     remesh_tool: &mut RemeshToolState,
     tool_mode: &mut ToolMode,
     view_mode: &mut ViewMode,
+    selection_tool_state: SelectionToolState,
     gpu_buffer_bytes: u64,
     status: &str,
     display_settings: &mut DisplaySettings,
@@ -2546,6 +2597,7 @@ fn draw_ui(
                 measure_tool,
                 remesh_tool,
                 *tool_mode,
+                selection_tool_state,
                 gpu_buffer_bytes,
                 action,
             );
@@ -2560,6 +2612,8 @@ fn draw_ui(
             ui.label(status);
         });
     });
+
+    draw_selection_tool_badge(ctx, selection_tool_state, *tool_mode);
 }
 
 fn tool_button(ui: &mut egui::Ui, mode: ToolMode, selected: bool) -> egui::Response {
@@ -2606,6 +2660,34 @@ fn tool_button(ui: &mut egui::Ui, mode: ToolMode, selected: bool) -> egui::Respo
         stroke_color.gamma_multiply(0.72),
     );
     response.on_hover_text(mode.tooltip())
+}
+
+fn draw_selection_tool_badge(
+    ctx: &egui::Context,
+    selection_tool_state: SelectionToolState,
+    tool_mode: ToolMode,
+) {
+    if selection_tool_state != SelectionToolState::Preparing {
+        return;
+    }
+
+    let text = if selection_index_tool(tool_mode) {
+        "Preparing selected tool"
+    } else {
+        "Preparing repair tools"
+    };
+    egui::Area::new(egui::Id::new("selection_tool_status"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-14.0, -36.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.small(text);
+            });
+        });
+}
+
+fn selection_index_tool(tool_mode: ToolMode) -> bool {
+    matches!(tool_mode, ToolMode::RepairBrush | ToolMode::XrayInspect)
 }
 
 fn draw_tool_icon(painter: &egui::Painter, rect: egui::Rect, mode: ToolMode, color: egui::Color32) {
@@ -2701,6 +2783,7 @@ fn draw_repair_panel(
     measure_tool: &mut MeasureToolState,
     remesh_tool: &mut RemeshToolState,
     tool_mode: ToolMode,
+    selection_tool_state: SelectionToolState,
     gpu_buffer_bytes: u64,
     action: &mut UiAction,
 ) {
@@ -2732,9 +2815,14 @@ fn draw_repair_panel(
             action,
         ),
         ToolMode::CrossSection => draw_cross_section_tools(ui, model, cross_section, action),
-        ToolMode::RepairBrush => {
-            draw_repair_brush_tools(ui, model, issue_session, brush_tool, action)
-        }
+        ToolMode::RepairBrush => draw_repair_brush_tools(
+            ui,
+            model,
+            issue_session,
+            brush_tool,
+            selection_tool_state,
+            action,
+        ),
         ToolMode::HoleFill => draw_hole_fill_tools(ui, analysis_report, action),
         ToolMode::Cut => draw_cut_tools(ui, cross_section, action),
         ToolMode::Measure => draw_measure_tools(ui, selected_pick, project, measure_tool, action),
@@ -2924,10 +3012,15 @@ fn draw_repair_brush_tools(
     model: &ModelInfo,
     issue_session: &mut Option<IssueSession>,
     brush_tool: &mut BrushToolState,
+    selection_tool_state: SelectionToolState,
     action: &mut UiAction,
 ) {
     ui.heading("Surface Ring Brush");
     let (stroke_count, selected_face_count) = brush_region_counts(issue_session.as_ref());
+    let tools_ready = selection_tool_state == SelectionToolState::Ready;
+    if selection_tool_state == SelectionToolState::Preparing {
+        ui.label("Preparing tool");
+    }
 
     egui::ComboBox::from_label("Paint")
         .selected_text(brush_tool.kind.label())
@@ -2950,7 +3043,7 @@ fn draw_repair_brush_tools(
     ));
 
     ui.horizontal(|ui| {
-        let can_apply = selected_face_count > 0;
+        let can_apply = selected_face_count > 0 && tools_ready;
         if ui
             .add_enabled(can_apply, egui::Button::new("Cap / Wrap Opening"))
             .clicked()

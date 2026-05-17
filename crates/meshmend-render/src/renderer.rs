@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::mpsc, time::Instant};
 
 use glam::{Vec2, Vec3, Vec4};
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshBounds, Triangle, TriangleId};
@@ -86,6 +86,13 @@ pub struct SelectionSummary {
     pub non_manifold_edge_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionToolState {
+    Empty,
+    Preparing,
+    Ready,
+}
+
 #[derive(Debug, Clone)]
 pub struct LabelStrokeOverlay {
     pub points: Vec<Vec3>,
@@ -120,8 +127,14 @@ pub struct WgpuRenderer<'window> {
     selection_marker: Option<SceneLines>,
     issue_markers: Option<SceneLines>,
     selection_mesh: Option<SelectionMesh>,
+    selection_build: Option<SelectionMeshBuild>,
     display_settings: DisplaySettings,
     info: RendererInfo,
+}
+
+struct SelectionMeshBuild {
+    receiver: mpsc::Receiver<SelectionMesh>,
+    started: Instant,
 }
 
 impl<'window> WgpuRenderer<'window> {
@@ -331,6 +344,7 @@ impl<'window> WgpuRenderer<'window> {
             selection_marker: None,
             issue_markers: None,
             selection_mesh: None,
+            selection_build: None,
             display_settings: DisplaySettings::default(),
             info,
         })
@@ -414,23 +428,12 @@ impl<'window> WgpuRenderer<'window> {
         self.selection_marker = None;
         self.issue_markers = None;
         self.selection_mesh = None;
-        let mut selection_triangles = Vec::new();
+        self.selection_build = None;
 
         for chunk in chunks {
             if chunk.triangles.is_empty() {
                 continue;
             }
-            selection_triangles.extend(chunk.triangles.iter().copied().enumerate().map(
-                |(local_index, triangle)| {
-                    (
-                        TriangleId {
-                            chunk: chunk.chunk_index,
-                            local_index: local_index as u32,
-                        },
-                        triangle,
-                    )
-                },
-            ));
             let triangles = chunk
                 .triangles
                 .iter()
@@ -482,25 +485,92 @@ impl<'window> WgpuRenderer<'window> {
             });
         }
 
-        if !selection_triangles.is_empty() {
-            let started = std::time::Instant::now();
-            let selection_mesh = SelectionMesh::from_triangles(
-                selection_triangles,
-                selection_weld_tolerance(bounds),
-            );
-            tracing::info!(
-                vertices = selection_mesh.mesh.vertices.len(),
-                faces = selection_mesh.mesh.faces.len(),
-                components = selection_mesh.mesh.connectivity.component_count,
-                boundary_loops = selection_mesh.mesh.connectivity.boundary_loops.len(),
-                non_manifold_edges = selection_mesh.mesh.connectivity.non_manifold_edges.len(),
-                build_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "built CPU selection geometry"
-            );
-            self.selection_mesh = Some(selection_mesh);
+        self.start_selection_mesh_build(bounds);
+        self.fit_camera_to_mesh();
+    }
+
+    fn start_selection_mesh_build(&mut self, bounds: MeshBounds) {
+        if self.selection_mesh.is_some() || self.selection_build.is_some() {
+            return;
+        }
+        let triangle_count = self
+            .mesh_chunks
+            .iter()
+            .map(|chunk| chunk.cpu_triangles.len())
+            .sum();
+        if triangle_count == 0 {
+            return;
         }
 
-        self.fit_camera_to_mesh();
+        let started = Instant::now();
+        let mut selection_triangles = Vec::with_capacity(triangle_count);
+        for chunk in &self.mesh_chunks {
+            selection_triangles.extend(chunk.cpu_triangles.iter().copied().enumerate().map(
+                |(local_index, triangle)| {
+                    (
+                        TriangleId {
+                            chunk: chunk.chunk_index,
+                            local_index: local_index as u32,
+                        },
+                        triangle,
+                    )
+                },
+            ));
+        }
+
+        tracing::info!(
+            triangles = selection_triangles.len(),
+            prep_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "started CPU selection geometry build"
+        );
+        let tolerance = selection_weld_tolerance(bounds);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let selection_mesh = SelectionMesh::from_triangles(selection_triangles, tolerance);
+            let _ = sender.send(selection_mesh);
+        });
+        self.selection_build = Some(SelectionMeshBuild {
+            receiver,
+            started: Instant::now(),
+        });
+    }
+
+    fn poll_selection_mesh(&mut self) {
+        let Some(build) = self.selection_build.take() else {
+            return;
+        };
+
+        match build.receiver.try_recv() {
+            Ok(selection_mesh) => {
+                tracing::info!(
+                    vertices = selection_mesh.mesh.vertices.len(),
+                    faces = selection_mesh.mesh.faces.len(),
+                    components = selection_mesh.mesh.connectivity.component_count,
+                    boundary_loops = selection_mesh.mesh.connectivity.boundary_loops.len(),
+                    non_manifold_edges = selection_mesh.mesh.connectivity.non_manifold_edges.len(),
+                    build_ms = build.started.elapsed().as_secs_f64() * 1000.0,
+                    "built CPU selection geometry"
+                );
+                self.selection_mesh = Some(selection_mesh);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.selection_build = Some(build);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tracing::warn!("CPU selection geometry build stopped before completion");
+            }
+        }
+    }
+
+    pub fn selection_tool_state(&mut self) -> SelectionToolState {
+        self.poll_selection_mesh();
+        if self.selection_mesh.is_some() {
+            SelectionToolState::Ready
+        } else if self.selection_build.is_some() {
+            SelectionToolState::Preparing
+        } else {
+            SelectionToolState::Empty
+        }
     }
 
     pub fn selection_summary(&self) -> Option<SelectionSummary> {
@@ -897,15 +967,19 @@ impl<'window> WgpuRenderer<'window> {
         }))
     }
 
-    pub fn pick_hit_stack(&self, screen_position: Vec2) -> Result<Vec<PickResult>, RenderError> {
-        let Some(selection_mesh) = &self.selection_mesh else {
-            return Ok(Vec::new());
-        };
+    pub fn pick_hit_stack(
+        &mut self,
+        screen_position: Vec2,
+    ) -> Result<Vec<PickResult>, RenderError> {
+        self.poll_selection_mesh();
         let ray = self.pick_ray(screen_position);
         let clip_plane = self
             .cross_section
             .enabled
             .then(|| self.cross_section.plane());
+        let Some(selection_mesh) = &self.selection_mesh else {
+            return Ok(Vec::new());
+        };
         Ok(selection_mesh
             .hit_stack(ray, clip_plane)
             .into_iter()
@@ -917,11 +991,12 @@ impl<'window> WgpuRenderer<'window> {
     }
 
     pub fn surface_brush_region(
-        &self,
+        &mut self,
         seed: PickResult,
         radius: f32,
         max_faces: usize,
     ) -> Vec<PickResult> {
+        self.poll_selection_mesh();
         self.selection_mesh
             .as_ref()
             .map(|selection_mesh| {
@@ -934,7 +1009,7 @@ impl<'window> WgpuRenderer<'window> {
                     })
                     .collect()
             })
-            .unwrap_or_else(|| vec![seed])
+            .unwrap_or_default()
     }
 
     pub fn set_selection_marker(&mut self, position: Option<Vec3>) {
