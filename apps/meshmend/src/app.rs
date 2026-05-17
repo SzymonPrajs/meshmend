@@ -16,7 +16,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
@@ -99,6 +99,7 @@ pub fn run_native(
         None,
     );
     let mut camera_input = CameraInput::default();
+    let mut active_modifiers = ModifiersState::default();
     let mut needs_redraw = true;
     let mut selected_pick: Option<PickResult> = None;
 
@@ -120,6 +121,9 @@ pub fn run_native(
                     WindowEvent::Resized(size) => {
                         renderer.resize(size);
                         needs_redraw = true;
+                    }
+                    WindowEvent::ModifiersChanged(modifiers) => {
+                        active_modifiers = modifiers.state();
                     }
                     WindowEvent::RedrawRequested => {
                         let raw_input = egui_state.take_egui_input(redraw_window);
@@ -237,7 +241,10 @@ pub fn run_native(
                         }
                         ElementState::Released => {
                             if let Some(position) = camera_input.release(button) {
-                                if button == MouseButton::Left && !egui_response.consumed {
+                                if button == MouseButton::Left
+                                    && !active_modifiers.shift_key()
+                                    && !egui_response.consumed
+                                {
                                     match renderer.pick(position) {
                                         Ok(pick) => {
                                             selected_pick = pick;
@@ -267,6 +274,9 @@ pub fn run_native(
                         {
                             let mut camera = renderer.camera();
                             match button {
+                                MouseButton::Left if active_modifiers.shift_key() => {
+                                    camera.pan(delta, renderer.size().height as f32);
+                                }
                                 MouseButton::Left => camera.orbit(delta),
                                 MouseButton::Right | MouseButton::Middle => {
                                     camera.pan(delta, renderer.size().height as f32);
