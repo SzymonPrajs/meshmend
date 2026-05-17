@@ -4,7 +4,7 @@ use anyhow::Result;
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::MeshStats;
-use meshmend_render::{MeshChunkUpload, RendererInfo, WgpuRenderer};
+use meshmend_render::{DisplaySettings, MeshChunkUpload, RendererInfo, WgpuRenderer};
 use meshmend_stl::{load_binary_stl, ParsedStl};
 use winit::{
     dpi::LogicalSize,
@@ -99,6 +99,7 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                     WindowEvent::RedrawRequested => {
                         let raw_input = egui_state.take_egui_input(redraw_window);
                         let mut action = UiAction::None;
+                        let mut display_settings = renderer.display_settings();
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             draw_ui(
                                 ctx,
@@ -106,12 +107,17 @@ pub fn run_native(initial_file: Option<PathBuf>, smoke_window: bool) -> Result<(
                                 model_info.as_ref(),
                                 renderer.gpu_buffer_bytes(),
                                 &status,
+                                &mut display_settings,
                                 &mut action,
                             );
                         });
                         egui_state
                             .handle_platform_output(redraw_window, full_output.platform_output);
 
+                        if display_settings != renderer.display_settings() {
+                            renderer.set_display_settings(display_settings);
+                            needs_redraw = true;
+                        }
                         handle_ui_action(
                             action,
                             &mut renderer,
@@ -322,6 +328,7 @@ fn draw_ui(
     model_info: Option<&ModelInfo>,
     gpu_buffer_bytes: u64,
     status: &str,
+    display_settings: &mut DisplaySettings,
     action: &mut UiAction,
 ) {
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -335,6 +342,12 @@ fn draw_ui(
             if ui.button("Reset").clicked() {
                 *action = UiAction::Reset;
             }
+            ui.separator();
+            ui.checkbox(&mut display_settings.wireframe, "Wire");
+            ui.checkbox(&mut display_settings.show_backfaces, "Backfaces");
+            ui.checkbox(&mut display_settings.show_grid, "Grid");
+            ui.checkbox(&mut display_settings.show_axes, "Axes");
+            ui.checkbox(&mut display_settings.normal_debug, "Normals");
         });
     });
 

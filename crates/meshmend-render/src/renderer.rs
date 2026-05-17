@@ -16,6 +16,27 @@ pub struct RendererInfo {
     pub present_mode: wgpu::PresentMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySettings {
+    pub wireframe: bool,
+    pub show_backfaces: bool,
+    pub show_grid: bool,
+    pub show_axes: bool,
+    pub normal_debug: bool,
+}
+
+impl Default for DisplaySettings {
+    fn default() -> Self {
+        Self {
+            wireframe: false,
+            show_backfaces: true,
+            show_grid: true,
+            show_axes: true,
+            normal_debug: false,
+        }
+    }
+}
+
 pub struct WgpuRenderer<'window> {
     surface: wgpu::Surface<'window>,
     device: wgpu::Device,
@@ -28,9 +49,13 @@ pub struct WgpuRenderer<'window> {
     camera_bind_group: wgpu::BindGroup,
     chunk_bind_group_layout: wgpu::BindGroupLayout,
     mesh_pipeline: wgpu::RenderPipeline,
+    mesh_culled_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
     egui_renderer: egui_wgpu::Renderer,
     mesh_chunks: Vec<GpuMeshChunk>,
+    scene_lines: Option<SceneLines>,
     mesh_bounds: Option<MeshBounds>,
+    display_settings: DisplaySettings,
     info: RendererInfo,
 }
 
@@ -100,6 +125,7 @@ impl<'window> WgpuRenderer<'window> {
             contents: bytemuck::bytes_of(&CameraUniform::from_camera(
                 camera,
                 aspect_from_size(size),
+                DisplaySettings::default(),
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -156,7 +182,17 @@ impl<'window> WgpuRenderer<'window> {
             surface_format,
             &camera_bind_group_layout,
             &chunk_bind_group_layout,
+            None,
         );
+        let mesh_culled_pipeline = create_mesh_pipeline(
+            &device,
+            surface_format,
+            &camera_bind_group_layout,
+            &chunk_bind_group_layout,
+            Some(wgpu::Face::Back),
+        );
+        let grid_pipeline =
+            create_grid_pipeline(&device, surface_format, &camera_bind_group_layout);
         let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
         let info = RendererInfo {
             adapter_name: adapter_info.name,
@@ -186,9 +222,13 @@ impl<'window> WgpuRenderer<'window> {
             camera_bind_group,
             chunk_bind_group_layout,
             mesh_pipeline,
+            mesh_culled_pipeline,
+            grid_pipeline,
             egui_renderer,
             mesh_chunks: Vec::new(),
+            scene_lines: None,
             mesh_bounds: None,
+            display_settings: DisplaySettings::default(),
             info,
         })
     }
@@ -222,6 +262,15 @@ impl<'window> WgpuRenderer<'window> {
         self.write_camera();
     }
 
+    pub fn display_settings(&self) -> DisplaySettings {
+        self.display_settings
+    }
+
+    pub fn set_display_settings(&mut self, settings: DisplaySettings) {
+        self.display_settings = settings;
+        self.write_camera();
+    }
+
     pub fn mesh_bounds(&self) -> Option<MeshBounds> {
         self.mesh_bounds
     }
@@ -240,6 +289,7 @@ impl<'window> WgpuRenderer<'window> {
     ) {
         self.mesh_chunks.clear();
         self.mesh_bounds = Some(bounds);
+        self.scene_lines = Some(SceneLines::new(&self.device, bounds));
 
         for chunk in chunks {
             if chunk.triangles.is_empty() {
@@ -383,7 +433,26 @@ impl<'window> WgpuRenderer<'window> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.mesh_pipeline);
+            if let Some(lines) = &self.scene_lines {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, lines.buffer.slice(..));
+                if self.display_settings.show_grid && lines.grid_vertex_count > 0 {
+                    pass.draw(0..lines.grid_vertex_count, 0..1);
+                }
+                if self.display_settings.show_axes && lines.axes_vertex_count > 0 {
+                    pass.draw(
+                        lines.grid_vertex_count..lines.grid_vertex_count + lines.axes_vertex_count,
+                        0..1,
+                    );
+                }
+            }
+            let mesh_pipeline = if self.display_settings.show_backfaces {
+                &self.mesh_pipeline
+            } else {
+                &self.mesh_culled_pipeline
+            };
+            pass.set_pipeline(mesh_pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             for chunk in &self.mesh_chunks {
                 pass.set_bind_group(1, &chunk.bind_group, &[]);
@@ -435,7 +504,11 @@ impl<'window> WgpuRenderer<'window> {
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::bytes_of(&CameraUniform::from_camera(self.camera, self.aspect())),
+            bytemuck::bytes_of(&CameraUniform::from_camera(
+                self.camera,
+                self.aspect(),
+                self.display_settings,
+            )),
         );
     }
 
@@ -462,15 +535,22 @@ struct CameraUniform {
     eye: [f32; 4],
     light_dir: [f32; 4],
     material: [f32; 4],
+    settings: [u32; 4],
 }
 
 impl CameraUniform {
-    fn from_camera(camera: Camera, aspect: f32) -> Self {
+    fn from_camera(camera: Camera, aspect: f32, settings: DisplaySettings) -> Self {
         Self {
             view_proj: camera.view_projection(aspect).to_cols_array_2d(),
             eye: camera.eye().extend(1.0).to_array(),
             light_dir: Vec4::new(-0.35, -0.65, -0.62, 0.0).to_array(),
             material: Vec4::new(0.66, 0.70, 0.70, 1.0).to_array(),
+            settings: [
+                settings.wireframe as u32,
+                settings.normal_debug as u32,
+                0,
+                0,
+            ],
         }
     }
 }
@@ -487,6 +567,7 @@ fn create_mesh_pipeline(
     surface_format: wgpu::TextureFormat,
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     chunk_bind_group_layout: &wgpu::BindGroupLayout,
+    cull_mode: Option<wgpu::Face>,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("MeshMend mesh shader"),
@@ -519,7 +600,7 @@ fn create_mesh_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
+            cull_mode,
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
             conservative: false,
@@ -528,6 +609,161 @@ fn create_mesh_pipeline(
             format: DepthTexture::FORMAT,
             depth_write_enabled: true,
             depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct LineVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+impl LineVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+struct SceneLines {
+    buffer: wgpu::Buffer,
+    grid_vertex_count: u32,
+    axes_vertex_count: u32,
+}
+
+impl SceneLines {
+    fn new(device: &wgpu::Device, bounds: MeshBounds) -> Self {
+        let mut vertices = Vec::new();
+        let center = bounds.center();
+        let extent = bounds.extent();
+        let radius = bounds.radius().max(1.0);
+        let half = extent.x.max(extent.y).max(radius) * 0.75;
+        let z = bounds.min.z;
+        let step = (half * 2.0 / 12.0).max(0.001);
+        let grid_color = [0.26, 0.30, 0.32, 0.42];
+
+        for i in -12..=12 {
+            let offset = i as f32 * step;
+            vertices.push(LineVertex {
+                position: [center.x - half, center.y + offset, z],
+                color: grid_color,
+            });
+            vertices.push(LineVertex {
+                position: [center.x + half, center.y + offset, z],
+                color: grid_color,
+            });
+            vertices.push(LineVertex {
+                position: [center.x + offset, center.y - half, z],
+                color: grid_color,
+            });
+            vertices.push(LineVertex {
+                position: [center.x + offset, center.y + half, z],
+                color: grid_color,
+            });
+        }
+        let grid_vertex_count = vertices.len() as u32;
+
+        let axis = radius.max(half) * 1.15;
+        let axes = [
+            (
+                [center.x - axis, center.y, center.z],
+                [center.x + axis, center.y, center.z],
+                [0.95, 0.25, 0.22, 0.95],
+            ),
+            (
+                [center.x, center.y - axis, center.z],
+                [center.x, center.y + axis, center.z],
+                [0.35, 0.82, 0.36, 0.95],
+            ),
+            (
+                [center.x, center.y, center.z - axis],
+                [center.x, center.y, center.z + axis],
+                [0.32, 0.55, 1.0, 0.95],
+            ),
+        ];
+        for (start, end, color) in axes {
+            vertices.push(LineVertex {
+                position: start,
+                color,
+            });
+            vertices.push(LineVertex {
+                position: end,
+                color,
+            });
+        }
+        let axes_vertex_count = vertices.len() as u32 - grid_vertex_count;
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MeshMend grid and axes buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            buffer,
+            grid_vertex_count,
+            axes_vertex_count,
+        }
+    }
+}
+
+fn create_grid_pipeline(
+    device: &wgpu::Device,
+    surface_format: wgpu::TextureFormat,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("MeshMend grid shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/grid.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("MeshMend grid pipeline layout"),
+        bind_group_layouts: &[camera_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("MeshMend grid pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[LineVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DepthTexture::FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
