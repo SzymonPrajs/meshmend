@@ -39,6 +39,8 @@ The active implementation is now the native viewer:
 - Rust topology analysis for components, open boundaries, non-manifold edges,
   duplicate/degenerate faces, simple contained-shell candidates, and CLI
   reports via `meshmend analyze`
+- process-based C++ worker protocol with CGAL and OpenVDB smoke workers built
+  by `just worker-build`
 
 ## App Location
 

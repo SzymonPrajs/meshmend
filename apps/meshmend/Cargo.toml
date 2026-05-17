@@ -19,6 +19,7 @@ meshmend-inspection = { path = "../../crates/meshmend-inspection" }
 meshmend-project = { path = "../../crates/meshmend-project" }
 meshmend-render = { path = "../../crates/meshmend-render" }
 meshmend-stl = { path = "../../crates/meshmend-stl" }
+meshmend-worker-api = { path = "../../crates/meshmend-worker-api" }
 pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true

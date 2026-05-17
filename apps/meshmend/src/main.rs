@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use meshmend_project::MeshMendProject;
 use meshmend_stl::{load_binary_stl_with_options, LoadOptions};
+use meshmend_worker_api::{discover_worker_binary, WorkerOperation, WorkerRequest, WorkerRunner};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
@@ -68,6 +69,12 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    WorkerSmoke {
+        #[arg(value_name = "BACKEND")]
+        backend: WorkerBackend,
+        #[arg(value_name = "STL")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +83,12 @@ enum ProjectCommand {
         #[arg(value_name = "PROJECT")]
         path: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum WorkerBackend {
+    Cgal,
+    Openvdb,
 }
 
 fn main() -> Result<()> {
@@ -182,6 +195,38 @@ fn main() -> Result<()> {
             println!("revision: {}", project.current_revision);
             println!("operations: {}", project.operations.len());
             println!("exports: {}", project.exports.len());
+        }
+        Some(Command::WorkerSmoke { backend, path }) => {
+            let (binary_name, operation) = match backend {
+                WorkerBackend::Cgal => ("meshmend-cgal-worker", WorkerOperation::CgalInspect),
+                WorkerBackend::Openvdb => {
+                    ("meshmend-openvdb-worker", WorkerOperation::OpenVdbInspect)
+                }
+            };
+            let binary = discover_worker_binary(binary_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "worker binary {binary_name} was not found; run `just worker-build`"
+                )
+            })?;
+            let response_path = PathBuf::from("outputs")
+                .join("workers")
+                .join(format!("{binary_name}-response.json"));
+            let request_path = PathBuf::from("outputs")
+                .join("workers")
+                .join(format!("{binary_name}-request.json"));
+            let request = WorkerRequest::new(operation, path, response_path);
+            let result = WorkerRunner::new(binary).run(&request, &request_path)?;
+            println!("worker success: {}", result.response.success);
+            println!(
+                "input triangles: {}",
+                result
+                    .response
+                    .metrics
+                    .input_triangles
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            println!("progress events: {}", result.progress.len());
         }
         None => {
             app::run_native(cli.input, cli.smoke_window, cli.smoke_pick_center)?;

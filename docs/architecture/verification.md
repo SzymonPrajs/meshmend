@@ -30,6 +30,14 @@ cargo test -p meshmend-project
 cargo run -p meshmend -- project validate path/to/project.meshmend
 ```
 
+Worker checks:
+
+```bash
+just worker-build
+cargo run -p meshmend -- worker-smoke cgal fixtures/stl/cube_binary.stl
+cargo run -p meshmend -- worker-smoke openvdb fixtures/stl/cube_binary.stl
+```
+
 Renderer checks:
 
 ```bash
