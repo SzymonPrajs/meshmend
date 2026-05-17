@@ -18,3 +18,21 @@ pub fn pick_issue_session_to_save(default_name: &str) -> Option<PathBuf> {
         .set_file_name(default_name)
         .save_file()
 }
+
+pub fn pick_project_to_save(default_name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("MeshMend project", &["meshmend"])
+        .set_file_name(default_name)
+        .save_file()
+}
+
+pub fn pick_project_to_open() -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+
+pub fn pick_report_to_save(default_name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Markdown report", &["md"])
+        .set_file_name(default_name)
+        .save_file()
+}

@@ -1763,6 +1763,7 @@ dependencies = [
  "meshmend-core",
  "meshmend-inspection",
  "meshmend-io",
+ "meshmend-project",
  "meshmend-render",
  "meshmend-stl",
  "pollster",
@@ -1807,6 +1808,18 @@ version = "0.1.0"
 dependencies = [
  "rfd",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "meshmend-project"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "meshmend-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

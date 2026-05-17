@@ -15,6 +15,7 @@ glam.workspace = true
 meshmend-core = { path = "../../crates/meshmend-core" }
 meshmend-io = { path = "../../crates/meshmend-io" }
 meshmend-inspection = { path = "../../crates/meshmend-inspection" }
+meshmend-project = { path = "../../crates/meshmend-project" }
 meshmend-render = { path = "../../crates/meshmend-render" }
 meshmend-stl = { path = "../../crates/meshmend-stl" }
 pollster.workspace = true

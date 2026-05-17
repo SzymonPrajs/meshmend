@@ -34,6 +34,8 @@ The active implementation is now the native viewer:
 - orbit, pan, zoom, fit, and reset camera controls
 - mesh stats, cross-section inspection, brush labels, issue marking, selection,
   screenshots, and performance metrics
+- directory-backed `.meshmend` project state for source hashes, operation
+  history, undo/redo revision pointers, exports, and repair reports
 
 ## App Location
 

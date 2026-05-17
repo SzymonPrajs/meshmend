@@ -16,6 +16,13 @@ cargo run -p meshmend -- inspect fixtures/stl/cube_binary.stl
 cargo run -p meshmend -- inspect rose/raw.stl --parallel
 ```
 
+Project checks:
+
+```bash
+cargo test -p meshmend-project
+cargo run -p meshmend -- project validate path/to/project.meshmend
+```
+
 Renderer checks:
 
 ```bash

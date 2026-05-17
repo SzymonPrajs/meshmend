@@ -10,6 +10,10 @@ use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use meshmend_core::{CrossSectionAxis, CrossSectionState, MeshStats};
 use meshmend_inspection::{BrushLabelKind, IssueKind, IssueSession};
+use meshmend_project::{
+    project_directory_from_selection, MeshMendProject, OperationKind, OperationStatus,
+    SelectionReference,
+};
 use meshmend_render::{
     DisplaySettings, LabelStrokeOverlay, LightingMode, MeshChunkUpload, PickResult, RendererInfo,
     SelectionSummary, WgpuRenderer,
@@ -29,6 +33,7 @@ use crate::input::CameraInput;
 struct ModelInfo {
     path: PathBuf,
     file_name: String,
+    source_hash: String,
     stats: MeshStats,
     chunk_count: usize,
     parse_ms: f64,
@@ -40,6 +45,11 @@ struct ModelInfo {
 enum UiAction {
     None,
     LoadStl,
+    OpenProject,
+    SaveProject,
+    ExportReport,
+    Undo,
+    Redo,
     Fit,
     Reset,
     AddIssue,
@@ -250,6 +260,7 @@ pub fn run_native(
     let mut issue_session = model_info
         .as_ref()
         .map(|model| IssueSession::new(model.file_name.clone(), model.stats.source_bytes));
+    let mut project = model_info.as_ref().map(project_from_model);
     let mut cross_section = model_info
         .as_ref()
         .map(|model| CrossSectionState::centered(model.stats.bounds))
@@ -307,6 +318,7 @@ pub fn run_native(
                                 model_info.as_ref(),
                                 selected_pick,
                                 &mut issue_session,
+                                project.as_ref(),
                                 &mut cross_section,
                                 &mut selected_issue_kind,
                                 &mut brush_tool,
@@ -331,6 +343,7 @@ pub fn run_native(
                             redraw_window,
                             &mut model_info,
                             &mut issue_session,
+                            &mut project,
                             &mut cross_section,
                             selected_issue_kind,
                             &mut brush_tool,
@@ -397,6 +410,7 @@ pub fn run_native(
                                     info.file_name.clone(),
                                     info.stats.source_bytes,
                                 ));
+                                project = Some(project_from_model(&info));
                                 cross_section = CrossSectionState::centered(info.stats.bounds);
                                 model_info = Some(info);
                                 selected_pick = None;
@@ -1114,6 +1128,7 @@ fn handle_ui_action(
     window: &Window,
     model_info: &mut Option<ModelInfo>,
     issue_session: &mut Option<IssueSession>,
+    project: &mut Option<MeshMendProject>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: IssueKind,
     brush_tool: &mut BrushToolState,
@@ -1133,6 +1148,7 @@ fn handle_ui_action(
                             info.file_name.clone(),
                             info.stats.source_bytes,
                         ));
+                        *project = Some(project_from_model(&info));
                         *cross_section = CrossSectionState::centered(info.stats.bounds);
                         *model_info = Some(info);
                         *selected_pick = None;
@@ -1146,6 +1162,113 @@ fn handle_ui_action(
                         *status = format!("Load failed: {err}");
                         tracing::error!(error = %err, "failed to load STL");
                     }
+                }
+                *needs_redraw = true;
+            }
+        }
+        UiAction::OpenProject => {
+            if let Some(path) = meshmend_io::pick_project_to_open() {
+                let directory = project_directory_from_selection(&path);
+                match MeshMendProject::load_from_dir(&directory) {
+                    Ok(loaded_project) => {
+                        let source_path = loaded_project.source.path.clone();
+                        if source_path.exists() {
+                            match load_model(&source_path, renderer, window) {
+                                Ok(info) => {
+                                    *issue_session = Some(IssueSession::new(
+                                        info.file_name.clone(),
+                                        info.stats.source_bytes,
+                                    ));
+                                    *cross_section = CrossSectionState::centered(info.stats.bounds);
+                                    *model_info = Some(info);
+                                    *selected_pick = None;
+                                    hit_stack_state.clear();
+                                    brush_tool.finish_stroke();
+                                    renderer.set_selection_marker(None);
+                                    renderer.set_issue_markers(&[]);
+                                    renderer.set_label_strokes(&[]);
+                                    *status = format!("Opened project {}", directory.display());
+                                }
+                                Err(err) => {
+                                    *status = format!("Project opened, source load failed: {err}");
+                                }
+                            }
+                        } else {
+                            *status = format!(
+                                "Opened project; source STL missing at {}",
+                                source_path.display()
+                            );
+                        }
+                        *project = Some(loaded_project);
+                    }
+                    Err(err) => {
+                        *status = format!("Open project failed: {err}");
+                        tracing::error!(error = %err, "failed to open project");
+                    }
+                }
+                *needs_redraw = true;
+            }
+        }
+        UiAction::SaveProject => {
+            if project.is_none() {
+                if let Some(model) = model_info.as_ref() {
+                    *project = Some(project_from_model(model));
+                }
+            }
+            if let Some(project) = project.as_mut() {
+                let default_name = format!("{}.meshmend", project.metadata.name);
+                if let Some(path) = meshmend_io::pick_project_to_save(&default_name) {
+                    let directory = project_directory_from_selection(&path);
+                    match project.save_to_dir(&directory) {
+                        Ok(project_file) => {
+                            *status = format!("Saved project {}", project_file.display());
+                        }
+                        Err(err) => {
+                            *status = format!("Save project failed: {err}");
+                            tracing::error!(error = %err, "failed to save project");
+                        }
+                    }
+                    *needs_redraw = true;
+                }
+            } else {
+                *status = "Load an STL before saving a project".to_string();
+                *needs_redraw = true;
+            }
+        }
+        UiAction::ExportReport => {
+            if let Some(project) = project.as_mut() {
+                let default_name = format!("{}-repair-report.md", project.metadata.name);
+                if let Some(path) = meshmend_io::pick_report_to_save(&default_name) {
+                    match project.write_markdown_report(&path) {
+                        Ok(()) => {
+                            *status = format!("Exported report {}", path.display());
+                        }
+                        Err(err) => {
+                            *status = format!("Export report failed: {err}");
+                            tracing::error!(error = %err, "failed to export report");
+                        }
+                    }
+                    *needs_redraw = true;
+                }
+            } else {
+                *status = "No project state to report".to_string();
+                *needs_redraw = true;
+            }
+        }
+        UiAction::Undo => {
+            if let Some(project) = project.as_mut() {
+                match project.undo() {
+                    Some(revision) => *status = format!("Undo to revision {revision}"),
+                    None => *status = "Nothing to undo".to_string(),
+                }
+                *needs_redraw = true;
+            }
+        }
+        UiAction::Redo => {
+            if let Some(project) = project.as_mut() {
+                match project.redo() {
+                    Some(revision) => *status = format!("Redo to revision {revision}"),
+                    None => *status = "Nothing to redo".to_string(),
                 }
                 *needs_redraw = true;
             }
@@ -1166,6 +1289,21 @@ fn handle_ui_action(
                     pick.position.to_array(),
                     *cross_section,
                 );
+                if let Some(project) = project.as_mut() {
+                    project.record_operation(
+                        OperationKind::DefectRecord,
+                        OperationStatus::Applied,
+                        serde_json::json!({
+                            "defect_kind": selected_issue_kind.label(),
+                            "cross_section": {
+                                "axis": cross_section.axis.label(),
+                                "offset": cross_section.offset,
+                                "flip_side": cross_section.flip_side,
+                            }
+                        }),
+                        vec![selection_reference_from_pick(pick)],
+                    );
+                }
                 update_issue_markers(renderer, session);
                 *status = format!("Added {}", selected_issue_kind.label());
                 *needs_redraw = true;
@@ -1362,11 +1500,13 @@ fn load_model(
     window: &winit::window::Window,
 ) -> Result<ModelInfo> {
     let parsed = load_binary_stl(path)?;
+    let source_hash = hash_file_fnv1a64(path)?;
     let brush_unit = estimate_mesh_detail_unit(&parsed);
     upload_parsed_mesh(renderer, &parsed);
     let info = ModelInfo {
         path: parsed.source_path.clone(),
         file_name: parsed.file_name.clone(),
+        source_hash,
         stats: parsed.stats.clone(),
         chunk_count: parsed.chunks.len(),
         parse_ms: parsed.timings.parse.as_secs_f64() * 1000.0,
@@ -1382,6 +1522,39 @@ fn load_model(
         "loaded STL mesh"
     );
     Ok(info)
+}
+
+fn project_from_model(model: &ModelInfo) -> MeshMendProject {
+    let name = model
+        .path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| model.file_name.clone());
+    MeshMendProject::new(
+        name,
+        model.path.clone(),
+        model.source_hash.clone(),
+        model.stats.clone(),
+    )
+}
+
+fn selection_reference_from_pick(pick: PickResult) -> SelectionReference {
+    SelectionReference {
+        triangle_chunk: pick.triangle_id.chunk,
+        triangle_local_index: pick.triangle_id.local_index,
+        position: pick.position.to_array(),
+    }
+}
+
+fn hash_file_fnv1a64(path: &Path) -> Result<String> {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let bytes = fs::read(path)?;
+    let hash = bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    });
+    Ok(format!("fnv1a64:{hash:016x}"))
 }
 
 fn estimate_mesh_detail_unit(parsed: &ParsedStl) -> f32 {
@@ -1575,6 +1748,7 @@ fn draw_ui(
     model_info: Option<&ModelInfo>,
     selected_pick: Option<PickResult>,
     issue_session: &mut Option<IssueSession>,
+    project: Option<&MeshMendProject>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
@@ -1615,6 +1789,12 @@ fn draw_ui(
         ui.horizontal_wrapped(|ui| {
             if ui.button("Load STL").clicked() {
                 *action = UiAction::LoadStl;
+            }
+            if ui.button("Open Project").clicked() {
+                *action = UiAction::OpenProject;
+            }
+            if ui.button("Save Project").clicked() {
+                *action = UiAction::SaveProject;
             }
             if ui.button("Fit").clicked() {
                 *action = UiAction::Fit;
@@ -1663,6 +1843,7 @@ fn draw_ui(
                 model_info,
                 selected_pick,
                 issue_session,
+                project,
                 cross_section,
                 selected_issue_kind,
                 brush_tool,
@@ -1797,6 +1978,7 @@ fn draw_repair_panel(
     model_info: Option<&ModelInfo>,
     selected_pick: Option<PickResult>,
     issue_session: &mut Option<IssueSession>,
+    project: Option<&MeshMendProject>,
     cross_section: &mut CrossSectionState,
     selected_issue_kind: &mut IssueKind,
     brush_tool: &mut BrushToolState,
@@ -1808,6 +1990,7 @@ fn draw_repair_panel(
     ui.heading("Repair");
     ui.label(format!("Tool: {}", tool_mode.label()));
     ui.label(format!("View: {}", view_mode.label()));
+    draw_project_controls(ui, project, action);
 
     let Some(model) = model_info else {
         ui.separator();
@@ -1873,7 +2056,7 @@ fn draw_repair_panel(
     }
 
     ui.separator();
-    draw_operation_history(ui, issue_session, action);
+    draw_operation_history(ui, issue_session, project, action);
 }
 
 fn draw_model_summary(
@@ -1888,6 +2071,7 @@ fn draw_model_summary(
         .show(ui, |ui| {
             ui.label(model.file_name.as_str());
             ui.label(format!("Path: {}", model.path.display()));
+            ui.label(format!("Source hash: {}", model.source_hash));
             ui.label(format!("Triangles: {}", model.stats.triangle_count));
             ui.label(format!("Chunks: {}", model.chunk_count));
             if let Some(summary) = model.selection_summary {
@@ -1930,6 +2114,48 @@ fn draw_model_summary(
             ui.label(format!("GPU: {}", renderer_info.adapter_name));
             ui.label(format!("Backend: {:?}", renderer_info.backend));
         });
+}
+
+fn draw_project_controls(
+    ui: &mut egui::Ui,
+    project: Option<&MeshMendProject>,
+    action: &mut UiAction,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Save Project").clicked() {
+            *action = UiAction::SaveProject;
+        }
+        if ui.button("Open Project").clicked() {
+            *action = UiAction::OpenProject;
+        }
+        if ui.button("Export Report").clicked() {
+            *action = UiAction::ExportReport;
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        let can_undo = project.is_some_and(|project| !project.undo_stack.is_empty());
+        let can_redo = project.is_some_and(|project| !project.redo_stack.is_empty());
+        if ui
+            .add_enabled(can_undo, egui::Button::new("Undo"))
+            .clicked()
+        {
+            *action = UiAction::Undo;
+        }
+        if ui
+            .add_enabled(can_redo, egui::Button::new("Redo"))
+            .clicked()
+        {
+            *action = UiAction::Redo;
+        }
+    });
+    if let Some(project) = project {
+        ui.small(format!(
+            "Project rev {} | {} operations | {} exports",
+            project.current_revision,
+            project.operations.len(),
+            project.exports.len()
+        ));
+    }
 }
 
 fn draw_cross_section_tools(
@@ -2070,9 +2296,23 @@ fn draw_defect_tools(
 fn draw_operation_history(
     ui: &mut egui::Ui,
     issue_session: &mut Option<IssueSession>,
+    project: Option<&MeshMendProject>,
     action: &mut UiAction,
 ) {
     ui.heading("Operations");
+    if let Some(project) = project {
+        if project.operations.is_empty() {
+            ui.label("No project operations recorded");
+        } else {
+            for operation in project.operations.iter().rev().take(6) {
+                ui.small(format!(
+                    "{:?} {:?} rev {}",
+                    operation.kind, operation.status, operation.input_revision
+                ));
+            }
+        }
+        ui.separator();
+    }
     if let Some(session) = issue_session.as_mut() {
         if session.issues.is_empty() {
             ui.label("No defect operations recorded");

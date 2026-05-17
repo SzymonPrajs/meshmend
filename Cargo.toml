@@ -6,6 +6,7 @@ members = [
   "crates/meshmend-geometry",
   "crates/meshmend-io",
   "crates/meshmend-inspection",
+  "crates/meshmend-project",
   "crates/meshmend-render",
   "crates/meshmend-stl",
 ]

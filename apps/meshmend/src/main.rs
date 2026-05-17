@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use meshmend_project::MeshMendProject;
 use meshmend_stl::{load_binary_stl_with_options, LoadOptions};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -56,6 +57,18 @@ enum Command {
         path: PathBuf,
         #[arg(long, value_name = "JSON")]
         output: PathBuf,
+    },
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    Validate {
+        #[arg(value_name = "PROJECT")]
+        path: PathBuf,
     },
 }
 
@@ -125,6 +138,16 @@ fn main() -> Result<()> {
         }
         Some(Command::Perf { path, output }) => {
             app::run_perf(path, output)?;
+        }
+        Some(Command::Project {
+            command: ProjectCommand::Validate { path },
+        }) => {
+            let project = MeshMendProject::load_from_dir(&path)?;
+            println!("project: {}", project.metadata.name);
+            println!("source: {}", project.source.path.display());
+            println!("revision: {}", project.current_revision);
+            println!("operations: {}", project.operations.len());
+            println!("exports: {}", project.exports.len());
         }
         None => {
             app::run_native(cli.input, cli.smoke_window, cli.smoke_pick_center)?;
