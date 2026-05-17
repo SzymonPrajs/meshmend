@@ -25,6 +25,8 @@ use crate::{
     input::CameraInput,
 };
 
+const FPS_DISPLAY_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 struct ModelInfo {
     path: PathBuf,
@@ -117,37 +119,148 @@ impl ViewMode {
 #[derive(Debug, Clone)]
 struct FrameMeter {
     last_frame: Instant,
-    frame_ms: f64,
-    fps: f64,
+    last_display_update: Instant,
+    smoothed_frame_ms: f64,
+    smoothed_fps: f64,
+    display_frame_ms: f64,
+    display_fps: f64,
 }
 
 impl Default for FrameMeter {
     fn default() -> Self {
+        let now = Instant::now();
         Self {
-            last_frame: Instant::now(),
-            frame_ms: 0.0,
-            fps: 0.0,
+            last_frame: now,
+            last_display_update: now - FPS_DISPLAY_INTERVAL,
+            smoothed_frame_ms: 0.0,
+            smoothed_fps: 0.0,
+            display_frame_ms: 0.0,
+            display_fps: 0.0,
         }
     }
 }
 
 impl FrameMeter {
     fn tick(&mut self) {
-        let now = Instant::now();
+        self.tick_at(Instant::now());
+    }
+
+    fn tick_at(&mut self, now: Instant) {
         let frame_ms = (now - self.last_frame).as_secs_f64() * 1000.0;
         self.last_frame = now;
         if frame_ms <= 0.0 {
             return;
         }
         let fps = 1000.0 / frame_ms;
-        if self.frame_ms == 0.0 {
-            self.frame_ms = frame_ms;
-            self.fps = fps;
+        if self.smoothed_frame_ms == 0.0 {
+            self.smoothed_frame_ms = frame_ms;
+            self.smoothed_fps = fps;
         } else {
-            self.frame_ms = self.frame_ms * 0.88 + frame_ms * 0.12;
-            self.fps = self.fps * 0.88 + fps * 0.12;
+            self.smoothed_frame_ms = self.smoothed_frame_ms * 0.9 + frame_ms * 0.1;
+            self.smoothed_fps = self.smoothed_fps * 0.9 + fps * 0.1;
+        }
+
+        if now.duration_since(self.last_display_update) >= FPS_DISPLAY_INTERVAL {
+            self.display_frame_ms = self.smoothed_frame_ms;
+            self.display_fps = self.smoothed_fps;
+            self.last_display_update = now;
         }
     }
+
+    fn display_fps(&self) -> f64 {
+        self.display_fps
+    }
+
+    fn display_frame_ms(&self) -> f64 {
+        self.display_frame_ms
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct UiInputRegions {
+    blocked: Vec<egui::Rect>,
+}
+
+impl UiInputRegions {
+    fn add(&mut self, rect: egui::Rect) {
+        self.blocked.push(rect.expand(2.0));
+    }
+
+    fn blocks_physical_position(&self, position: glam::Vec2, scale_factor: f32) -> bool {
+        let scale_factor = scale_factor.max(0.1);
+        let point = egui::pos2(position.x / scale_factor, position.y / scale_factor);
+        self.blocked.iter().any(|rect| rect.contains(point))
+    }
+
+    fn allows_physical_position(&self, position: Option<glam::Vec2>, scale_factor: f32) -> bool {
+        position
+            .map(|position| !self.blocks_physical_position(position, scale_factor))
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Default)]
+struct UiInputState {
+    regions: UiInputRegions,
+    cursor_position: Option<glam::Vec2>,
+}
+
+impl UiInputState {
+    fn allows_pointer_action(&self, scale_factor: f32) -> bool {
+        self.regions
+            .allows_physical_position(self.cursor_position, scale_factor)
+    }
+
+    fn set_cursor_position(&mut self, x: f64, y: f64) {
+        self.cursor_position = Some(glam::Vec2::new(x as f32, y as f32));
+    }
+
+    fn set_regions(&mut self, regions: UiInputRegions) {
+        self.regions = regions;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CameraDrag {
+    Orbit(glam::Vec2),
+    Pan(glam::Vec2),
+}
+
+fn camera_drag_for_button(
+    button: MouseButton,
+    delta: glam::Vec2,
+    modifiers: ModifiersState,
+) -> Option<CameraDrag> {
+    match button {
+        MouseButton::Left if modifiers.shift_key() => Some(CameraDrag::Pan(delta)),
+        MouseButton::Left => Some(CameraDrag::Orbit(delta)),
+        MouseButton::Right | MouseButton::Middle => Some(CameraDrag::Pan(delta)),
+        _ => None,
+    }
+}
+
+fn wheel_delta_from_event(delta: MouseScrollDelta) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(position) => position.y as f32 * 0.02,
+    }
+}
+
+fn apply_camera_drag(renderer: &mut WgpuRenderer<'_>, drag: CameraDrag, needs_redraw: &mut bool) {
+    let mut camera = renderer.camera();
+    match drag {
+        CameraDrag::Orbit(delta) => camera.orbit(delta),
+        CameraDrag::Pan(delta) => camera.pan(delta, renderer.size().height as f32),
+    }
+    renderer.set_camera(camera);
+    *needs_redraw = true;
+}
+
+fn apply_camera_zoom(renderer: &mut WgpuRenderer<'_>, wheel_delta: f32, needs_redraw: &mut bool) {
+    let mut camera = renderer.camera();
+    camera.zoom(wheel_delta, renderer.mesh_bounds());
+    renderer.set_camera(camera);
+    *needs_redraw = true;
 }
 
 pub fn run_native(
@@ -200,6 +313,7 @@ pub fn run_native(
         None,
     );
     let mut camera_input = CameraInput::default();
+    let mut ui_input = UiInputState::default();
     let mut active_modifiers = ModifiersState::default();
     let mut needs_redraw = true;
 
@@ -234,6 +348,7 @@ pub fn run_native(
                         let raw_input = egui_state.take_egui_input(redraw_window);
                         let mut action = UiAction::None;
                         let mut next_display_settings = renderer.display_settings();
+                        let mut next_ui_regions = UiInputRegions::default();
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             draw_ui(
                                 ctx,
@@ -247,8 +362,10 @@ pub fn run_native(
                                 &mut show_shortcuts,
                                 &mut show_view_switcher,
                                 &mut action,
+                                &mut next_ui_regions,
                             );
                         });
+                        ui_input.set_regions(next_ui_regions);
                         egui_state
                             .handle_platform_output(redraw_window, full_output.platform_output);
 
@@ -332,7 +449,8 @@ pub fn run_native(
                     }
                     WindowEvent::MouseInput { state, button, .. } => match state {
                         ElementState::Pressed
-                            if is_camera_button(button) && !egui_response.consumed =>
+                            if is_camera_button(button)
+                                && ui_input.allows_pointer_action(window.scale_factor() as f32) =>
                         {
                             camera_input.press(button);
                         }
@@ -341,34 +459,26 @@ pub fn run_native(
                         }
                         _ => {}
                     },
-                    WindowEvent::CursorMoved { position, .. } if !egui_response.consumed => {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        ui_input.set_cursor_position(position.x, position.y);
                         if let Some((button, delta)) =
                             camera_input.cursor_delta(position.x, position.y)
                         {
-                            let mut camera = renderer.camera();
-                            match button {
-                                MouseButton::Left if active_modifiers.shift_key() => {
-                                    camera.pan(delta, renderer.size().height as f32);
-                                }
-                                MouseButton::Left => camera.orbit(delta),
-                                MouseButton::Right | MouseButton::Middle => {
-                                    camera.pan(delta, renderer.size().height as f32);
-                                }
-                                _ => {}
+                            if let Some(drag) =
+                                camera_drag_for_button(button, delta, active_modifiers)
+                            {
+                                apply_camera_drag(&mut renderer, drag, &mut needs_redraw);
                             }
-                            renderer.set_camera(camera);
-                            needs_redraw = true;
                         }
                     }
-                    WindowEvent::MouseWheel { delta, .. } if !egui_response.consumed => {
-                        let wheel_delta = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => y,
-                            MouseScrollDelta::PixelDelta(position) => position.y as f32 * 0.02,
-                        };
-                        let mut camera = renderer.camera();
-                        camera.zoom(wheel_delta, renderer.mesh_bounds());
-                        renderer.set_camera(camera);
-                        needs_redraw = true;
+                    WindowEvent::MouseWheel { delta, .. }
+                        if ui_input.allows_pointer_action(window.scale_factor() as f32) =>
+                    {
+                        apply_camera_zoom(
+                            &mut renderer,
+                            wheel_delta_from_event(delta),
+                            &mut needs_redraw,
+                        );
                     }
                     WindowEvent::KeyboardInput { event, .. }
                         if event.state == ElementState::Pressed && !egui_response.consumed =>
@@ -802,8 +912,9 @@ fn draw_ui(
     show_shortcuts: &mut bool,
     show_view_switcher: &mut bool,
     action: &mut UiAction,
+    ui_regions: &mut UiInputRegions,
 ) {
-    egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+    let top_response = egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         draw_menu_bar(ui, model_info, view_mode, show_shortcuts, action);
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -817,12 +928,13 @@ fn draw_ui(
             }
         });
     });
+    ui_regions.add(top_response.response.rect);
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
         .show(ctx, |_ui| {});
 
-    egui::TopBottomPanel::bottom("status_bar")
+    let bottom_response = egui::TopBottomPanel::bottom("status_bar")
         .resizable(false)
         .show(ctx, |ui| {
             draw_status_bar(
@@ -835,12 +947,19 @@ fn draw_ui(
                 status,
             );
         });
+    ui_regions.add(bottom_response.response.rect);
 
     if *show_shortcuts {
-        draw_shortcuts_window(ctx, show_shortcuts);
+        if let Some(rect) = draw_shortcuts_window(ctx, show_shortcuts) {
+            ui_regions.add(rect);
+        }
     }
     if *show_view_switcher {
-        draw_view_switcher(ctx, view_mode, display_settings, show_view_switcher, action);
+        if let Some(rect) =
+            draw_view_switcher(ctx, view_mode, display_settings, show_view_switcher, action)
+        {
+            ui_regions.add(rect);
+        }
     }
 }
 
@@ -1078,14 +1197,15 @@ fn draw_status_bar(
         ui.separator();
         ui.label(format!(
             "{:.1} fps / {:.1} ms",
-            frame_meter.fps, frame_meter.frame_ms
+            frame_meter.display_fps(),
+            frame_meter.display_frame_ms()
         ));
         ui.separator();
         ui.label(status);
     });
 }
 
-fn draw_shortcuts_window(ctx: &egui::Context, show_shortcuts: &mut bool) {
+fn draw_shortcuts_window(ctx: &egui::Context, show_shortcuts: &mut bool) -> Option<egui::Rect> {
     egui::Window::new("Shortcuts")
         .open(show_shortcuts)
         .collapsible(false)
@@ -1107,7 +1227,8 @@ fn draw_shortcuts_window(ctx: &egui::Context, show_shortcuts: &mut bool) {
             ui.monospace("Shift+Left drag  Pan");
             ui.monospace("Middle/Right     Pan");
             ui.monospace("Wheel/trackpad   Zoom");
-        });
+        })
+        .map(|response| response.response.rect)
 }
 
 fn draw_view_switcher(
@@ -1116,7 +1237,7 @@ fn draw_view_switcher(
     display_settings: &mut DisplaySettings,
     show_view_switcher: &mut bool,
     action: &mut UiAction,
-) {
+) -> Option<egui::Rect> {
     egui::Window::new("View")
         .open(show_view_switcher)
         .collapsible(false)
@@ -1130,7 +1251,8 @@ fn draw_view_switcher(
                     }
                 }
             });
-        });
+        })
+        .map(|response| response.response.rect)
 }
 
 fn handle_ui_action(
@@ -1520,6 +1642,62 @@ mod tests {
     fn export_current_stl_accepts_same_path_as_already_saved() {
         let source = fixture_path("cube_binary.stl");
         export_current_stl(&source, &source).expect("same-path save should validate source");
+    }
+
+    #[test]
+    fn frame_meter_throttles_display_updates() {
+        let start = Instant::now();
+        let mut meter = FrameMeter {
+            last_frame: start,
+            last_display_update: start - FPS_DISPLAY_INTERVAL,
+            smoothed_frame_ms: 0.0,
+            smoothed_fps: 0.0,
+            display_frame_ms: 0.0,
+            display_fps: 0.0,
+        };
+
+        meter.tick_at(start + Duration::from_millis(2));
+        let first_display_fps = meter.display_fps();
+        assert!(first_display_fps > 0.0);
+
+        meter.tick_at(start + Duration::from_millis(4));
+        assert_eq!(meter.display_fps(), first_display_fps);
+
+        meter.tick_at(start + FPS_DISPLAY_INTERVAL + Duration::from_millis(4));
+        assert_ne!(meter.display_fps(), first_display_fps);
+    }
+
+    #[test]
+    fn ui_regions_block_controls_but_allow_viewport() {
+        let mut regions = UiInputRegions::default();
+        regions.add(egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 50.0),
+        ));
+
+        assert!(regions.blocks_physical_position(glam::Vec2::new(50.0, 25.0), 1.0));
+        assert!(!regions.blocks_physical_position(glam::Vec2::new(50.0, 80.0), 1.0));
+        assert!(regions.allows_physical_position(Some(glam::Vec2::new(50.0, 160.0)), 2.0));
+    }
+
+    #[test]
+    fn camera_drag_mapping_keeps_shift_left_as_pan() {
+        let delta = glam::Vec2::new(4.0, -3.0);
+        let mut shift = ModifiersState::empty();
+        shift.set(ModifiersState::SHIFT, true);
+
+        assert_eq!(
+            camera_drag_for_button(MouseButton::Left, delta, ModifiersState::empty()),
+            Some(CameraDrag::Orbit(delta))
+        );
+        assert_eq!(
+            camera_drag_for_button(MouseButton::Left, delta, shift),
+            Some(CameraDrag::Pan(delta))
+        );
+        assert_eq!(
+            camera_drag_for_button(MouseButton::Right, delta, ModifiersState::empty()),
+            Some(CameraDrag::Pan(delta))
+        );
     }
 
     fn fixture_path(name: &str) -> PathBuf {
